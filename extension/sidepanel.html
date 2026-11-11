@@ -3,273 +3,410 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Antigravity in Chrome</title>
+    <title>Antigravity</title>
     <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
-    <div class="app-shell">
-      <!-- Top Header -->
-      <header class="topbar">
-        <div class="brand-group">
-          <img class="brand-logo" src="icons/icon48.png" width="24" height="24" alt="Antigravity" />
-          <div class="brand-titles">
-            <div class="brand-row">
-              <span class="brand-name" id="header-title">Antigravity</span>
-              <button
-                type="button"
-                class="bridge-dot-btn"
-                id="bridge-status-btn"
-                title="Native Messaging Bridge status — click to reconnect"
-              >
-                <span class="status-dot" id="bridge-dot"></span>
-                <span id="bridge-label">Connecting…</span>
-              </button>
-            </div>
-          </div>
-        </div>
+    <!-- Shared New 4-Color Rounded Gemini Spark Definition (Blue, Red, Yellow, Green) -->
+    <svg width="0" height="0" style="position: absolute; pointer-events: none" aria-hidden="true">
+      <defs>
+        <clipPath id="gem-spark-clip">
+          <path
+            d="M14.9 3.2C15.15 1.85 16.85 1.85 17.1 3.2C18.25 9.41 22.59 13.75 28.8 14.9C30.15 15.15 30.15 16.85 28.8 17.1C22.59 18.25 18.25 22.59 17.1 28.8C16.85 30.15 15.15 30.15 14.9 28.8C13.75 22.59 9.41 18.25 3.2 17.1C1.85 16.85 1.85 15.15 3.2 14.9C9.41 13.75 13.75 9.41 14.9 3.2Z"
+          />
+        </clipPath>
+        <radialGradient id="gem-c-red" cx="16" cy="2" r="12.6" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#EA4335" />
+          <stop offset="52%" stop-color="#EA4335" stop-opacity="0.92" />
+          <stop offset="100%" stop-color="#EA4335" stop-opacity="0" />
+        </radialGradient>
+        <radialGradient id="gem-c-yellow" cx="2" cy="16" r="12.8" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#FBBC04" />
+          <stop offset="55%" stop-color="#FBBC04" stop-opacity="0.96" />
+          <stop offset="100%" stop-color="#FBBC04" stop-opacity="0" />
+        </radialGradient>
+        <radialGradient id="gem-c-green" cx="16" cy="30" r="12.6" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#34A853" />
+          <stop offset="52%" stop-color="#34A853" stop-opacity="0.94" />
+          <stop offset="100%" stop-color="#34A853" stop-opacity="0" />
+        </radialGradient>
+        <symbol id="gemini-spark-4c" viewBox="0 0 32 32">
+          <g clip-path="url(#gem-spark-clip)">
+            <rect width="32" height="32" fill="#4285F4" />
+            <rect width="32" height="32" fill="url(#gem-c-red)" />
+            <rect width="32" height="32" fill="url(#gem-c-green)" />
+            <rect width="32" height="32" fill="url(#gem-c-yellow)" />
+          </g>
+        </symbol>
+      </defs>
+    </svg>
 
-        <div class="topbar-actions">
-          <button type="button" class="icon-btn" id="new-chat-btn" title="New Chat">
-            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
-              <path d="M10 4v12M4 10h12" stroke-linecap="round" />
-            </svg>
-          </button>
-          <button type="button" class="icon-btn" id="history-btn" title="Chrome Chat History">
-            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7">
-              <circle cx="10" cy="10" r="6.8" />
-              <path d="M10 6.5v3.8l2.5 1.6" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
-          <button type="button" class="icon-btn" id="schedules-btn" title="Scheduled Browser Tasks">
-            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7">
-              <rect x="3.2" y="4.5" width="13.6" height="12.3" rx="2.2" />
-              <path d="M6.8 2.8v3M13.2 2.8v3M3.2 8.2h13.6" stroke-linecap="round" />
-            </svg>
-          </button>
+    <div class="app-shell">
+      <div class="ambient-aura" aria-hidden="true"></div>
+
+      <!-- New Gemini Centered Minimal Header -->
+      <header class="topbar">
+        <div class="topbar-side topbar-left">
           <button
             type="button"
-            class="icon-btn accent-link-btn"
-            id="open-desktop-btn"
-            title="View &amp; Continue in Antigravity Desktop App"
+            class="circle-icon-btn"
+            id="history-btn"
+            title="Recent chats &amp; scheduled tasks"
+            aria-label="Menu"
           >
-            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
-              <path d="M7 13L13.5 6.5M8.5 6.5h5v5" stroke-linecap="round" stroke-linejoin="round" />
-              <rect x="3.3" y="3.3" width="13.4" height="13.4" rx="2.8" />
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85">
+              <path d="M4 8.5h16M4 15.5h11" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="topbar-center">
+          <span class="brand-wordmark" id="header-title">Antigravity</span>
+          <span class="offline-dot hidden" id="bridge-dot" title="Native bridge offline"></span>
+        </div>
+
+        <div class="topbar-side topbar-right">
+          <button type="button" class="circle-icon-btn" id="new-chat-btn" title="New chat" aria-label="New chat">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path
+                d="M11 4H6.8A2.8 2.8 0 0 0 4 6.8v10.4A2.8 2.8 0 0 0 6.8 20h10.4a2.8 2.8 0 0 0 2.8-2.8V13"
+                stroke-linecap="round"
+              />
+              <path
+                d="M17.6 3.9a1.8 1.8 0 0 1 2.5 2.5L12.3 14.2l-3.3.8.8-3.3 7.8-7.8Z"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
             </svg>
           </button>
         </div>
       </header>
 
-      <!-- Live Desktop App / Debugger Activity Banner -->
-      <section class="desktop-activity-bar hidden" id="desktop-activity-bar">
-        <div class="activity-info">
-          <span class="pulse-dot"></span>
-          <span id="desktop-activity-text">Antigravity bridge active</span>
+      <!-- Live Browser Control Pill (Shown ONLY when debugger is actively controlling tabs) -->
+      <section class="live-control-pill hidden" id="desktop-activity-bar">
+        <div class="live-control-info">
+          <span class="live-pulse"></span>
+          <span id="desktop-activity-text">Controlling browser tab</span>
         </div>
-        <button type="button" class="mini-btn danger-subtle" id="detach-all-btn" title="Detach debugger &amp; close scratch tabs">
-          Take Over
-        </button>
+        <button type="button" class="live-stop-btn" id="detach-all-btn">Take over</button>
       </section>
 
-      <!-- CLI / Bridge Onboarding Notice (shown only if agy CLI or bridge needs setup) -->
-      <section class="setup-banner hidden" id="setup-banner">
-        <div class="setup-title" id="setup-banner-title">Connect Antigravity CLI</div>
-        <p class="setup-desc" id="setup-banner-desc"></p>
+      <!-- Subtle Onboarding Card (Only if CLI/bridge missing) -->
+      <section class="notice-card hidden" id="setup-banner">
+        <div class="notice-card-header">
+          <span class="notice-title" id="setup-banner-title">Finish connecting Antigravity</span>
+          <button type="button" class="tonal-pill-btn hidden" id="banner-reconnect-btn">Reconnect</button>
+        </div>
+        <p class="notice-desc" id="setup-banner-desc"></p>
       </section>
 
-      <!-- Slide-Down Drawer: Chrome Chat History -->
-      <aside class="drawer hidden" id="history-drawer">
-        <div class="drawer-header">
-          <div>
-            <h3>Chrome Side Panel Chats</h3>
-            <p class="drawer-note">
-              Chats started here automatically sync to your Antigravity Desktop App. Desktop-started chats control tabs via MCP and stay in the Desktop App.
-            </p>
+      <!-- Unified Navigation Drawer (Recent Chats & Scheduled Tasks) -->
+      <aside class="sheet-view hidden" id="history-drawer" aria-label="Activity menu">
+        <div class="sheet-header">
+          <div class="tonal-segmented drawer-tabs" id="drawer-tabs-group" role="tablist">
+            <button type="button" class="tonal-seg-btn active" id="tab-btn-chats" data-drawer-tab="chats">
+              Recent chats
+            </button>
+            <button type="button" class="tonal-seg-btn" id="tab-btn-schedules" data-drawer-tab="schedules">
+              Scheduled
+            </button>
           </div>
-          <button type="button" class="icon-btn" id="close-history-btn" title="Close">✕</button>
+          <button type="button" class="circle-icon-btn" id="close-history-btn" aria-label="Close menu">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.85">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
         </div>
-        <div class="drawer-list" id="history-list"></div>
+
+        <!-- Tab Panel: Recent Chats -->
+        <div class="drawer-panel" id="drawer-panel-chats">
+          <div class="drawer-subbar">
+            <p class="sheet-subtitle">Synced with your Antigravity desktop app</p>
+            <button type="button" class="tonal-pill-btn" id="open-desktop-btn">Open app ↗</button>
+          </div>
+          <div class="sheet-list" id="history-list"></div>
+        </div>
+
+        <!-- Tab Panel: Scheduled Tasks -->
+        <div class="drawer-panel hidden" id="drawer-panel-schedules">
+          <p class="sheet-subtitle">Run recurring page checks or browser workflows on a timer.</p>
+          <form class="tonal-form-card" id="schedule-form">
+            <input type="text" id="sched-name" placeholder="Task title (e.g. Morning briefing)" required />
+            <input type="url" id="sched-url" placeholder="Optional page URL (https://…)" />
+            <textarea id="sched-prompt" rows="2" placeholder="What should Antigravity do?" required></textarea>
+
+            <div class="form-chip-row">
+              <div class="tonal-segmented compact" id="sched-interval-group" role="group" aria-label="Frequency">
+                <button type="button" class="tonal-seg-btn" data-interval="15">15m</button>
+                <button type="button" class="tonal-seg-btn active" data-interval="60">1h</button>
+                <button type="button" class="tonal-seg-btn" data-interval="360">6h</button>
+                <button type="button" class="tonal-seg-btn" data-interval="1440">Daily</button>
+              </div>
+
+              <div class="tonal-segmented compact" id="sched-mode-group" role="group" aria-label="Mode">
+                <button type="button" class="tonal-seg-btn active" data-sched-mode="chat">Read</button>
+                <button type="button" class="tonal-seg-btn" data-sched-mode="agent">Agent</button>
+              </div>
+
+              <button type="submit" class="filled-pill-btn">Create</button>
+            </div>
+          </form>
+
+          <div class="sheet-list" id="schedules-list"></div>
+        </div>
       </aside>
 
-      <!-- Slide-Down Drawer: Scheduled Browser Tasks -->
-      <aside class="drawer hidden" id="schedules-drawer">
-        <div class="drawer-header">
-          <div>
-            <h3>Scheduled Browser Tasks</h3>
-            <p class="drawer-note">Automate recurring page checks or saved prompts while your browser is open.</p>
-          </div>
-          <button type="button" class="icon-btn" id="close-schedules-btn" title="Close">✕</button>
-        </div>
-        <form class="schedule-form" id="schedule-form">
-          <input type="text" id="sched-name" placeholder="Task name (e.g. Morning HN Digest)" required />
-          <input type="url" id="sched-url" placeholder="Optional target URL (https://...)" />
-          <textarea id="sched-prompt" rows="2" placeholder="Prompt or workflow instruction…" required></textarea>
-          <div class="schedule-form-row">
-            <select id="sched-interval" title="Run frequency">
-              <option value="15">Every 15 min</option>
-              <option value="60" selected>Every hour</option>
-              <option value="360">Every 6 hours</option>
-              <option value="1440">Daily (24h)</option>
-            </select>
-            <select id="sched-mode" title="Execution mode">
-              <option value="chat" selected>Chat (Read Page)</option>
-              <option value="agent">Agent (Browser Control)</option>
-            </select>
-            <button type="submit" class="primary-sm-btn">+ Schedule</button>
-          </div>
-        </form>
-        <div class="drawer-list" id="schedules-list"></div>
-      </aside>
-
-      <!-- Main Chat Timeline -->
+      <!-- Main Conversation Canvas -->
       <main class="chat-viewport" id="chat-viewport">
-        <!-- Empty / Welcome State -->
+        <!-- New Gemini Homepage Greeting ("Hi there" + Solid White "Where should we start?") -->
         <div class="welcome-state" id="welcome-state">
-          <div class="welcome-hero">
-            <img src="icons/icon128.png" width="46" height="46" alt="Antigravity" class="welcome-logo" />
-            <h2>Antigravity in Chrome</h2>
-            <p>
-              Chat with your live webpage, compare open tabs with <code>@</code>, trigger workflows with <code>/</code>, or switch to <strong>Agent Mode</strong> to let Antigravity drive your browser.
-            </p>
+          <div class="greeting-block">
+            <div class="greeting-eyebrow">
+              <svg class="greeting-spark-icon" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+                <use href="#gemini-spark-4c" />
+              </svg>
+              <span class="greeting-hi" id="greeting-headline">Hi there</span>
+            </div>
+            <h1 class="greeting-question">Where should we start?</h1>
           </div>
 
-          <div class="quick-grid" id="quick-grid">
-            <button type="button" class="quick-card" data-shortcut="summarize">
-              <span class="quick-cmd">/summarize</span>
-              <span class="quick-label">Summarize this page &amp; key takeaways</span>
+          <div class="suggestion-pills" id="quick-grid">
+            <button type="button" class="suggestion-pill" data-shortcut="summarize">
+              <span>Summarize this page</span>
             </button>
-            <button type="button" class="quick-card" data-shortcut="extract-table">
-              <span class="quick-cmd">/extract-table</span>
-              <span class="quick-label">Pull structured tables, prices, or specs</span>
+            <button type="button" class="suggestion-pill" data-shortcut="extract-table">
+              <span>Extract key data &amp; tables</span>
             </button>
-            <button type="button" class="quick-card" data-shortcut="audit-page">
-              <span class="quick-cmd">/audit-page</span>
-              <span class="quick-label">Inspect console errors &amp; UX issues</span>
+            <button type="button" class="suggestion-pill" data-shortcut="audit-page">
+              <span>Inspect console &amp; page issues</span>
             </button>
-            <button type="button" class="quick-card" data-shortcut="organize-tabs">
-              <span class="quick-cmd">/organize-tabs</span>
-              <span class="quick-label">Group open tabs into color Tab Groups</span>
+            <button type="button" class="suggestion-pill" data-shortcut="organize-tabs">
+              <span>Organize my open tabs</span>
             </button>
-          </div>
-
-          <div class="sync-hint-card">
-            <span>Synced two-way bridge:</span> Start chats here and view or continue them anytime inside the <strong>Antigravity Desktop App</strong>.
           </div>
         </div>
 
-        <!-- Dynamic Messages -->
+        <!-- Messages Stream -->
         <div class="messages-list" id="messages-list"></div>
       </main>
 
-      <!-- Composer Area -->
+      <!-- New Gemini Edge-to-Edge Rounded Bottom Prompt Sheet -->
       <footer class="composer-dock">
-        <!-- Popover: / Slash Shortcuts & Save Shortcut -->
-        <div class="popover hidden" id="slash-popover">
-          <div class="popover-header">
-            <span>Slash Shortcuts &amp; Skills</span>
-            <button type="button" class="text-link-btn" id="open-save-shortcut-btn">+ Save Custom</button>
+        <!-- Upward Popover: + Add & Tools Menu (Bottom-Left) -->
+        <div class="floating-menu add-menu hidden" id="add-menu-popover" role="menu">
+          <button type="button" class="menu-action-item" id="menu-share-tabs-btn">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="3.5" y="5" width="17" height="14" rx="2.8" />
+              <path d="M3.5 9.2h17" stroke-linecap="round" />
+            </svg>
+            <div class="menu-action-copy">
+              <span class="menu-action-title">Share open tabs</span>
+              <span class="menu-action-sub">Include up to 10 tabs with @</span>
+            </div>
+          </button>
+
+          <button type="button" class="menu-action-item" id="screenshot-btn">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="3.5" y="5" width="17" height="14" rx="2.8" />
+              <circle cx="9" cy="10.2" r="1.6" />
+              <path d="M20.5 15.2l-4.2-4.2L9.5 18" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <div class="menu-action-copy">
+              <span class="menu-action-title">Capture current view</span>
+              <span class="menu-action-sub">Attach visible page screenshot</span>
+            </div>
+          </button>
+
+          <button type="button" class="menu-action-item" id="menu-shortcuts-btn">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M4 7h10M18 7h2M14 5v4M4 17h4M12 17h8M8 15v4" stroke-linecap="round" />
+            </svg>
+            <div class="menu-action-copy">
+              <span class="menu-action-title">Shortcuts &amp; skills</span>
+              <span class="menu-action-sub">Run or save / workflows</span>
+            </div>
+          </button>
+
+          <button type="button" class="menu-action-item" id="schedules-btn">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="12" cy="12" r="8.2" />
+              <path d="M12 7.6v4.6l3 1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <div class="menu-action-copy">
+              <span class="menu-action-title">Scheduled tasks</span>
+              <span class="menu-action-sub">Automate recurring checks</span>
+            </div>
+          </button>
+        </div>
+
+        <!-- Upward Popover: Bottom-Right Model & Thinking/Approval Picker -->
+        <div class="floating-menu model-menu hidden" id="model-popover" role="menu">
+          <div class="menu-section-label">Choose your model</div>
+          <div class="model-options-list" id="model-options-list"></div>
+
+          <div class="menu-divider"></div>
+          <div class="menu-section-label">Action approval</div>
+          <div class="tonal-segmented" id="permission-segmented" role="radiogroup" aria-label="Action approval">
+            <button type="button" class="tonal-seg-btn active" data-perm="auto">Auto</button>
+            <button type="button" class="tonal-seg-btn" data-perm="default">Ask</button>
+            <button type="button" class="tonal-seg-btn" data-perm="plan">Plan</button>
           </div>
-          <div class="save-shortcut-box hidden" id="save-shortcut-box">
-            <input type="text" id="custom-sc-cmd" placeholder="Command name (e.g. weekly-brief)" />
+
+          <div class="menu-bridge-row hidden" id="bridge-reconnect-row">
+            <span class="bridge-status-caption" id="bridge-label">Offline</span>
+            <button type="button" class="tonal-pill-btn" id="bridge-status-btn">Reconnect</button>
+          </div>
+        </div>
+
+        <!-- Upward Popover: / Shortcuts & Skills -->
+        <div class="floating-menu picker-popover hidden" id="slash-popover">
+          <div class="picker-header">
+            <span class="picker-title">Shortcuts &amp; skills</span>
+            <button type="button" class="text-pill-btn" id="open-save-shortcut-btn">+ New shortcut</button>
+          </div>
+          <div class="tonal-subform hidden" id="save-shortcut-box">
+            <input type="text" id="custom-sc-cmd" placeholder="Shortcut name (e.g. brief)" />
             <input type="text" id="custom-sc-title" placeholder="Short description" />
-            <textarea id="custom-sc-prompt" rows="2" placeholder="Reusable prompt template…"></textarea>
-            <div class="save-shortcut-actions">
-              <select id="custom-sc-mode">
-                <option value="chat">Chat Mode</option>
-                <option value="agent">Agent Mode</option>
-              </select>
-              <button type="button" class="primary-sm-btn" id="save-custom-sc-btn">Save /shortcut</button>
+            <textarea id="custom-sc-prompt" rows="2" placeholder="Prompt instructions…"></textarea>
+            <div class="form-chip-row">
+              <div class="tonal-segmented compact" id="custom-sc-mode-group">
+                <button type="button" class="tonal-seg-btn active" data-sc-mode="chat">Read</button>
+                <button type="button" class="tonal-seg-btn" data-sc-mode="agent">Agent</button>
+              </div>
+              <button type="button" class="filled-pill-btn" id="save-custom-sc-btn">Save</button>
             </div>
           </div>
-          <div class="popover-list" id="slash-list"></div>
+          <div class="picker-list" id="slash-list"></div>
         </div>
 
-        <!-- Popover: @ Open Tabs Picker -->
-        <div class="popover hidden" id="tabs-popover">
-          <div class="popover-header">
-            <span>Attach Open Tabs (<code>@</code>)</span>
-            <button type="button" class="text-link-btn" id="group-mentioned-btn" title="Group attached tabs in browser">
-              Group Attached
-            </button>
+        <!-- Upward Popover: @ Open Tabs Picker -->
+        <div class="floating-menu picker-popover hidden" id="tabs-popover">
+          <div class="picker-header">
+            <span class="picker-title">Share open tabs</span>
+            <button type="button" class="text-pill-btn" id="group-mentioned-btn">Group tabs</button>
           </div>
-          <div class="popover-list" id="tabs-picker-list"></div>
+          <div class="picker-list" id="tabs-picker-list"></div>
         </div>
 
-        <!-- Active Tab & Attachments Context Bar -->
-        <div class="context-bar">
-          <label class="active-tab-pill" id="active-tab-pill" title="Include active tab content in your prompt">
-            <input type="checkbox" id="include-active-tab" checked />
-            <span class="tab-pill-title" id="active-tab-title">Current Tab</span>
-          </label>
+        <!-- The Signature New Gemini Rounded-Top Prompt Sheet -->
+        <div class="composer-sheet" id="composer-card">
+          <!-- Shared Tab & Attachment Context Shelf -->
+          <div class="context-shelf" id="context-shelf">
+            <div class="shared-page-chip" id="active-tab-chip">
+              <img class="tab-favicon hidden" id="active-tab-favicon" alt="" width="14" height="14" />
+              <svg
+                class="tab-globe-icon"
+                id="active-tab-globe"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+              >
+                <circle cx="12" cy="12" r="8.5" />
+                <path
+                  d="M3.8 12h16.4M12 3.5c2.4 2.4 3.7 5.4 3.7 8.5s-1.3 6.1-3.7 8.5c-2.4-2.4-3.7-5.4-3.7-8.5s1.3-6.1 3.7-8.5Z"
+                />
+              </svg>
+              <span class="shared-page-title" id="active-tab-title">Current page</span>
+              <button
+                type="button"
+                class="chip-dismiss-btn"
+                id="unshare-active-tab-btn"
+                title="Stop sharing current page"
+                aria-label="Stop sharing current page"
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
 
-          <div class="context-tools">
-            <button type="button" class="chip-btn" id="mention-tabs-btn" title="Attach additional open tabs (@)">
-              @ Tabs
+            <button type="button" class="reshare-page-chip hidden" id="reshare-active-tab-btn">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M8 3.2v9.6M3.2 8h9.6" stroke-linecap="round" />
+              </svg>
+              <span>Share current tab</span>
             </button>
-            <button type="button" class="chip-btn" id="screenshot-btn" title="Attach visible tab screenshot">
-              📷
-            </button>
-            <button type="button" class="chip-btn" id="slash-btn" title="Browse / shortcuts &amp; skills">
-              /
-            </button>
+
+            <div class="extra-chips-wrap" id="attachment-chips"></div>
           </div>
-        </div>
 
-        <!-- Attached @-Tabs & Screenshot Chips -->
-        <div class="attachment-chips hidden" id="attachment-chips"></div>
-
-        <!-- Prompt Input Box -->
-        <div class="input-frame">
+          <!-- Prompt Input -->
           <textarea
             id="prompt-input"
-            rows="2"
-            placeholder="Ask about this page, type / for shortcuts, @ for tabs…"
+            rows="1"
+            placeholder="Ask Antigravity"
+            aria-label="Ask Antigravity"
           ></textarea>
 
-          <div class="composer-controls">
-            <div class="left-controls">
-              <!-- Chat vs Agent Mode Switch -->
-              <div class="mode-segmented" role="group" aria-label="Interaction mode">
-                <button
-                  type="button"
-                  class="seg-btn active"
-                  id="mode-chat-btn"
-                  data-mode="chat"
-                  title="Chat Mode: Read &amp; analyze pages without debugger banner"
-                >
-                  Chat
-                </button>
-                <button
-                  type="button"
-                  class="seg-btn"
-                  id="mode-agent-btn"
-                  data-mode="agent"
-                  title="Agent Mode: Click, type, navigate &amp; manage Tab Groups"
-                >
-                  Agent
-                </button>
-              </div>
+          <!-- New Gemini Bottom Controls Row: [+][Agent] ... [Model ▾][Send] -->
+          <div class="composer-toolbar">
+            <div class="toolbar-left">
+              <button
+                type="button"
+                class="composer-circle-btn"
+                id="add-menu-btn"
+                title="Add tabs, screenshot, or shortcuts"
+                aria-label="Add context or tools"
+              >
+                <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9">
+                  <path d="M12 5v14M5 12h14" stroke-linecap="round" />
+                </svg>
+              </button>
 
-              <!-- Permission Policy Selector -->
-              <select id="permission-select" class="compact-select" title="Permission mode">
-                <option value="auto" selected>Auto</option>
-                <option value="default">Ask</option>
-                <option value="plan">Plan</option>
-              </select>
-
-              <!-- Model Selector -->
-              <select id="model-select" class="compact-select model-select" title="Antigravity Model">
-                <option value="gemini-4-carbon-medium">Gemini 4 Carbon</option>
-              </select>
+              <button
+                type="button"
+                class="tools-toggle-pill"
+                id="agent-mode-toggle"
+                aria-pressed="false"
+                title="Toggle Auto Browse / Agent Mode"
+              >
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.85">
+                  <path d="M4 8h9M17 8h3M13 5.5v5M4 16h3M11 16h9M7 13.5v5" stroke-linecap="round" />
+                </svg>
+                <span>Agent</span>
+              </button>
             </div>
 
-            <div class="right-controls">
-              <button type="button" class="send-btn" id="send-btn" title="Send (Enter)">
-                <svg id="send-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1">
-                  <path d="M10 15V5M5.5 9.5L10 5l4.5 4.5" stroke-linecap="round" stroke-linejoin="round" />
+            <div class="toolbar-right">
+              <button
+                type="button"
+                class="composer-model-pill"
+                id="model-menu-btn"
+                aria-haspopup="true"
+                aria-expanded="false"
+                title="Switch model &amp; approval mode"
+              >
+                <span class="model-current-label" id="model-current-label">Pro</span>
+                <svg
+                  class="chevron-xs"
+                  viewBox="0 0 20 20"
+                  width="14"
+                  height="14"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.9"
+                >
+                  <path d="M5.5 7.75L10 12.25l4.5-4.5" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
-                <svg id="stop-icon" class="hidden" viewBox="0 0 20 20" width="14" height="14" fill="currentColor">
-                  <rect x="5" y="5" width="10" height="10" rx="2" />
+              </button>
+
+              <button type="button" class="send-fab" id="send-btn" title="Send" aria-label="Send" disabled>
+                <svg
+                  id="send-icon"
+                  viewBox="0 0 24 24"
+                  width="18"
+                  height="18"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.2"
+                >
+                  <path d="M12 19V5M6 11l6-6 6 6" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <svg id="stop-icon" class="hidden" viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2.6" />
                 </svg>
               </button>
             </div>

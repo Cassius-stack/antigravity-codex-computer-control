@@ -1,4 +1,4 @@
-// Antigravity in Chrome — Docked Side Panel UI & Live ACP Streaming Client
+// Antigravity in Chrome — Crafted Google Gemini Side Panel & Live ACP Client
 
 const state = {
   currentSessionId: null,
@@ -6,6 +6,7 @@ const state = {
   interactionMode: "chat", // "chat" | "agent"
   permissionMode: "auto", // "auto" | "default" | "plan"
   modelId: "gemini-4-carbon-medium",
+  models: [{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon" }],
   running: false,
   activeRequestId: null,
   includeActiveTab: true,
@@ -19,13 +20,39 @@ const state = {
   schedules: [],
   bridgeStatus: null,
   agentStatus: null,
+  schedInterval: 60,
+  schedMode: "chat",
+  customScMode: "chat",
 };
 
-// DOM Elements
+// SVG Snippets (Crisp Material Symbols & New 4-Color Rounded Gemini Spark)
+const SVG = {
+  sparkle: `<svg viewBox="0 0 32 32" width="21" height="21" aria-hidden="true"><use href="#gemini-spark-4c"/></svg>`,
+  chevronDown: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M5.5 7.75L10 12.25l4.5-4.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  check: `<svg class="model-option-check" viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4.2 10.5l3.8 3.8 7.8-8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  spinner: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M10 3a7 7 0 1 1-4.95 2.05" stroke-linecap="round"/></svg>`,
+  checkSmall: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true"><path d="M4.5 10.5l3.6 3.6 7.4-7.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  alertSmall: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6.5v4M10 13.5h.01" stroke-linecap="round"/></svg>`,
+  closeXs: `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke-linecap="round"/></svg>`,
+  globeXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M3 10h14M10 2.8c2 2 3.1 4.5 3.1 7.2S12 15.2 10 17.2c-2-2-3.1-4.5-3.1-7.2S8 4.8 10 2.8Z"/></svg>`,
+  imageXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="2.8" y="4" width="14.4" height="12" rx="2.2"/><circle cx="7.4" cy="8.4" r="1.3"/><path d="M17.2 13l-3.6-3.6L7.8 15.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  copySm: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="6.8" y="6.8" width="9.4" height="9.4" rx="2"/><path d="M4.2 12.8V5.2a1.8 1.8 0 0 1 1.8-1.8h7.6" stroke-linecap="round"/></svg>`,
+  openExtSm: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M11.5 4.5h4v4M15.5 4.5L8.5 11.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 5.5H5.8A1.8 1.8 0 0 0 4 7.3v6.9A1.8 1.8 0 0 0 5.8 16h6.9a1.8 1.8 0 0 0 1.8-1.8V11" stroke-linecap="round"/></svg>`,
+  slashSm: `<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12.5 4L7.5 16" stroke-linecap="round"/></svg>`,
+};
+
+// DOM References
 const headerTitleEl = document.getElementById("header-title");
-const bridgeStatusBtn = document.getElementById("bridge-status-btn");
+const modelMenuBtn = document.getElementById("model-menu-btn");
+const modelCurrentLabelEl = document.getElementById("model-current-label");
+const modelPopover = document.getElementById("model-popover");
+const modelOptionsListEl = document.getElementById("model-options-list");
+const permissionSegmentedEl = document.getElementById("permission-segmented");
 const bridgeDotEl = document.getElementById("bridge-dot");
+const bridgeReconnectRow = document.getElementById("bridge-reconnect-row");
 const bridgeLabelEl = document.getElementById("bridge-label");
+const bridgeStatusBtn = document.getElementById("bridge-status-btn");
+
 const newChatBtn = document.getElementById("new-chat-btn");
 const historyBtn = document.getElementById("history-btn");
 const schedulesBtn = document.getElementById("schedules-btn");
@@ -38,50 +65,74 @@ const detachAllBtn = document.getElementById("detach-all-btn");
 const setupBanner = document.getElementById("setup-banner");
 const setupBannerTitle = document.getElementById("setup-banner-title");
 const setupBannerDesc = document.getElementById("setup-banner-desc");
+const bannerReconnectBtn = document.getElementById("banner-reconnect-btn");
 
 const historyDrawer = document.getElementById("history-drawer");
 const closeHistoryBtn = document.getElementById("close-history-btn");
+const drawerTabsGroup = document.getElementById("drawer-tabs-group");
+const drawerPanelChats = document.getElementById("drawer-panel-chats");
+const drawerPanelSchedules = document.getElementById("drawer-panel-schedules");
 const historyListEl = document.getElementById("history-list");
 
-const schedulesDrawer = document.getElementById("schedules-drawer");
-const closeSchedulesBtn = document.getElementById("close-schedules-btn");
 const scheduleForm = document.getElementById("schedule-form");
+const schedIntervalGroup = document.getElementById("sched-interval-group");
+const schedModeGroup = document.getElementById("sched-mode-group");
 const schedulesListEl = document.getElementById("schedules-list");
 
 const chatViewport = document.getElementById("chat-viewport");
 const welcomeStateEl = document.getElementById("welcome-state");
+const greetingHeadlineEl = document.getElementById("greeting-headline");
 const quickGridEl = document.getElementById("quick-grid");
 const messagesListEl = document.getElementById("messages-list");
+
+const addMenuBtn = document.getElementById("add-menu-btn");
+const addMenuPopover = document.getElementById("add-menu-popover");
+const menuShareTabsBtn = document.getElementById("menu-share-tabs-btn");
+const screenshotBtn = document.getElementById("screenshot-btn");
+const menuShortcutsBtn = document.getElementById("menu-shortcuts-btn");
 
 const slashPopover = document.getElementById("slash-popover");
 const slashListEl = document.getElementById("slash-list");
 const openSaveShortcutBtn = document.getElementById("open-save-shortcut-btn");
 const saveShortcutBox = document.getElementById("save-shortcut-box");
+const customScModeGroup = document.getElementById("custom-sc-mode-group");
 const saveCustomScBtn = document.getElementById("save-custom-sc-btn");
 
 const tabsPopover = document.getElementById("tabs-popover");
 const tabsPickerListEl = document.getElementById("tabs-picker-list");
 const groupMentionedBtn = document.getElementById("group-mentioned-btn");
 
-const includeActiveTabCb = document.getElementById("include-active-tab");
+const activeTabChipEl = document.getElementById("active-tab-chip");
+const activeTabFaviconEl = document.getElementById("active-tab-favicon");
+const activeTabGlobeEl = document.getElementById("active-tab-globe");
 const activeTabTitleEl = document.getElementById("active-tab-title");
-const mentionTabsBtn = document.getElementById("mention-tabs-btn");
-const screenshotBtn = document.getElementById("screenshot-btn");
-const slashBtn = document.getElementById("slash-btn");
+const unshareActiveTabBtn = document.getElementById("unshare-active-tab-btn");
+const reshareActiveTabBtn = document.getElementById("reshare-active-tab-btn");
 const attachmentChipsEl = document.getElementById("attachment-chips");
 
-const inputFrameEl = document.querySelector(".input-frame");
 const promptInput = document.getElementById("prompt-input");
-const modeChatBtn = document.getElementById("mode-chat-btn");
-const modeAgentBtn = document.getElementById("mode-agent-btn");
-const permissionSelect = document.getElementById("permission-select");
-const modelSelect = document.getElementById("model-select");
+const agentModeToggle = document.getElementById("agent-mode-toggle");
 const sendBtn = document.getElementById("send-btn");
 const sendIcon = document.getElementById("send-icon");
 const stopIcon = document.getElementById("stop-icon");
 
-// Active streaming assistant DOM references for the current turn
 let liveAssistantRefs = null;
+
+activeTabFaviconEl.addEventListener("error", () => {
+  activeTabFaviconEl.classList.add("hidden");
+  activeTabGlobeEl.classList.remove("hidden");
+});
+
+function updateGreetingByTime() {
+  const hr = new Date().getHours();
+  if (hr >= 5 && hr < 12) {
+    greetingHeadlineEl.textContent = "Good morning";
+  } else if (hr >= 12 && hr < 18) {
+    greetingHeadlineEl.textContent = "Good afternoon";
+  } else {
+    greetingHeadlineEl.textContent = "Hi there";
+  }
+}
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -94,19 +145,16 @@ function escapeHtml(str) {
 
 function formatInlineMarkdown(escapedLine) {
   let out = escapedLine;
-  // Inline code
   out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
-  // Safe external links [label](https://...)
-  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  // Bold & italic
+  out = out.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+  );
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/(^|[\s(])\*([^*]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
   return out;
 }
 
-/**
- * Safe, zero-XSS Markdown-to-HTML renderer for assistant responses.
- */
 function renderMarkdownSafe(rawMarkdown) {
   const src = String(rawMarkdown ?? "").replace(/\r\n/g, "\n");
   if (!src.trim()) return "";
@@ -239,7 +287,7 @@ function renderMarkdownSafe(rawMarkdown) {
 }
 
 function isNearBottom() {
-  return chatViewport.scrollHeight - chatViewport.scrollTop - chatViewport.clientHeight < 90;
+  return chatViewport.scrollHeight - chatViewport.scrollTop - chatViewport.clientHeight < 96;
 }
 
 function scrollToBottom(force = false) {
@@ -248,65 +296,122 @@ function scrollToBottom(force = false) {
   }
 }
 
+function closeAllPopovers() {
+  modelPopover.classList.add("hidden");
+  modelMenuBtn.setAttribute("aria-expanded", "false");
+  addMenuPopover.classList.add("hidden");
+  addMenuBtn.classList.remove("active");
+  slashPopover.classList.add("hidden");
+  tabsPopover.classList.add("hidden");
+}
+
+function syncSendButtonState() {
+  if (state.running) {
+    sendBtn.disabled = false;
+    sendBtn.classList.add("running");
+    sendIcon.classList.add("hidden");
+    stopIcon.classList.remove("hidden");
+    sendBtn.title = "Stop response";
+    sendBtn.setAttribute("aria-label", "Stop response");
+  } else {
+    const hasText = promptInput.value.trim().length > 0;
+    sendBtn.disabled = !hasText;
+    sendBtn.classList.remove("running");
+    sendIcon.classList.remove("hidden");
+    stopIcon.classList.add("hidden");
+    sendBtn.title = "Send";
+    sendBtn.setAttribute("aria-label", "Send");
+  }
+}
+
 function updateModeUI() {
   const isAgent = state.interactionMode === "agent";
-  modeChatBtn.classList.toggle("active", !isAgent);
-  modeAgentBtn.classList.toggle("active", isAgent);
-  inputFrameEl.classList.toggle("agent-mode", isAgent);
-  promptInput.placeholder = isAgent
-    ? "Tell Antigravity what to click, fill, upload, or group in your browser…"
-    : "Ask about this page, type / for shortcuts, @ for tabs…";
+  agentModeToggle.classList.toggle("active", isAgent);
+  agentModeToggle.setAttribute("aria-pressed", isAgent ? "true" : "false");
+  promptInput.placeholder = isAgent ? "Ask Antigravity to act on this page" : "Ask Antigravity";
 }
 
 function updateRunningUI(running) {
   state.running = Boolean(running);
-  sendBtn.classList.toggle("running", state.running);
-  sendIcon.classList.toggle("hidden", state.running);
-  stopIcon.classList.toggle("hidden", !state.running);
-  sendBtn.title = state.running ? "Stop active turn" : "Send (Enter)";
+  syncSendButtonState();
+}
+
+function formatShortModelName(rawName) {
+  const cleaned = String(rawName || "Pro")
+    .replace(/\s*\(.*?\)\s*/g, "")
+    .replace(/^Gemini\s+/i, "")
+    .trim();
+  return cleaned || "Pro";
+}
+
+function renderModelMenu() {
+  const activeModel = state.models.find((m) => m.modelId === state.modelId) || state.models[0];
+  modelCurrentLabelEl.textContent = formatShortModelName(activeModel?.name || state.modelId);
+
+  modelOptionsListEl.innerHTML = "";
+  for (const m of state.models) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const selected = m.modelId === state.modelId;
+    btn.className = `model-option-btn${selected ? " selected" : ""}`;
+    btn.innerHTML = `<span>${escapeHtml(m.name || m.modelId)}</span>${SVG.check}`;
+    btn.addEventListener("click", () => {
+      state.modelId = m.modelId;
+      renderModelMenu();
+      closeAllPopovers();
+      if (state.currentSessionId) {
+        chrome.runtime.sendMessage({
+          type: "sidepanel:setConfig",
+          payload: { sessionId: state.currentSessionId, modelId: state.modelId },
+        });
+      }
+    });
+    modelOptionsListEl.appendChild(btn);
+  }
+
+  for (const seg of permissionSegmentedEl.querySelectorAll(".tonal-seg-btn")) {
+    seg.classList.toggle("active", seg.dataset.perm === state.permissionMode);
+  }
 }
 
 function renderBridgeStatus(status) {
   if (!status) return;
   state.bridgeStatus = status;
   const online = Boolean(status.nativeConnected);
-  bridgeDotEl.classList.toggle("online", online);
-  bridgeDotEl.classList.toggle("offline", !online);
-  const bName = status.browserName || "Browser";
-  bridgeLabelEl.textContent = online ? bName : "Offline";
 
+  bridgeDotEl.classList.toggle("hidden", online);
+  bridgeReconnectRow.classList.toggle("hidden", online);
+  bridgeLabelEl.textContent = online ? "Connected" : "Native bridge offline";
+
+  // Show live browser control pill ONLY when tabs or Tab Groups are actively being controlled
   const attachedCount = Number(status.attachedTabCount || 0);
   const groups = Array.isArray(status.sessionGroups) ? status.sessionGroups : [];
-  const desktopClients = Number(status.desktopBridgeInfo?.desktopMcpClients || 0);
 
-  if (attachedCount > 0 || groups.length > 0 || desktopClients > 0) {
+  if (attachedCount > 0 || groups.length > 0) {
     desktopActivityBar.classList.remove("hidden");
     const parts = [];
-    if (desktopClients > 0) {
-      parts.push(`Desktop MCP connected`);
-    }
     if (groups.length > 0) {
-      parts.push(`Group: ${groups.map((g) => g.title || "Antigravity").join(", ")}`);
+      parts.push(groups.map((g) => g.title || "Antigravity").join(", "));
     }
     if (attachedCount > 0) {
-      parts.push(`${attachedCount} tab${attachedCount > 1 ? "s" : ""} attached`);
+      parts.push(`${attachedCount} tab${attachedCount > 1 ? "s" : ""} active`);
     }
     desktopActivityText.textContent = parts.join(" · ");
-    detachAllBtn.classList.toggle("hidden", attachedCount === 0 && groups.length === 0);
   } else {
     desktopActivityBar.classList.add("hidden");
   }
 
   if (!online && status.lastNativeError) {
     setupBanner.classList.remove("hidden");
-    setupBannerTitle.textContent = "Native Bridge Offline";
-    setupBannerDesc.textContent =
-      "Run ./install.sh in antigravity-codex-computer-control, then click the Offline badge above to reconnect.";
+    bannerReconnectBtn.classList.remove("hidden");
+    setupBannerTitle.textContent = "Native bridge disconnected";
+    setupBannerDesc.textContent = "Run ./install.sh once if not set up yet, then tap Reconnect.";
   } else if (state.agentStatus && state.agentStatus.ok && !state.agentStatus.agyFound) {
     setupBanner.classList.remove("hidden");
-    setupBannerTitle.textContent = "Antigravity CLI ('agy') Needed for Side Panel Chat";
+    bannerReconnectBtn.classList.add("hidden");
+    setupBannerTitle.textContent = "Enable Antigravity CLI ('agy')";
     setupBannerDesc.textContent =
-      "Desktop App → Browser tab control is active! Install the 'agy' CLI from Antigravity Settings → CLI to chat directly inside this Side Panel.";
+      "Install 'agy' from Antigravity Settings → CLI to chat directly inside this Side Panel.";
   } else {
     setupBanner.classList.add("hidden");
   }
@@ -319,22 +424,45 @@ function populateAgentCatalog(agentStatus) {
     state.agySkills = agentStatus.availableCommands;
   }
   if (Array.isArray(agentStatus.models) && agentStatus.models.length > 0) {
-    const prevVal = modelSelect.value;
-    modelSelect.innerHTML = "";
-    for (const m of agentStatus.models) {
-      const opt = document.createElement("option");
-      opt.value = m.modelId;
-      opt.textContent = m.name || m.modelId;
-      modelSelect.appendChild(opt);
+    state.models = agentStatus.models;
+    if (!state.models.some((m) => m.modelId === state.modelId)) {
+      state.modelId = agentStatus.currentModelId || state.models[0].modelId;
     }
-    if ([...modelSelect.options].some((o) => o.value === prevVal)) {
-      modelSelect.value = prevVal;
-    } else if (agentStatus.currentModelId) {
-      modelSelect.value = agentStatus.currentModelId;
-    }
-    state.modelId = modelSelect.value;
   }
+  renderModelMenu();
   renderBridgeStatus(state.bridgeStatus);
+}
+
+function syncSharedPageChipUI() {
+  const active = state.activeTab;
+  if (!active) {
+    activeTabChipEl.classList.add("hidden");
+    reshareActiveTabBtn.classList.add("hidden");
+    return;
+  }
+
+  if (state.includeActiveTab) {
+    activeTabChipEl.classList.remove("hidden");
+    reshareActiveTabBtn.classList.add("hidden");
+
+    let host = "";
+    try {
+      host = new URL(active.url).hostname.replace(/^www\./, "");
+    } catch {}
+    activeTabTitleEl.textContent = active.title || host || "Current page";
+
+    if (active.favIconUrl && /^https?:|^data:/i.test(active.favIconUrl)) {
+      activeTabFaviconEl.src = active.favIconUrl;
+      activeTabFaviconEl.classList.remove("hidden");
+      activeTabGlobeEl.classList.add("hidden");
+    } else {
+      activeTabFaviconEl.classList.add("hidden");
+      activeTabGlobeEl.classList.remove("hidden");
+    }
+  } else {
+    activeTabChipEl.classList.add("hidden");
+    reshareActiveTabBtn.classList.remove("hidden");
+  }
 }
 
 function updateActiveTabBar(tabs) {
@@ -344,19 +472,8 @@ function updateActiveTabBar(tabs) {
     state.allTabs.find((t) => t.active) ||
     null;
   state.activeTab = active;
+  syncSharedPageChipUI();
 
-  if (active) {
-    let host = "";
-    try {
-      host = new URL(active.url).hostname.replace(/^www\./, "");
-    } catch {}
-    const label = active.title || host || "Current Tab";
-    activeTabTitleEl.textContent = host && !label.includes(host) ? `${label} (${host})` : label;
-  } else {
-    activeTabTitleEl.textContent = "No active webpage";
-  }
-
-  // Prune closed tabs from mentionedTabIds
   const validIds = new Set(state.allTabs.map((t) => t.tabId));
   for (const id of Array.from(state.mentionedTabIds)) {
     if (!validIds.has(id)) state.mentionedTabIds.delete(id);
@@ -366,19 +483,30 @@ function updateActiveTabBar(tabs) {
 
 function renderAttachmentChips() {
   attachmentChipsEl.innerHTML = "";
-  let count = 0;
 
   for (const tid of state.mentionedTabIds) {
     const tab = state.allTabs.find((t) => t.tabId === tid);
     if (!tab) continue;
-    count++;
     const chip = document.createElement("div");
     chip.className = "removable-chip";
-    chip.innerHTML = `<span>@${escapeHtml(tab.title || tab.url || `Tab #${tid}`)}</span>`;
+
+    if (tab.favIconUrl && /^https?:|^data:/i.test(tab.favIconUrl)) {
+      const fav = document.createElement("img");
+      fav.className = "tab-favicon";
+      fav.src = tab.favIconUrl;
+      fav.alt = "";
+      fav.addEventListener("error", () => fav.remove());
+      chip.appendChild(fav);
+    }
+
+    const lbl = document.createElement("span");
+    lbl.textContent = tab.title || tab.url || `Tab ${tid}`;
+    chip.appendChild(lbl);
+
     const rm = document.createElement("button");
     rm.type = "button";
-    rm.className = "chip-remove-btn";
-    rm.textContent = "✕";
+    rm.className = "chip-dismiss-btn";
+    rm.innerHTML = SVG.closeXs;
     rm.addEventListener("click", () => {
       state.mentionedTabIds.delete(tid);
       renderAttachmentChips();
@@ -388,14 +516,23 @@ function renderAttachmentChips() {
   }
 
   if (state.screenshot) {
-    count++;
     const chip = document.createElement("div");
     chip.className = "removable-chip";
-    chip.innerHTML = `<span>📷 Page Screenshot</span>`;
+    if (state.screenshot.dataUrl) {
+      const thumb = document.createElement("img");
+      thumb.className = "shot-thumb";
+      thumb.src = state.screenshot.dataUrl;
+      thumb.alt = "";
+      chip.appendChild(thumb);
+    }
+    const lbl = document.createElement("span");
+    lbl.textContent = "Page view";
+    chip.appendChild(lbl);
+
     const rm = document.createElement("button");
     rm.type = "button";
-    rm.className = "chip-remove-btn";
-    rm.textContent = "✕";
+    rm.className = "chip-dismiss-btn";
+    rm.innerHTML = SVG.closeXs;
     rm.addEventListener("click", () => {
       state.screenshot = null;
       renderAttachmentChips();
@@ -403,14 +540,12 @@ function renderAttachmentChips() {
     chip.appendChild(rm);
     attachmentChipsEl.appendChild(chip);
   }
-
-  attachmentChipsEl.classList.toggle("hidden", count === 0);
 }
 
 function appendUserMessageDOM(text, attachments = []) {
   welcomeStateEl.classList.add("hidden");
-  const wrap = document.createElement("div");
-  wrap.className = "msg-user";
+  const turnWrap = document.createElement("div");
+  turnWrap.className = "user-turn-wrap";
 
   if (Array.isArray(attachments) && attachments.length > 0) {
     const attRow = document.createElement("div");
@@ -419,22 +554,24 @@ function appendUserMessageDOM(text, attachments = []) {
       const b = document.createElement("span");
       b.className = "att-badge";
       if (att.kind === "screenshot") {
-        b.textContent = "📷 Screenshot";
-      } else if (att.kind === "mentioned-tab") {
-        b.textContent = `@ ${att.title || `Tab #${att.tabId}`}`;
+        b.innerHTML = `${SVG.imageXs}<span>Page view</span>`;
       } else {
-        b.textContent = `📄 ${att.title || "Active Tab"}`;
+        b.innerHTML = `${SVG.globeXs}<span>${escapeHtml(att.title || "Shared page")}</span>`;
       }
       attRow.appendChild(b);
     }
-    wrap.appendChild(attRow);
+    turnWrap.appendChild(attRow);
   }
 
+  const bubble = document.createElement("div");
+  bubble.className = "msg-user";
   const txtEl = document.createElement("div");
   txtEl.className = "msg-user-text";
   txtEl.textContent = text;
-  wrap.appendChild(txtEl);
-  messagesListEl.appendChild(wrap);
+  bubble.appendChild(txtEl);
+
+  turnWrap.appendChild(bubble);
+  messagesListEl.appendChild(turnWrap);
   scrollToBottom(true);
 }
 
@@ -443,15 +580,40 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
   const container = document.createElement("div");
   container.className = "msg-assistant";
 
-  const thoughtDetails = document.createElement("details");
-  thoughtDetails.className = `thought-details${thoughts ? "" : " hidden"}`;
-  if (streaming && thoughts && !text) thoughtDetails.open = true;
-  const thoughtSummary = document.createElement("summary");
-  thoughtSummary.textContent = streaming ? "Thinking…" : "Thought process";
+  const metaRow = document.createElement("div");
+  metaRow.className = "assistant-meta-row";
+
+  const sparkleEl = document.createElement("span");
+  sparkleEl.className = `assistant-sparkle${streaming ? " streaming" : ""}`;
+  sparkleEl.innerHTML = SVG.sparkle;
+
+  const thoughtToggleBtn = document.createElement("button");
+  thoughtToggleBtn.type = "button";
+  thoughtToggleBtn.className = `thought-toggle-btn${thoughts ? "" : " hidden"}`;
+  const startOpen = Boolean(streaming && thoughts && !text);
+  thoughtToggleBtn.setAttribute("aria-expanded", startOpen ? "true" : "false");
+
+  const thoughtLabel = document.createElement("span");
+  thoughtLabel.textContent = streaming && !text ? "Thinking" : "Show thinking";
+  thoughtToggleBtn.innerHTML = "";
+  thoughtToggleBtn.append(thoughtLabel);
+  thoughtToggleBtn.insertAdjacentHTML("beforeend", SVG.chevronDown);
+
   const thoughtBody = document.createElement("div");
-  thoughtBody.className = "thought-body";
+  thoughtBody.className = `thought-body${startOpen ? "" : " hidden"}`;
   thoughtBody.textContent = thoughts || "";
-  thoughtDetails.append(thoughtSummary, thoughtBody);
+
+  thoughtToggleBtn.addEventListener("click", () => {
+    const expanded = thoughtToggleBtn.getAttribute("aria-expanded") === "true";
+    const next = !expanded;
+    thoughtToggleBtn.setAttribute("aria-expanded", next ? "true" : "false");
+    thoughtBody.classList.toggle("hidden", !next);
+    if (!container.dataset.streaming) {
+      thoughtLabel.textContent = next ? "Hide thinking" : "Show thinking";
+    }
+  });
+
+  metaRow.append(sparkleEl, thoughtToggleBtn);
 
   const toolsStack = document.createElement("div");
   toolsStack.className = "tool-calls-stack";
@@ -464,14 +626,20 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
     if (!card) {
       card = document.createElement("div");
       card.className = "tool-card";
-      card.innerHTML = `<span class="tool-status-dot"></span><span class="tool-card-title"></span>`;
+      card.innerHTML = `<span class="tool-indicator">${SVG.spinner}</span><span class="tool-card-title"></span>`;
       toolNodesById.set(id, card);
       toolsStack.appendChild(card);
     }
-    card.classList.toggle("completed", tc.status === "completed");
-    card.classList.toggle("failed", tc.status === "failed");
-    const label = tc.title || tc.name || "Tool action";
-    card.querySelector(".tool-card-title").textContent = label;
+    const isDone = tc.status === "completed";
+    const isFailed = tc.status === "failed";
+    card.classList.toggle("completed", isDone);
+    card.classList.toggle("failed", isFailed);
+    card.querySelector(".tool-indicator").innerHTML = isDone
+      ? SVG.checkSmall
+      : isFailed
+        ? SVG.alertSmall
+        : SVG.spinner;
+    card.querySelector(".tool-card-title").textContent = tc.title || tc.name || "Browser action";
   };
 
   if (Array.isArray(toolCalls)) {
@@ -486,24 +654,34 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
   if (text) {
     mdBody.innerHTML = renderMarkdownSafe(text);
   } else if (streaming) {
-    mdBody.innerHTML = `<div class="typing-indicator"><span>Working…</span></div>`;
+    container.dataset.streaming = "1";
+    mdBody.innerHTML = `<span class="streaming-placeholder">Just a moment…</span>`;
   }
 
   const footer = document.createElement("div");
   footer.className = `turn-footer${streaming ? " hidden" : ""}`;
-  footer.innerHTML = `<span>Synced with Antigravity Desktop</span><button type="button" class="open-app-inline">Open in App ↗</button>`;
-  footer.querySelector(".open-app-inline").addEventListener("click", () => {
-    openInDesktopApp();
-  });
 
-  container.append(thoughtDetails, toolsStack, permissionsStack, mdBody, footer);
+  const copyTurnBtn = document.createElement("button");
+  copyTurnBtn.type = "button";
+  copyTurnBtn.className = "turn-action-btn";
+  copyTurnBtn.innerHTML = `${SVG.copySm}<span>Copy</span>`;
+
+  const openAppBtn = document.createElement("button");
+  openAppBtn.type = "button";
+  openAppBtn.className = "turn-action-btn";
+  openAppBtn.innerHTML = `${SVG.openExtSm}<span>Continue in app</span>`;
+  openAppBtn.addEventListener("click", () => openInDesktopApp());
+
+  footer.append(copyTurnBtn, openAppBtn);
+  container.append(metaRow, thoughtBody, toolsStack, permissionsStack, mdBody, footer);
   messagesListEl.appendChild(container);
   scrollToBottom(true);
 
-  return {
+  const refs = {
     container,
-    thoughtDetails,
-    thoughtSummary,
+    sparkleEl,
+    thoughtToggleBtn,
+    thoughtLabel,
     thoughtBody,
     toolsStack,
     permissionsStack,
@@ -513,6 +691,33 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
     rawText: text || "",
     rawThoughts: thoughts || "",
   };
+
+  copyTurnBtn.addEventListener("click", () => {
+    const content = refs.rawText || mdBody.innerText || "";
+    if (!content) return;
+    navigator.clipboard?.writeText(content).then(() => {
+      const span = copyTurnBtn.querySelector("span");
+      if (span) {
+        span.textContent = "Copied";
+        setTimeout(() => {
+          span.textContent = "Copy";
+        }, 1400);
+      }
+    });
+  });
+
+  return refs;
+}
+
+function finalizeAssistantTurnDOM(refs) {
+  if (!refs) return;
+  delete refs.container.dataset.streaming;
+  refs.sparkleEl.classList.remove("streaming");
+  if (refs.rawThoughts) {
+    const isExpanded = refs.thoughtToggleBtn.getAttribute("aria-expanded") === "true";
+    refs.thoughtLabel.textContent = isExpanded ? "Hide thinking" : "Show thinking";
+  }
+  refs.footer.classList.remove("hidden");
 }
 
 function renderPermissionRequestCard(refs, payload) {
@@ -520,14 +725,14 @@ function renderPermissionRequestCard(refs, payload) {
   const { permRequestId, toolCall, options } = payload;
   const card = document.createElement("div");
   card.className = "permission-card";
-  const toolTitle = toolCall?.title || toolCall?.name || "Tool Execution";
+  const toolTitle = toolCall?.title || toolCall?.name || "Action";
   const detailText =
     toolCall?.args?.CommandLine ||
     (toolCall?.args ? JSON.stringify(toolCall.args) : "") ||
     toolTitle;
 
   card.innerHTML = `
-    <div class="perm-header">Approval requested · ${escapeHtml(toolCall?.name || "Action")}</div>
+    <div class="perm-header">Allow ${escapeHtml(toolCall?.name || "action")}?</div>
     <div class="perm-detail">${escapeHtml(detailText)}</div>
     <div class="perm-actions"></div>
   `;
@@ -536,15 +741,16 @@ function renderPermissionRequestCard(refs, payload) {
     Array.isArray(options) && options.length > 0
       ? options
       : [
+          { optionId: "deny", name: "Decline", kind: "reject_once" },
           { optionId: "allow", name: "Allow", kind: "allow_once" },
-          { optionId: "deny", name: "Deny", kind: "reject_once" },
         ];
 
   for (const opt of opts) {
     const btn = document.createElement("button");
     btn.type = "button";
     const isAllow = /allow/i.test(opt.kind || opt.optionId || "");
-    btn.className = isAllow ? "primary-sm-btn" : "mini-btn danger-subtle";
+    btn.className = isAllow ? "filled-pill-btn" : "tonal-pill-btn";
+    if (isAllow) btn.style.marginLeft = "0";
     btn.textContent = opt.name || opt.optionId;
     btn.addEventListener("click", async () => {
       card.remove();
@@ -589,15 +795,20 @@ function handleIncomingAgentEvent(payload = {}) {
 
     if (update.sessionUpdate === "agent_thought_chunk" && update.content?.text) {
       liveAssistantRefs.rawThoughts += update.content.text;
-      liveAssistantRefs.thoughtDetails.classList.remove("hidden");
-      if (!liveAssistantRefs.rawText) liveAssistantRefs.thoughtDetails.open = true;
+      liveAssistantRefs.thoughtToggleBtn.classList.remove("hidden");
+      if (!liveAssistantRefs.rawText) {
+        liveAssistantRefs.thoughtLabel.textContent = "Thinking";
+        liveAssistantRefs.thoughtToggleBtn.setAttribute("aria-expanded", "true");
+        liveAssistantRefs.thoughtBody.classList.remove("hidden");
+      }
       liveAssistantRefs.thoughtBody.textContent = liveAssistantRefs.rawThoughts;
     } else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
       liveAssistantRefs.upsertToolCard(update);
     } else if (update.sessionUpdate === "agent_message_chunk" && update.content?.text) {
       liveAssistantRefs.rawText += update.content.text;
-      liveAssistantRefs.thoughtDetails.open = false;
-      liveAssistantRefs.thoughtSummary.textContent = "Thought process";
+      liveAssistantRefs.thoughtToggleBtn.setAttribute("aria-expanded", "false");
+      liveAssistantRefs.thoughtBody.classList.add("hidden");
+      liveAssistantRefs.thoughtLabel.textContent = "Show thinking";
       liveAssistantRefs.mdBody.innerHTML = renderMarkdownSafe(liveAssistantRefs.rawText);
     }
 
@@ -619,7 +830,6 @@ async function sendPromptNow(overridePromptText = null) {
   let rawInput = overridePromptText !== null ? String(overridePromptText) : promptInput.value.trim();
   if (!rawInput) return;
 
-  // Expand `/shortcut` if the user typed an exact shortcut command
   if (rawInput.startsWith("/")) {
     const token = rawInput.slice(1).split(/\s+/)[0].toLowerCase();
     const rest = rawInput.slice(1 + token.length).trim();
@@ -636,8 +846,8 @@ async function sendPromptNow(overridePromptText = null) {
 
   promptInput.value = "";
   promptInput.style.height = "auto";
-  slashPopover.classList.add("hidden");
-  tabsPopover.classList.add("hidden");
+  closeAllPopovers();
+  syncSendButtonState();
 
   const attachmentsPreview = [];
   if (state.includeActiveTab && state.activeTab) {
@@ -673,10 +883,10 @@ async function sendPromptNow(overridePromptText = null) {
         sessionId: state.currentSessionId,
         userText: rawInput,
         interactionMode: state.interactionMode,
-        permissionMode: permissionSelect.value || "auto",
+        permissionMode: state.permissionMode || "auto",
         autoApprovePermissions: false,
-        modelId: modelSelect.value || null,
-        includeActiveTab: Boolean(includeActiveTabCb.checked),
+        modelId: state.modelId || null,
+        includeActiveTab: Boolean(state.includeActiveTab),
         activeTabId: state.activeTab?.tabId || null,
         mentionedTabIds: Array.from(state.mentionedTabIds),
         screenshotBase64,
@@ -689,6 +899,7 @@ async function sendPromptNow(overridePromptText = null) {
       errDiv.textContent = res?.error || "Request failed.";
       liveAssistantRefs.mdBody.innerHTML = "";
       liveAssistantRefs.mdBody.appendChild(errDiv);
+      liveAssistantRefs.sparkleEl.classList.remove("streaming");
     } else {
       state.currentSessionId = res.sessionId || state.currentSessionId;
       if (res.title) {
@@ -696,13 +907,13 @@ async function sendPromptNow(overridePromptText = null) {
         headerTitleEl.textContent = res.title;
       }
       if (!liveAssistantRefs.rawText) {
-        liveAssistantRefs.mdBody.innerHTML = `<p><em>Turn completed (${escapeHtml(res.stopReason || "done")}).</em></p>`;
+        liveAssistantRefs.mdBody.innerHTML = `<p><em>Done.</em></p>`;
       }
-      liveAssistantRefs.thoughtSummary.textContent = "Thought process";
-      liveAssistantRefs.footer.classList.remove("hidden");
+      finalizeAssistantTurnDOM(liveAssistantRefs);
     }
   } catch (err) {
     if (liveAssistantRefs) {
+      liveAssistantRefs.sparkleEl.classList.remove("streaming");
       liveAssistantRefs.mdBody.innerHTML = `<div class="error-bubble">${escapeHtml(
         err?.message || String(err),
       )}</div>`;
@@ -721,29 +932,32 @@ function startNewChat() {
   state.sessionTitle = "Antigravity";
   headerTitleEl.textContent = "Antigravity";
   messagesListEl.innerHTML = "";
+  updateGreetingByTime();
   welcomeStateEl.classList.remove("hidden");
   historyDrawer.classList.add("hidden");
-  schedulesDrawer.classList.add("hidden");
+  closeAllPopovers();
   promptInput.focus();
 }
 
 async function loadChromeSessionIntoView(sessionId) {
   historyDrawer.classList.add("hidden");
-  schedulesDrawer.classList.add("hidden");
+  closeAllPopovers();
+
   const res = await chrome.runtime.sendMessage({
     type: "sidepanel:loadSession",
     sessionId,
   });
   if (!res?.ok || !res.session) {
     messagesListEl.innerHTML = `<div class="error-bubble">${escapeHtml(
-      res?.error || "Unable to load session.",
+      res?.error || "Unable to load chat.",
     )}</div>`;
     welcomeStateEl.classList.add("hidden");
     return;
   }
+
   const sess = res.session;
   state.currentSessionId = sess.sessionId;
-  state.sessionTitle = sess.title || "Browser Chat";
+  state.sessionTitle = sess.title || "Chat";
   headerTitleEl.textContent = state.sessionTitle;
   if (sess.interactionMode) {
     state.interactionMode = sess.interactionMode;
@@ -775,28 +989,30 @@ async function loadChromeSessionIntoView(sessionId) {
 function renderHistoryDrawer() {
   historyListEl.innerHTML = "";
   if (!Array.isArray(state.sessions) || state.sessions.length === 0) {
-    historyListEl.innerHTML = `<p class="drawer-note">No Chrome Side Panel chats yet. Send a message below to start one!</p>`;
+    historyListEl.innerHTML = `<p class="sheet-empty">No recent chats in Chrome yet.</p>`;
     return;
   }
 
   for (const s of state.sessions) {
     const card = document.createElement("div");
-    card.className = "session-card";
-    const when = s.updatedAt ? new Date(s.updatedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    card.className = "tonal-list-card";
+    const when = s.updatedAt
+      ? new Date(s.updatedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+      : "";
     card.innerHTML = `
-      <div class="session-card-top">
-        <div class="session-card-title">${escapeHtml(s.title || "Browser Chat")}</div>
-        <div class="session-card-actions">
-          <button type="button" class="text-link-btn open-app-btn" title="Open in Antigravity Desktop App">App ↗</button>
-          <button type="button" class="chip-remove-btn del-sess-btn" title="Remove from Chrome list">✕</button>
+      <div class="tonal-card-top">
+        <div class="tonal-card-title">${escapeHtml(s.title || "Chat")}</div>
+        <div class="tonal-card-actions">
+          <button type="button" class="text-pill-btn open-app-btn" title="Open in Antigravity app">Open in app</button>
+          <button type="button" class="mini-icon-btn del-sess-btn" title="Remove" aria-label="Remove">${SVG.closeXs}</button>
         </div>
       </div>
-      <div class="session-card-meta">
-        <span>${escapeHtml(s.interactionMode === "agent" ? "Agent Mode" : "Chat Mode")} · ${s.messageCount || 0} msgs</span>
+      <div class="tonal-card-meta">
+        <span>${escapeHtml(s.interactionMode === "agent" ? "Agent" : "Chat")} · ${s.messageCount || 0} messages</span>
         <span>${escapeHtml(when)}</span>
       </div>
     `;
-    card.querySelector(".session-card-title").addEventListener("click", () => {
+    card.querySelector(".tonal-card-title").addEventListener("click", () => {
       loadChromeSessionIntoView(s.sessionId);
     });
     card.querySelector(".open-app-btn").addEventListener("click", (e) => {
@@ -822,27 +1038,27 @@ function renderHistoryDrawer() {
 function renderSchedulesDrawer() {
   schedulesListEl.innerHTML = "";
   if (!Array.isArray(state.schedules) || state.schedules.length === 0) {
-    schedulesListEl.innerHTML = `<p class="drawer-note">No scheduled browser tasks yet. Create one above to run recurring checks automatically.</p>`;
+    schedulesListEl.innerHTML = `<p class="sheet-empty">No scheduled tasks yet.</p>`;
     return;
   }
 
   for (const task of state.schedules) {
     const card = document.createElement("div");
-    card.className = "schedule-card";
+    card.className = "tonal-list-card";
     const lastInfo = task.lastRunAt
-      ? `Last: ${new Date(task.lastRunAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (${task.lastStatus || "ok"})`
-      : "Not run yet";
+      ? `Last run ${new Date(task.lastRunAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : "Waiting for next run";
     card.innerHTML = `
-      <div class="session-card-top">
-        <div class="session-card-title">${escapeHtml(task.name)}</div>
-        <div class="session-card-actions">
-          <button type="button" class="mini-btn run-now-btn">Run Now</button>
-          ${task.lastSessionId ? '<button type="button" class="text-link-btn view-run-btn">View</button>' : ""}
-          <button type="button" class="chip-remove-btn del-sched-btn">✕</button>
+      <div class="tonal-card-top">
+        <div class="tonal-card-title">${escapeHtml(task.name)}</div>
+        <div class="tonal-card-actions">
+          <button type="button" class="tonal-pill-btn run-now-btn">Run now</button>
+          ${task.lastSessionId ? '<button type="button" class="text-pill-btn view-run-btn">View</button>' : ""}
+          <button type="button" class="mini-icon-btn del-sched-btn" aria-label="Delete">${SVG.closeXs}</button>
         </div>
       </div>
-      <div class="session-card-meta">
-        <span>Every ${task.intervalMinutes}m · ${task.interactionMode === "agent" ? "Agent" : "Chat"}</span>
+      <div class="tonal-card-meta">
+        <span>Every ${task.intervalMinutes}m · ${task.interactionMode === "agent" ? "Agent" : "Read"}</span>
         <span>${escapeHtml(lastInfo)}</span>
       </div>
     `;
@@ -857,7 +1073,7 @@ function renderSchedulesDrawer() {
         }
       } finally {
         btn.disabled = false;
-        btn.textContent = "Run Now";
+        btn.textContent = "Run now";
       }
     });
     const viewBtn = card.querySelector(".view-run-btn");
@@ -887,7 +1103,7 @@ function renderSlashPopover(filterText = "") {
     ...(state.shortcuts.builtin || []).map((s) => ({ ...s, kindLabel: s.interactionMode === "agent" ? "Agent" : "Page" })),
     ...(state.agySkills || []).slice(0, 25).map((sk) => ({
       command: sk.name,
-      title: `/${sk.name}`,
+      title: sk.name,
       description: sk.description || "",
       isSkill: true,
       kindLabel: "Skill",
@@ -901,7 +1117,7 @@ function renderSlashPopover(filterText = "") {
   );
 
   if (combined.length === 0) {
-    slashListEl.innerHTML = `<div class="popover-item-sub" style="padding:6px 8px;">No matching /shortcuts. Click '+ Save Custom' above to create one!</div>`;
+    slashListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 12px;">No matching shortcuts.</div>`;
     return;
   }
 
@@ -909,19 +1125,21 @@ function renderSlashPopover(filterText = "") {
     const row = document.createElement("div");
     row.className = "popover-item";
     row.innerHTML = `
+      <span class="popover-item-icon">${SVG.slashSm}</span>
       <div class="popover-item-main">
-        <div class="popover-item-title">/${escapeHtml(item.command)} <span style="font-weight:400;color:var(--text-muted)">· ${escapeHtml(
+        <div class="popover-item-title">${escapeHtml(item.command)} <span style="font-weight:400;color:var(--gem-text-muted)">· ${escapeHtml(
       item.kindLabel,
     )}</span></div>
         <div class="popover-item-sub">${escapeHtml(item.description || item.title || "")}</div>
       </div>
-      ${!item.builtin && !item.isSkill ? '<button type="button" class="chip-remove-btn del-sc-btn" title="Delete shortcut">✕</button>' : ""}
+      ${!item.builtin && !item.isSkill ? `<button type="button" class="mini-icon-btn del-sc-btn" title="Delete">${SVG.closeXs}</button>` : ""}
     `;
     row.addEventListener("click", (e) => {
       if (e.target.closest(".del-sc-btn")) return;
-      slashPopover.classList.add("hidden");
+      closeAllPopovers();
       if (item.isSkill) {
         promptInput.value = `/${item.command} `;
+        syncSendButtonState();
         promptInput.focus();
       } else {
         if (item.interactionMode) {
@@ -959,7 +1177,7 @@ function renderTabsPicker(filterText = "") {
   );
 
   if (candidates.length === 0) {
-    tabsPickerListEl.innerHTML = `<div class="popover-item-sub" style="padding:6px 8px;">No matching open tabs.</div>`;
+    tabsPickerListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 12px;">No open tabs found.</div>`;
     return;
   }
 
@@ -968,22 +1186,40 @@ function renderTabsPicker(filterText = "") {
     const isSelected = state.mentionedTabIds.has(t.tabId);
     const row = document.createElement("div");
     row.className = `popover-item${isSelected ? " selected" : ""}`;
-    row.innerHTML = `
-      <div class="popover-item-main">
-        <div class="popover-item-title">${isSelected ? "✓ " : ""}${escapeHtml(t.title || t.url || `Tab #${t.tabId}`)}${
-      isActive ? " (Active)" : ""
-    }</div>
-        <div class="popover-item-sub">${escapeHtml(t.url || "")}</div>
-      </div>
+
+    const iconSlot = document.createElement("span");
+    iconSlot.className = "popover-item-icon";
+    if (isSelected) {
+      iconSlot.innerHTML = SVG.checkSmall;
+    } else if (t.favIconUrl && /^https?:|^data:/i.test(t.favIconUrl)) {
+      const img = document.createElement("img");
+      img.className = "tab-favicon";
+      img.src = t.favIconUrl;
+      img.alt = "";
+      img.addEventListener("error", () => {
+        iconSlot.innerHTML = SVG.globeXs;
+      });
+      iconSlot.appendChild(img);
+    } else {
+      iconSlot.innerHTML = SVG.globeXs;
+    }
+
+    const mainDiv = document.createElement("div");
+    mainDiv.className = "popover-item-main";
+    mainDiv.innerHTML = `
+      <div class="popover-item-title">${escapeHtml(t.title || t.url || `Tab ${t.tabId}`)}${isActive ? " · Current" : ""}</div>
+      <div class="popover-item-sub">${escapeHtml(t.url || "")}</div>
     `;
+
+    row.append(iconSlot, mainDiv);
     row.addEventListener("click", () => {
       if (state.mentionedTabIds.has(t.tabId)) {
         state.mentionedTabIds.delete(t.tabId);
       } else {
         state.mentionedTabIds.add(t.tabId);
       }
-      // Strip trailing `@query` if triggered via `@` in textarea
       promptInput.value = promptInput.value.replace(/(^|\s)@[^\s]*$/, "$1");
+      syncSendButtonState();
       renderAttachmentChips();
       renderTabsPicker(filterText);
     });
@@ -1005,51 +1241,129 @@ async function refreshTabsList() {
   }
 }
 
-// Event Listeners
-newChatBtn.addEventListener("click", startNewChat);
-openDesktopBtn.addEventListener("click", () => openInDesktopApp());
-
-bridgeStatusBtn.addEventListener("click", async () => {
-  bridgeLabelEl.textContent = "Reconnecting…";
+async function reconnectNativeBridge() {
   const status = await chrome.runtime.sendMessage({ type: "sidepanel:reconnect" });
   renderBridgeStatus(status);
+}
+
+// Event Listeners
+document.addEventListener("click", (e) => {
+  if (
+    !e.target.closest(".floating-menu") &&
+    !e.target.closest("#model-menu-btn") &&
+    !e.target.closest("#add-menu-btn")
+  ) {
+    closeAllPopovers();
+  }
 });
+
+modelMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const willOpen = modelPopover.classList.contains("hidden");
+  closeAllPopovers();
+  if (willOpen) {
+    renderModelMenu();
+    modelPopover.classList.remove("hidden");
+    modelMenuBtn.setAttribute("aria-expanded", "true");
+  }
+});
+
+permissionSegmentedEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tonal-seg-btn");
+  if (!btn || !btn.dataset.perm) return;
+  state.permissionMode = btn.dataset.perm;
+  renderModelMenu();
+  if (state.currentSessionId) {
+    chrome.runtime.sendMessage({
+      type: "sidepanel:setConfig",
+      payload: { sessionId: state.currentSessionId, modeId: state.permissionMode },
+    });
+  }
+});
+
+bridgeStatusBtn.addEventListener("click", reconnectNativeBridge);
+bannerReconnectBtn.addEventListener("click", reconnectNativeBridge);
+
+newChatBtn.addEventListener("click", startNewChat);
+openDesktopBtn.addEventListener("click", () => openInDesktopApp());
 
 detachAllBtn.addEventListener("click", async () => {
   const status = await chrome.runtime.sendMessage({ type: "sidepanel:finishAll" });
   renderBridgeStatus(status);
 });
 
+function openDrawerTab(tabName = "chats") {
+  closeAllPopovers();
+  historyDrawer.classList.remove("hidden");
+  const isSchedules = tabName === "schedules";
+  drawerPanelChats.classList.toggle("hidden", isSchedules);
+  drawerPanelSchedules.classList.toggle("hidden", !isSchedules);
+  for (const btn of drawerTabsGroup.querySelectorAll(".tonal-seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.drawerTab === tabName);
+  }
+  if (isSchedules) {
+    renderSchedulesDrawer();
+  } else {
+    renderHistoryDrawer();
+  }
+}
+
 historyBtn.addEventListener("click", () => {
-  schedulesDrawer.classList.add("hidden");
-  const opening = historyDrawer.classList.contains("hidden");
-  historyDrawer.classList.toggle("hidden", !opening);
-  if (opening) renderHistoryDrawer();
+  if (!historyDrawer.classList.contains("hidden")) {
+    historyDrawer.classList.add("hidden");
+  } else {
+    openDrawerTab("chats");
+  }
 });
 
 closeHistoryBtn.addEventListener("click", () => historyDrawer.classList.add("hidden"));
 
-schedulesBtn.addEventListener("click", () => {
-  historyDrawer.classList.add("hidden");
-  const opening = schedulesDrawer.classList.contains("hidden");
-  schedulesDrawer.classList.toggle("hidden", !opening);
-  if (opening) renderSchedulesDrawer();
+drawerTabsGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tonal-seg-btn");
+  if (!btn || !btn.dataset.drawerTab) return;
+  openDrawerTab(btn.dataset.drawerTab);
 });
 
-closeSchedulesBtn.addEventListener("click", () => schedulesDrawer.classList.add("hidden"));
+schedulesBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  openDrawerTab("schedules");
+});
+
+schedIntervalGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tonal-seg-btn");
+  if (!btn) return;
+  state.schedInterval = Number(btn.dataset.interval) || 60;
+  for (const el of schedIntervalGroup.querySelectorAll(".tonal-seg-btn")) {
+    el.classList.toggle("active", el === btn);
+  }
+});
+
+schedModeGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tonal-seg-btn");
+  if (!btn) return;
+  state.schedMode = btn.dataset.schedMode || "chat";
+  for (const el of schedModeGroup.querySelectorAll(".tonal-seg-btn")) {
+    el.classList.toggle("active", el === btn);
+  }
+});
 
 scheduleForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = document.getElementById("sched-name").value.trim();
   const targetUrl = document.getElementById("sched-url").value.trim();
   const prompt = document.getElementById("sched-prompt").value.trim();
-  const intervalMinutes = Number(document.getElementById("sched-interval").value) || 60;
-  const interactionMode = document.getElementById("sched-mode").value;
   if (!name || !prompt) return;
 
   const res = await chrome.runtime.sendMessage({
     type: "sidepanel:saveSchedule",
-    payload: { name, targetUrl, prompt, intervalMinutes, interactionMode, enabled: true },
+    payload: {
+      name,
+      targetUrl,
+      prompt,
+      intervalMinutes: state.schedInterval,
+      interactionMode: state.schedMode,
+      enabled: true,
+    },
   });
   if (res?.tasks) {
     state.schedules = res.tasks;
@@ -1059,9 +1373,9 @@ scheduleForm.addEventListener("submit", async (e) => {
 });
 
 quickGridEl.addEventListener("click", (e) => {
-  const card = e.target.closest(".quick-card");
-  if (!card) return;
-  const scName = card.dataset.shortcut;
+  const pill = e.target.closest(".suggestion-pill");
+  if (!pill) return;
+  const scName = pill.dataset.shortcut;
   const all = [...(state.shortcuts.custom || []), ...(state.shortcuts.builtin || [])];
   const found = all.find((s) => s.command === scName);
   if (found) {
@@ -1078,75 +1392,50 @@ messagesListEl.addEventListener("click", (e) => {
   if (!copyBtn) return;
   const decoded = decodeURIComponent(copyBtn.dataset.code || "");
   navigator.clipboard?.writeText(decoded).then(() => {
-    copyBtn.textContent = "Copied!";
+    copyBtn.textContent = "Copied";
     setTimeout(() => {
       copyBtn.textContent = "Copy";
     }, 1400);
   });
 });
 
-modeChatBtn.addEventListener("click", () => {
-  state.interactionMode = "chat";
+agentModeToggle.addEventListener("click", () => {
+  state.interactionMode = state.interactionMode === "agent" ? "chat" : "agent";
   updateModeUI();
+  promptInput.focus();
 });
 
-modeAgentBtn.addEventListener("click", () => {
-  state.interactionMode = "agent";
-  updateModeUI();
+unshareActiveTabBtn.addEventListener("click", () => {
+  state.includeActiveTab = false;
+  syncSharedPageChipUI();
 });
 
-permissionSelect.addEventListener("change", () => {
-  state.permissionMode = permissionSelect.value;
-  if (state.currentSessionId) {
-    chrome.runtime.sendMessage({
-      type: "sidepanel:setConfig",
-      payload: { sessionId: state.currentSessionId, modeId: state.permissionMode },
-    });
+reshareActiveTabBtn.addEventListener("click", () => {
+  state.includeActiveTab = true;
+  syncSharedPageChipUI();
+});
+
+addMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const willOpen = addMenuPopover.classList.contains("hidden");
+  closeAllPopovers();
+  if (willOpen) {
+    addMenuPopover.classList.remove("hidden");
+    addMenuBtn.classList.add("active");
   }
 });
 
-modelSelect.addEventListener("change", () => {
-  state.modelId = modelSelect.value;
-  if (state.currentSessionId) {
-    chrome.runtime.sendMessage({
-      type: "sidepanel:setConfig",
-      payload: { sessionId: state.currentSessionId, modelId: state.modelId },
-    });
-  }
+menuShareTabsBtn.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  closeAllPopovers();
+  await refreshTabsList();
+  renderTabsPicker("");
+  tabsPopover.classList.remove("hidden");
 });
 
-includeActiveTabCb.addEventListener("change", () => {
-  state.includeActiveTab = includeActiveTabCb.checked;
-});
-
-mentionTabsBtn.addEventListener("click", async () => {
-  slashPopover.classList.add("hidden");
-  const opening = tabsPopover.classList.contains("hidden");
-  tabsPopover.classList.toggle("hidden", !opening);
-  if (opening) {
-    await refreshTabsList();
-    renderTabsPicker("");
-  }
-});
-
-groupMentionedBtn.addEventListener("click", async () => {
-  const ids = Array.from(state.mentionedTabIds);
-  if (state.activeTab?.tabId && !ids.includes(state.activeTab.tabId)) {
-    ids.unshift(state.activeTab.tabId);
-  }
-  if (ids.length === 0) return;
-  await chrome.runtime.sendMessage({
-    type: "sidepanel:groupTabsNow",
-    payload: {
-      tabIds: ids,
-      title: state.sessionTitle === "Antigravity" ? "Antigravity" : state.sessionTitle.slice(0, 22),
-      color: "cyan",
-    },
-  });
-  tabsPopover.classList.add("hidden");
-});
-
-screenshotBtn.addEventListener("click", async () => {
+screenshotBtn.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  closeAllPopovers();
   screenshotBtn.disabled = true;
   try {
     const res = await chrome.runtime.sendMessage({
@@ -1162,11 +1451,28 @@ screenshotBtn.addEventListener("click", async () => {
   }
 });
 
-slashBtn.addEventListener("click", () => {
-  tabsPopover.classList.add("hidden");
-  const opening = slashPopover.classList.contains("hidden");
-  slashPopover.classList.toggle("hidden", !opening);
-  if (opening) renderSlashPopover("");
+menuShortcutsBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  closeAllPopovers();
+  renderSlashPopover("");
+  slashPopover.classList.remove("hidden");
+});
+
+groupMentionedBtn.addEventListener("click", async () => {
+  const ids = Array.from(state.mentionedTabIds);
+  if (state.activeTab?.tabId && !ids.includes(state.activeTab.tabId)) {
+    ids.unshift(state.activeTab.tabId);
+  }
+  if (ids.length === 0) return;
+  await chrome.runtime.sendMessage({
+    type: "sidepanel:groupTabsNow",
+    payload: {
+      tabIds: ids,
+      title: state.sessionTitle === "Antigravity" ? "Antigravity" : state.sessionTitle.slice(0, 22),
+      color: "blue",
+    },
+  });
+  closeAllPopovers();
 });
 
 openSaveShortcutBtn.addEventListener("click", () => {
@@ -1177,15 +1483,23 @@ openSaveShortcutBtn.addEventListener("click", () => {
   }
 });
 
+customScModeGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tonal-seg-btn");
+  if (!btn) return;
+  state.customScMode = btn.dataset.scMode || "chat";
+  for (const el of customScModeGroup.querySelectorAll(".tonal-seg-btn")) {
+    el.classList.toggle("active", el === btn);
+  }
+});
+
 saveCustomScBtn.addEventListener("click", async () => {
   const command = document.getElementById("custom-sc-cmd").value.trim();
   const title = document.getElementById("custom-sc-title").value.trim();
   const prompt = document.getElementById("custom-sc-prompt").value.trim();
-  const interactionMode = document.getElementById("custom-sc-mode").value;
   if (!command || !prompt) return;
   const res = await chrome.runtime.sendMessage({
     type: "sidepanel:saveShortcut",
-    payload: { command, title, prompt, interactionMode },
+    payload: { command, title, prompt, interactionMode: state.customScMode },
   });
   if (res?.custom) {
     state.shortcuts.custom = res.custom;
@@ -1199,10 +1513,12 @@ saveCustomScBtn.addEventListener("click", async () => {
 
 promptInput.addEventListener("input", () => {
   promptInput.style.height = "auto";
-  promptInput.style.height = `${Math.min(130, promptInput.scrollHeight)}px`;
+  promptInput.style.height = `${Math.min(136, promptInput.scrollHeight)}px`;
+  syncSendButtonState();
 
   const val = promptInput.value;
   if (/^\/[a-zA-Z0-9_-]*$/.test(val)) {
+    addMenuPopover.classList.add("hidden");
     tabsPopover.classList.add("hidden");
     slashPopover.classList.remove("hidden");
     renderSlashPopover(val);
@@ -1212,6 +1528,7 @@ promptInput.addEventListener("input", () => {
 
   const atMatch = /(?:^|\s)@([^\s]*)$/.exec(val);
   if (atMatch) {
+    addMenuPopover.classList.add("hidden");
     tabsPopover.classList.remove("hidden");
     renderTabsPicker(atMatch[1] || "");
   } else {
@@ -1221,8 +1538,7 @@ promptInput.addEventListener("input", () => {
 
 promptInput.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    slashPopover.classList.add("hidden");
-    tabsPopover.classList.add("hidden");
+    closeAllPopovers();
     return;
   }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -1233,7 +1549,7 @@ promptInput.addEventListener("keydown", (e) => {
 
 sendBtn.addEventListener("click", () => sendPromptNow());
 
-// Connect Live Runtime Port & Bootstrap Initial State
+// Live Runtime Port & Initial Bootstrap
 const livePort = chrome.runtime.connect({ name: "ag-sidepanel" });
 livePort.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
@@ -1248,12 +1564,17 @@ livePort.onMessage.addListener((msg) => {
     if (!historyDrawer.classList.contains("hidden")) renderHistoryDrawer();
   } else if (msg.type === "sidepanel:schedulesUpdated") {
     state.schedules = msg.tasks || [];
-    if (!schedulesDrawer.classList.contains("hidden")) renderSchedulesDrawer();
+    if (!historyDrawer.classList.contains("hidden") && !drawerPanelSchedules.classList.contains("hidden")) {
+      renderSchedulesDrawer();
+    }
   }
 });
 
 (async function bootstrap() {
+  updateGreetingByTime();
   updateModeUI();
+  renderModelMenu();
+  syncSendButtonState();
   try {
     const init = await chrome.runtime.sendMessage({ type: "sidepanel:init" });
     if (init?.ok) {
@@ -1268,7 +1589,7 @@ livePort.onMessage.addListener((msg) => {
     renderBridgeStatus({
       nativeConnected: false,
       browserName: "Browser",
-      lastNativeError: err?.message || "Initializing extension service worker…",
+      lastNativeError: err?.message || "Initializing extension…",
     });
   }
 })();
