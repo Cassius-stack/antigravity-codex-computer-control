@@ -1,7 +1,7 @@
 {
   "name": "antigravity-codex-computer-control",
-  "version": "2.0.0",
-  "description": "Self-contained macOS Multi-Window App & Live Browser Computer-Use MCP Server + MV3 Extension + Antigravity Plugin (Codex CUA, Tab Groups & Daintier Cursor Parity)",
+  "version": "3.0.0",
+  "description": "Self-contained macOS Multi-Window App & Live Browser Computer-Use MCP Server + Docked Side Panel MV3 Extension + Antigravity Plugin (Claude/Codex in Chrome & CUA Parity)",
   "license": "MIT",
   "os": [
     "darwin"

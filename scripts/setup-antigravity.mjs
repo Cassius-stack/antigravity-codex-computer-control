@@ -82,7 +82,16 @@ function checkPlatformAndNode() {
 
 function buildEnvPath(nodeBinPath) {
   const nodeDir = path.dirname(nodeBinPath);
-  const stdDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  const stdDirs = [
+    path.join(HOME_DIR, ".local", "bin"),
+    path.join(HOME_DIR, ".antigravity", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
   const seen = new Set();
   const ordered = [];
   for (const d of [nodeDir, ...stdDirs]) {
@@ -125,7 +134,7 @@ function writeJsonAtomic(filePath, obj) {
 }
 
 function installNativeMessagingBridge(nodePath, { dryRun = false } = {}) {
-  const shimContent = `#!/usr/bin/env bash\nexec "${nodePath}" "${NATIVE_HOST_SCRIPT}" "$@"\n`;
+  const shimContent = `#!/usr/bin/env bash\nexport PATH="$HOME/.local/bin:$HOME/.antigravity/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"\nexec "${nodePath}" "${NATIVE_HOST_SCRIPT}" "$@"\n`;
   const hostManifest = {
     name: NATIVE_HOST_NAME,
     description: "Antigravity Browser Extension Native Messaging Bridge",
@@ -265,7 +274,7 @@ async function verifyServerAndPermissions({ requestPrompt = false } = {}) {
         const initRes = await rpc("initialize", {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "antigravity-setup-verifier", version: "2.0.0" },
+          clientInfo: { name: "antigravity-setup-verifier", version: "3.0.0" },
         });
         child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
@@ -382,7 +391,7 @@ async function main() {
     );
   }
   console.log(
-    `✅ MCP server verified (${check.toolCount} tools active, v${check.serverInfo?.version ?? "2.0.0"}, Node v${process.versions.node} [${process.arch}])`,
+    `✅ MCP server verified (${check.toolCount} tools active, v${check.serverInfo?.version ?? "3.0.0"}, Node v${process.versions.node} [${process.arch}])`,
   );
 
   const axOk = Boolean(check.permissions?.axTrusted);
@@ -400,8 +409,8 @@ async function main() {
   console.log("");
   console.log("🌐 15-Second Browser Extension Setup (Brave / Chrome / Edge / Arc):");
   console.log("   1. Open brave://extensions or chrome://extensions and enable 'Developer mode' (top-right).");
-  console.log(`   2. Click 'Load unpacked' and select: ${EXTENSION_DIR}`);
-  console.log(`   3. Extension ID '${EXTENSION_ID}' auto-connects to ${NATIVE_HOST_NAME}!`);
+  console.log(`   2. Click 'Load unpacked' (or Reload ↻) and select: ${EXTENSION_DIR}`);
+  console.log(`   3. Click the Antigravity toolbar icon (or press Cmd+Shift+.) to open the docked Side Panel Chat Bar!`);
 
   console.log("");
   console.log("🚀 Final Step in Antigravity:");

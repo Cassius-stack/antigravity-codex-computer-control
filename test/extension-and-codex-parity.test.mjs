@@ -64,7 +64,13 @@ function attachMcpRpcHelper(clientToServer, serverToClient) {
  * Create an in-process MV3 Chrome Extension Service Worker VM running the REAL `extension/background.js`
  * wired over 4-byte uint32 LE Native Messaging stdio frames to a REAL `bin/antigravity-native-host.mjs` process!
  */
-function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTabs = [], onDebuggerCommand = null }) {
+function launchNativeHostWithRealExtension({
+  sockDir,
+  brand = "brave",
+  initialTabs = [],
+  onDebuggerCommand = null,
+  extraHostEnv = {},
+}) {
   const hostScript = path.join(PROJECT_ROOT, "bin", "antigravity-native-host.mjs");
   const hostProc = spawn(process.execPath, [hostScript], {
     cwd: PROJECT_ROOT,
@@ -72,6 +78,7 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
     env: {
       ...process.env,
       AG_BRIDGE_SOCK_DIR: sockDir,
+      ...extraHostEnv,
     },
   });
 
@@ -102,6 +109,9 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
     { id: "h-1", title: "Release Notes", url: "https://antigravity.example.test/releases", lastVisitTime: Date.now() },
   ];
   const sessionStorageMap = {};
+  const localStorageMap = {};
+  const createdAlarms = new Map();
+  let sidePanelBehavior = null;
 
   for (const t of initialTabs) {
     tabs.set(t.id, {
@@ -122,6 +132,7 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
   const debuggerOnDetach = makeEvent();
   const tabsOnRemoved = makeEvent();
   const tabsOnUpdated = makeEvent();
+  const tabsOnActivated = makeEvent();
   const downloadsOnCreated = makeEvent();
   const downloadsOnChanged = makeEvent();
   const alarmsOnAlarm = makeEvent();
@@ -188,7 +199,7 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
     runtime: {
       id: "cnipmpbdggdeocaigfifflifphanoiic",
       lastError: null,
-      getManifest: () => ({ version: "2.0.0", name: "Antigravity in Chrome" }),
+      getManifest: () => ({ version: "3.0.0", name: "Antigravity in Chrome" }),
       connectNative(name) {
         if (envClosed) throw new Error("Bridge test environment closed");
         assert.equal(name, "com.antigravity.browser_bridge");
@@ -200,18 +211,63 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
       onInstalled: runtimeOnInstalled,
       onStartup: runtimeOnStartup,
     },
+    sidePanel: {
+      setPanelBehavior: async (opts) => {
+        sidePanelBehavior = opts;
+      },
+    },
     offscreen: {
       Reason: { BLOBS: "BLOBS" },
       createDocument: async () => {},
     },
     alarms: {
-      create: () => {},
+      create: (name, info) => {
+        createdAlarms.set(name, info);
+      },
+      getAll: async () => Array.from(createdAlarms.entries()).map(([name, info]) => ({ name, ...info })),
+      clear: async (name) => createdAlarms.delete(name),
       onAlarm: alarmsOnAlarm,
     },
     storage: {
       session: {
-        get: async (key) => ({ [key]: sessionStorageMap[key] }),
+        get: async (keys) => {
+          const list = Array.isArray(keys) ? keys : [keys];
+          const out = {};
+          for (const k of list) out[k] = sessionStorageMap[k];
+          return out;
+        },
         set: async (obj) => Object.assign(sessionStorageMap, obj),
+      },
+      local: {
+        get: async (keys) => {
+          const list = Array.isArray(keys) ? keys : [keys];
+          const out = {};
+          for (const k of list) out[k] = localStorageMap[k];
+          return out;
+        },
+        set: async (obj) => Object.assign(localStorageMap, obj),
+      },
+    },
+    scripting: {
+      executeScript: async ({ target }) => {
+        const t = tabs.get(target?.tabId);
+        if (!t) throw new Error(`No tab ${target?.tabId}`);
+        return [
+          {
+            result: {
+              title: t.title || "Page",
+              url: t.url || "https://example.test/",
+              selection: t.selection || "",
+              metaDescription: `Summary of ${t.title}`,
+              headings: [`H1: ${t.title}`],
+              linksCount: 5,
+              buttonsCount: 2,
+              inputsCount: 1,
+              text: t.bodyText || `Visible page text for ${t.title} at ${t.url}`,
+              truncated: false,
+            },
+          },
+        ];
       },
     },
     windows: {
@@ -314,8 +370,11 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
           if (t) t.groupId = -1;
         }
       },
+      captureVisibleTab: async () =>
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
       onRemoved: tabsOnRemoved,
       onUpdated: tabsOnUpdated,
+      onActivated: tabsOnActivated,
     },
     debugger: {
       attach: async (Debuggee, _version) => {
@@ -457,6 +516,7 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
     Object,
     Error,
     RegExp,
+    URL,
   });
   vm.runInContext(bgCode, swContext, { filename: "extension/background.js" });
 
@@ -468,6 +528,35 @@ function launchNativeHostWithRealExtension({ sockDir, brand = "brave", initialTa
     downloads,
     cookies,
     bookmarks,
+    createdAlarms,
+    alarmsOnAlarm,
+    getSidePanelBehavior: () => sidePanelBehavior,
+    sendRuntimeMessage(msg) {
+      return new Promise((resolve) => {
+        runtimeOnMessage.emit(msg, {}, resolve);
+      });
+    },
+    connectSidePanelPort() {
+      const msgListeners = new Set();
+      const discListeners = new Set();
+      const portForBg = {
+        name: "ag-sidepanel",
+        postMessage: (m) => {
+          for (const fn of [...msgListeners]) fn(m);
+        },
+        onMessage: { addListener: () => {} },
+        onDisconnect: { addListener: (fn) => discListeners.add(fn) },
+      };
+      runtimeOnConnect.emit(portForBg);
+      return {
+        onMessage(fn) {
+          msgListeners.add(fn);
+        },
+        disconnect() {
+          for (const fn of [...discListeners]) fn();
+        },
+      };
+    },
     debuggerOnEvent,
     debuggerOnDetach,
     downloadsOnCreated,
@@ -514,8 +603,23 @@ test("Manifest, Antigravity Plugin Schema, and Browser Safety & CAPTCHA Policy v
   const extManifest = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "extension", "manifest.json"), "utf8"));
   assert.equal(extManifest.manifest_version, 3);
   assert.equal(extManifest.name, "Antigravity in Chrome");
+  assert.equal(extManifest.version, "3.0.0");
   assert.ok(extManifest.key && extManifest.key.length > 100, "MV3 manifest must embed deterministic public key");
+  assert.equal(extManifest.side_panel?.default_path, "sidepanel.html", "MV3 manifest must declare side_panel.default_path");
+  assert.equal(
+    extManifest.action?.default_popup,
+    undefined,
+    "MV3 action must omit default_popup so toolbar click opens the docked Side Panel via openPanelOnActionClick",
+  );
+  for (const sidePanelFile of ["sidepanel.html", "sidepanel.css", "sidepanel.js"]) {
+    assert.ok(
+      fs.existsSync(path.join(PROJECT_ROOT, "extension", sidePanelFile)),
+      `Missing Side Panel asset ${sidePanelFile}`,
+    );
+  }
   for (const perm of [
+    "sidePanel",
+    "activeTab",
     "debugger",
     "tabs",
     "tabGroups",
@@ -560,7 +664,7 @@ test("Manifest, Antigravity Plugin Schema, and Browser Safety & CAPTCHA Policy v
   }
   assert.equal(pluginJson.name, "antigravity-computer-use");
   assert.equal(pluginJson.displayName, "Antigravity Computer Control");
-  assert.equal(pluginJson.version, "2.0.0");
+  assert.equal(pluginJson.version, "3.0.0");
   assert.equal(pluginJson.suggestedPrompts.length, 3);
   assert.ok(fs.existsSync(path.join(PROJECT_ROOT, "plugin", pluginJson.logo)));
   assert.equal(
@@ -1546,4 +1650,516 @@ test("Full Codex Browser Parity: Two-Tier upload_files, Downloads, Non-Blocking 
   bridgeEnv.debuggerOnDetach.emit({ tabId: 20 }, "canceled_by_user");
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(ctrl.takenOverByUser, true, "canceled_by_user detach must record takenOverByUser on tab controller");
+});
+
+test("Docked Side Panel Chat Bar, Persistent agy ACP Bridge, One-Way Session Rule, Permission Prompts, Simultaneous Desktop MCP Control, and Scheduled Tasks", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-sidepanel-acp-"));
+  const sockDir = path.join(tmpDir, "socks");
+  const chromeSessionsFile = path.join(tmpDir, "chrome-sessions.json");
+  const mockAgyPath = path.join(tmpDir, "mock-agy");
+  const acpLogPath = path.join(tmpDir, "acp-invocations.json");
+
+  // Deterministic Node mock of `agy` supporting `agy models` and `agy acp --app-data-dir antigravity`
+  const mockAgyScript = `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+
+const args = process.argv.slice(2);
+if (args[0] === "models") {
+  console.log("gemini-4-carbon-medium (Gemini 4 Carbon (Medium))");
+  console.log("gemini-3.8-flash-low (Gemini 3.8 Flash (Low))");
+  process.exit(0);
+}
+if (args[0] !== "acp") {
+  process.exit(1);
+}
+
+const logPath = ${JSON.stringify(acpLogPath)};
+const sessions = new Map();
+// Seed a pre-existing Desktop-originated conversation (simulating Antigravity.app chat)
+sessions.set("desktop-conv-9999", {
+  cwd: "/",
+  title: "Desktop Only Conversation",
+  history: [{ promptText: "From desktop", replyText: "Desktop reply" }],
+});
+
+let sessionCounter = 1;
+let permCounter = 1;
+const pendingPerms = new Map();
+const log = { argv: args, prompts: [] };
+const flushLog = () => fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
+flushLog();
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", async (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+
+  // Response to server-initiated permission request
+  if (msg.id !== undefined && !msg.method && pendingPerms.has(String(msg.id))) {
+    const resFn = pendingPerms.get(String(msg.id));
+    pendingPerms.delete(String(msg.id));
+    resFn(msg.result);
+    return;
+  }
+
+  const { id, method, params } = msg;
+  if (method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: true, embeddedContext: true },
+          sessionCapabilities: { resume: {}, close: {}, load: {}, list: {} },
+        },
+        agentInfo: { name: "Mock Antigravity ACP Server", version: "1.5.5" },
+      },
+    });
+    return;
+  }
+
+  if (method === "session/new") {
+    const sid = \`chrome-sess-\${sessionCounter++}\`;
+    sessions.set(sid, {
+      cwd: params?.cwd || "/",
+      modeId: "auto",
+      modelId: "gemini-4-carbon-medium",
+      systemAppend: params?._meta?.antigravity?.systemPrompt?.append || "",
+      history: [],
+    });
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        sessionId: sid,
+        models: {
+          currentModelId: "gemini-4-carbon-medium",
+          availableModels: [
+            { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+            { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
+          ],
+        },
+        modes: {
+          currentModeId: "auto",
+          availableModes: [
+            { id: "auto", name: "Auto" },
+            { id: "default", name: "Ask" },
+            { id: "plan", name: "Plan" },
+          ],
+        },
+      },
+    });
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: [{ name: "plan", description: "Plan carefully" }],
+        },
+      },
+    });
+    return;
+  }
+
+  if (method === "session/set_mode") {
+    const s = sessions.get(params.sessionId);
+    if (s) s.modeId = params.modeId;
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+
+  if (method === "session/set_model") {
+    const s = sessions.get(params.sessionId);
+    if (s) s.modelId = params.modelId;
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+
+  if (method === "session/resume" || method === "session/close") {
+    send({ jsonrpc: "2.0", id, result: { sessionId: params?.sessionId } });
+    return;
+  }
+
+  if (method === "session/load") {
+    const s = sessions.get(params.sessionId);
+    if (!s) {
+      send({ jsonrpc: "2.0", id, error: { code: -32004, message: "Not found" } });
+      return;
+    }
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "session_info_update", title: s.title || "Loaded Chrome Chat" },
+      },
+    });
+    for (const turn of s.history) {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: turn.promptText } },
+        },
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: turn.replyText } },
+        },
+      });
+    }
+    send({ jsonrpc: "2.0", id, result: { sessionId: params.sessionId } });
+    return;
+  }
+
+  if (method === "session/prompt") {
+    const sid = params.sessionId;
+    const s = sessions.get(sid);
+    const blocks = params.prompt || [];
+    const textBlock = blocks.find((b) => b.type === "text")?.text || "";
+    const hasImage = blocks.some((b) => b.type === "image" && b.data);
+    log.prompts.push({ sessionId: sid, hasImage, modeId: s?.modeId, text: textBlock });
+    flushLog();
+
+    // Emit auto-generated conversation title (like Antigravity Desktop store!)
+    s.title = "Brave Page Comparison";
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: { sessionUpdate: "session_info_update", title: s.title },
+      },
+    });
+
+    // Emit thought chunk
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Comparing attached Brave tabs..." } },
+      },
+    });
+
+    // If session is in "default" (Ask) mode, request inline permission first!
+    let permDecision = "auto";
+    if (s?.modeId === "default") {
+      const pId = String(permCounter++);
+      const outcomePromise = new Promise((res) => pendingPerms.set(pId, res));
+      send({
+        jsonrpc: "2.0",
+        id: pId,
+        method: "session/request_permission",
+        params: {
+          sessionId: sid,
+          toolCall: {
+            toolCallId: "tc-perm-1",
+            name: "browser_tab_action",
+            title: "Click Submit on Brave Tab #10",
+            args: { action: "click", element_index: 1 },
+          },
+          options: [
+            { optionId: "allow", name: "Allow", kind: "allow_once" },
+            { optionId: "deny", name: "Deny", kind: "reject_once" },
+          ],
+        },
+      });
+      const permRes = await outcomePromise;
+      permDecision = permRes?.outcome?.optionId || "cancelled";
+    }
+
+    // Emit tool call & completion
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-1",
+          name: "read_page_context",
+          title: "Read active Brave tab",
+          status: "in_progress",
+        },
+      },
+    });
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-1",
+          name: "read_page_context",
+          title: "Read active Brave tab",
+          status: "completed",
+        },
+      },
+    });
+
+    const replyText = \`Summary ready (image=\${hasImage}, perm=\${permDecision})\`;
+    s.history.push({ promptText: textBlock, replyText });
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: replyText } },
+      },
+    });
+
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        stopReason: "end_turn",
+        usage: { inputTokens: 120, outputTokens: 18, totalTokens: 138 },
+      },
+    });
+  }
+});
+`;
+  fs.writeFileSync(mockAgyPath, mockAgyScript, { mode: 0o755 });
+  fs.chmodSync(mockAgyPath, 0o755);
+
+  const bridgeEnv = launchNativeHostWithRealExtension({
+    sockDir,
+    brand: "brave",
+    extraHostEnv: {
+      AGY_BIN: mockAgyPath,
+      AG_ACP_APP_DATA_DIR: "antigravity",
+      AG_ACP_DEFAULT_CWD: tmpDir,
+      AG_CHROME_SESSIONS_FILE: chromeSessionsFile,
+      AG_MOCK_OPEN_DESKTOP: "1",
+    },
+    initialTabs: [
+      { id: 10, windowId: 1, active: true, title: "Pricing Tier A", url: "https://saas.example.test/pricing-a" },
+      { id: 11, windowId: 1, active: false, title: "Pricing Tier B", url: "https://saas.example.test/pricing-b" },
+    ],
+  });
+
+  t.after(async () => {
+    await bridgeEnv.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const sockPath = await bridgeEnv.waitForSocket();
+
+  // 1. Verify `openPanelOnActionClick: true` was set automatically on boot
+  assert.equal(
+    bridgeEnv.getSidePanelBehavior()?.openPanelOnActionClick,
+    true,
+    "Extension must configure chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })",
+  );
+
+  // 2. Connect live Side Panel port & run `sidepanel:init`
+  const spEvents = [];
+  const spPort = bridgeEnv.connectSidePanelPort();
+  spPort.onMessage((m) => spEvents.push(m));
+
+  const initRes = await bridgeEnv.sendRuntimeMessage({ type: "sidepanel:init" });
+  assert.equal(initRes.ok, true);
+  assert.equal(initRes.agentStatus.ok, true);
+  assert.equal(initRes.agentStatus.agyFound, true);
+  assert.equal(initRes.agentStatus.acpReady, true);
+  assert.ok(initRes.shortcuts.builtin.some((s) => s.command === "summarize"));
+
+  // Verify `agy acp --app-data-dir antigravity` was invoked so Chrome chats share Antigravity Desktop's store
+  const bootLog = JSON.parse(fs.readFileSync(acpLogPath, "utf8"));
+  assert.deepEqual(bootLog.argv, ["acp", "--app-data-dir", "antigravity"]);
+
+  // 3. Send Chat Mode prompt with Active Tab (#10) + @-Mentioned Tab (#11) + Screenshot
+  const shotRes = await bridgeEnv.sendRuntimeMessage({ type: "sidepanel:captureScreenshot", windowId: 1 });
+  assert.equal(shotRes.ok, true);
+
+  const turn1Res = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      requestId: "req-turn-1",
+      sessionId: null,
+      userText: "Compare Pricing Tier A and Pricing Tier B.",
+      interactionMode: "chat",
+      permissionMode: "auto",
+      modelId: "gemini-4-carbon-medium",
+      includeActiveTab: true,
+      activeTabId: 10,
+      mentionedTabIds: [11],
+      screenshotBase64: shotRes.base64,
+    },
+  });
+
+  assert.equal(turn1Res.ok, true);
+  assert.equal(turn1Res.sessionId, "chrome-sess-1");
+  assert.equal(turn1Res.title, "Brave Page Comparison");
+
+  // Zero debugger banner in Chat Mode!
+  assert.equal(
+    bridgeEnv.attachedTargets.size,
+    0,
+    "Chat Mode page reading must NOT attach chrome.debugger (zero debugging banner)",
+  );
+
+  // Verify streaming thoughts, tool calls, and markdown chunks reached the Side Panel port
+  const agentEvents = spEvents.filter((e) => e.type === "sidepanel:agentEvent").map((e) => e.payload);
+  assert.ok(agentEvents.some((e) => e.event === "session_created" && e.sessionId === "chrome-sess-1"));
+  assert.ok(agentEvents.some((e) => e.update?.sessionUpdate === "agent_thought_chunk"));
+  assert.ok(agentEvents.some((e) => e.update?.sessionUpdate === "tool_call"));
+  assert.ok(
+    agentEvents.some(
+      (e) =>
+        e.update?.sessionUpdate === "agent_message_chunk" &&
+        e.update.content?.text?.includes("Summary ready (image=true, perm=auto)"),
+    ),
+  );
+
+  // Verify ACP prompt received active tab, @-mentioned tab, and image block
+  const afterTurn1Log = JSON.parse(fs.readFileSync(acpLogPath, "utf8"));
+  assert.equal(afterTurn1Log.prompts[0].hasImage, true);
+  assert.match(afterTurn1Log.prompts[0].text, /Pricing Tier A/);
+  assert.match(afterTurn1Log.prompts[0].text, /@-Mentioned Tab \(#11\)/);
+  assert.match(afterTurn1Log.prompts[0].text, /Pricing Tier B/);
+
+  // 4. Send Turn 2 in "Ask" (`default`) Permission Mode and approve inline permission prompt!
+  spPort.onMessage((m) => {
+    if (m.type === "sidepanel:agentEvent" && m.payload?.event === "permission_request") {
+      bridgeEnv.sendRuntimeMessage({
+        type: "sidepanel:respondPermission",
+        permRequestId: m.payload.permRequestId,
+        optionId: "allow",
+      });
+    }
+  });
+
+  const turn2Res = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      requestId: "req-turn-2",
+      sessionId: "chrome-sess-1",
+      userText: "Now submit the form.",
+      interactionMode: "agent",
+      permissionMode: "default",
+      includeActiveTab: true,
+      activeTabId: 10,
+    },
+  });
+  assert.equal(turn2Res.ok, true);
+  assert.ok(
+    spEvents.some(
+      (e) =>
+        e.type === "sidepanel:agentEvent" &&
+        e.payload?.update?.sessionUpdate === "agent_message_chunk" &&
+        e.payload.update.content?.text?.includes("perm=allow"),
+    ),
+    "Inline permission approval must resolve ACP session/request_permission",
+  );
+
+  // 5. Verify Exact One-Way Session Rule:
+  //    a) Chrome-created chat CAN be reloaded in Chrome (with clean stripped user text) AND opened in Desktop App!
+  const reloadChromeRes = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:loadSession",
+    sessionId: "chrome-sess-1",
+  });
+  assert.equal(reloadChromeRes.ok, true);
+  assert.equal(reloadChromeRes.session.messages[0].text, "Compare Pricing Tier A and Pricing Tier B.");
+  assert.ok(
+    !reloadChromeRes.session.messages[0].text.includes("<browser_sidepanel_context>"),
+    "Reloaded user message must strip internal <browser_sidepanel_context> wrapper",
+  );
+
+  const openAppRes = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:openInDesktopApp",
+    sessionId: "chrome-sess-1",
+  });
+  assert.equal(openAppRes.ok, true);
+  assert.equal(openAppRes.launched, true);
+
+  //    b) Desktop-originated Antigravity chat ("desktop-conv-9999") MUST BE BLOCKED from opening in Chrome!
+  const blockedDesktopRes = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:loadSession",
+    sessionId: "desktop-conv-9999",
+  });
+  assert.equal(blockedDesktopRes.ok, false);
+  assert.equal(blockedDesktopRes.code, -32010);
+  assert.match(blockedDesktopRes.error, /cannot be opened in Antigravity in Chrome/i);
+
+  // 6. Verify Simultaneous Desktop App -> Brave Tab Control over Unix Socket while Side Panel is open!
+  const clientToServer = new PassThrough();
+  const serverToClient = new PassThrough();
+  const { mcp, browserManager } = createComputerUseServer({
+    input: clientToServer,
+    output: serverToClient,
+    jxaRunner: async () => "[]",
+    extensionSockDir: sockDir,
+  });
+  browserManager.discoverCDPEndpoints = async () => [];
+  mcp.start();
+  const desktopMcpRpc = attachMcpRpcHelper(clientToServer, serverToClient);
+  t.after(async () => {
+    await mcp.shutdown();
+  });
+
+  await desktopMcpRpc("initialize", { protocolVersion: "2024-11-05" });
+  const desktopOpenTab = await desktopMcpRpc("tools/call", {
+    name: "browser_open_tab",
+    arguments: {
+      url: "https://desktop-agent.example.test/research",
+      group_title: "Desktop Task",
+      group_color: "blue",
+    },
+  });
+  assert.ok(!desktopOpenTab.result.isError, "Desktop MCP chat must simultaneously control Brave tabs & Tab Groups");
+  assert.match(desktopOpenTab.result.content[0].text, /Navigated https:\/\/desktop-agent\.example\.test\/research|desktop-agent\.example\.test/);
+
+  // 7. Verify Custom `/` Shortcut + Scheduled Browser Task (`chrome.alarms`) execution!
+  const savedSc = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:saveShortcut",
+    payload: {
+      command: "daily-digest",
+      title: "Daily Digest",
+      prompt: "Create my daily digest from this tab.",
+      interactionMode: "chat",
+    },
+  });
+  assert.equal(savedSc.ok, true);
+  assert.equal(savedSc.shortcut.command, "daily-digest");
+
+  const savedSched = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:saveSchedule",
+    payload: {
+      name: "Hourly Pricing Check",
+      targetUrl: "https://saas.example.test/pricing-a",
+      prompt: "Check if Pricing Tier A changed.",
+      intervalMinutes: 60,
+      interactionMode: "chat",
+      enabled: true,
+    },
+  });
+  assert.equal(savedSched.ok, true);
+  const alarmName = `ag-sched:${savedSched.task.id}`;
+  assert.ok(bridgeEnv.createdAlarms.has(alarmName), "Saving an enabled schedule must register a chrome.alarms timer");
+
+  const runSchedRes = await bridgeEnv.sendRuntimeMessage({
+    type: "sidepanel:runScheduleNow",
+    id: savedSched.task.id,
+  });
+  assert.equal(runSchedRes.ok, true);
+  assert.equal(runSchedRes.sessionId, "chrome-sess-2");
+  assert.equal(runSchedRes.task.lastStatus, "completed");
+
+  spPort.disconnect();
 });

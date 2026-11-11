@@ -1,6 +1,9 @@
-// Antigravity in Chrome — MV3 Service Worker & Native Messaging JSON-RPC 2.0 Server
+// Antigravity in Chrome — MV3 Service Worker, Side Panel Controller & Native Messaging Bridge
 const NATIVE_HOST_NAME = "com.antigravity.browser_bridge";
 const KEEPALIVE_ALARM = "ag-native-bridge-watchdog";
+const SCHEDULE_ALARM_PREFIX = "ag-sched:";
+const MAX_STORED_CHROME_SESSIONS = 50;
+
 const VALID_GROUP_COLORS = new Set([
   "grey",
   "blue",
@@ -13,11 +16,96 @@ const VALID_GROUP_COLORS = new Set([
   "orange",
 ]);
 
+const BUILTIN_SHORTCUTS = [
+  {
+    id: "builtin-summarize",
+    command: "summarize",
+    title: "Summarize this page",
+    description: "Concise executive summary, key takeaways, and action items from the current tab.",
+    prompt:
+      "Summarize this webpage clearly: give a 2-sentence TL;DR, bulleted key takeaways, and any notable numbers, links, or caveats.",
+    interactionMode: "chat",
+    builtin: true,
+  },
+  {
+    id: "builtin-extract",
+    command: "extract-table",
+    title: "Extract structured data",
+    description: "Pull tables, prices, specs, or lists on this page into clean Markdown / JSON.",
+    prompt:
+      "Extract the main structured data, items, tables, or metrics from this page into a clean Markdown table (and compact JSON block if helpful).",
+    interactionMode: "chat",
+    builtin: true,
+  },
+  {
+    id: "builtin-selection",
+    command: "explain-selection",
+    title: "Explain highlighted text",
+    description: "Explain or fact-check the text currently selected on the active tab.",
+    prompt:
+      "Explain the selected text on this page in plain, clear language, including how it relates to the surrounding page context.",
+    interactionMode: "chat",
+    builtin: true,
+  },
+  {
+    id: "builtin-compare",
+    command: "compare-tabs",
+    title: "Compare attached tabs",
+    description: "Compare pricing, docs, or specs across the active tab and @-mentioned tabs.",
+    prompt:
+      "Compare the active tab and all attached @-mentioned tabs side-by-side in a clear comparison table with pros, cons, and a recommendation.",
+    interactionMode: "chat",
+    builtin: true,
+  },
+  {
+    id: "builtin-organize",
+    command: "organize-tabs",
+    title: "Group & tidy open tabs",
+    description: "Agent Mode: organize open browser tabs into clean color-coded Tab Groups.",
+    prompt:
+      "Inspect my open browser tabs using computer-use and organize related research/work tabs into clean, descriptive color-coded Tab Groups without closing any of my tabs.",
+    interactionMode: "agent",
+    builtin: true,
+  },
+  {
+    id: "builtin-audit",
+    command: "audit-page",
+    title: "Inspect console & UX issues",
+    description: "Agent Mode: inspect console errors, failed network requests, and accessibility on this tab.",
+    prompt:
+      "Claim this browser tab in-place using computer-use, inspect its accessibility snapshot, console messages, and failed network requests, and report any bugs or UX issues.",
+    interactionMode: "agent",
+    builtin: true,
+  },
+];
+
 let nativePort = null;
 let lastNativeError = null;
 let reconnectAttempt = 0;
 let reconnectTimer = null;
 let browserIdentityPromise = null;
+
+// Outbound Extension -> Native Host JSON-RPC requests (`agent.*`)
+let nextExtRpcId = 1;
+const pendingNativeRpcs = new Map(); // rpcId -> { resolve, reject, timer }
+
+// Live Side Panel UI Ports
+const sidepanelPorts = new Set();
+
+// Desktop MCP Bridge telemetry
+let desktopBridgeInfo = {
+  desktopMcpClients: 0,
+  lastMethod: null,
+  ts: 0,
+};
+
+// Chrome-originated Side Panel conversations (NEVER includes Desktop-originated chats!)
+// sessionId -> { sessionId, title, createdAt, updatedAt, interactionMode, permissionMode, modelId, originUrl, originTitle, scheduledTaskName, messages }
+const chromeSessions = new Map();
+// requestId -> { sessionId, userText, interactionMode, permissionMode, modelId, originUrl, originTitle, scheduledTaskName, assistantMsg }
+const activeTurnByRequest = new Map();
+let localStateLoaded = false;
+let persistChromeSessionsTimer = null;
 
 // Attached debuggers: tabId -> Promise | true
 const attachedTabs = new Set();
@@ -47,6 +135,98 @@ function normalizeGroupColor(color) {
   if (c === "violet" || c === "indigo") return "purple";
   if (c === "amber") return "orange";
   return "cyan";
+}
+
+function stripInjectedBrowserContext(rawText) {
+  if (typeof rawText !== "string") return "";
+  return rawText.replace(/^<browser_sidepanel_context>[\s\S]*?<\/browser_sidepanel_context>\s*/i, "").trim();
+}
+
+function isSafeInjectableUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return false;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+  if (/chromewebstore\.google\.com|addons\.mozilla\.org/i.test(parsed.hostname)) {
+    return false;
+  }
+  return true;
+}
+
+async function configureSidePanelBehavior() {
+  try {
+    if (chrome.sidePanel?.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+    }
+  } catch {}
+}
+
+function broadcastToSidePanels(msg) {
+  for (const port of Array.from(sidepanelPorts)) {
+    try {
+      port.postMessage(msg);
+    } catch {
+      sidepanelPorts.delete(port);
+    }
+  }
+}
+
+async function ensureLocalStateLoaded() {
+  if (localStateLoaded) return;
+  localStateLoaded = true;
+  try {
+    if (!chrome.storage?.local?.get) return;
+    const data = await chrome.storage.local.get(["agChromeSessions"]);
+    if (Array.isArray(data?.agChromeSessions)) {
+      for (const item of data.agChromeSessions) {
+        if (item && typeof item.sessionId === "string" && item.sessionId) {
+          chromeSessions.set(item.sessionId, item);
+        }
+      }
+    }
+  } catch {}
+}
+
+function schedulePersistChromeSessions() {
+  if (persistChromeSessionsTimer) return;
+  persistChromeSessionsTimer = setTimeout(async () => {
+    persistChromeSessionsTimer = null;
+    await flushChromeSessionsNow();
+  }, 250);
+}
+
+async function flushChromeSessionsNow() {
+  try {
+    if (!chrome.storage?.local?.set) return;
+    const sorted = Array.from(chromeSessions.values())
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+      .slice(0, MAX_STORED_CHROME_SESSIONS);
+    await chrome.storage.local.set({ agChromeSessions: sorted });
+  } catch {}
+}
+
+function getChromeSessionsSummaryList() {
+  return Array.from(chromeSessions.values())
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    .map((s) => ({
+      sessionId: s.sessionId,
+      title: s.title || "Browser Chat",
+      createdAt: s.createdAt || 0,
+      updatedAt: s.updatedAt || 0,
+      interactionMode: s.interactionMode || "chat",
+      permissionMode: s.permissionMode || "auto",
+      modelId: s.modelId || "",
+      originUrl: s.originUrl || "",
+      originTitle: s.originTitle || "",
+      scheduledTaskName: s.scheduledTaskName || null,
+      messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
+    }));
 }
 
 function getOrCreateSession(sessionId = "default", defaults = {}) {
@@ -174,6 +354,40 @@ function emitNotification(method, params) {
   });
 }
 
+async function callNativeAgentRpc(method, params = {}, timeoutMs = 0) {
+  if (!nativePort) {
+    await connectNativeBridge();
+  }
+  if (!nativePort) {
+    throw new Error(
+      lastNativeError ||
+        "Native Messaging host is disconnected. Run ./install.sh in antigravity-codex-computer-control and click Reconnect.",
+    );
+  }
+  const id = `ext-rpc-${nextExtRpcId++}`;
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        pendingNativeRpcs.delete(id);
+        reject(new Error(`Native host request '${method}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+    pendingNativeRpcs.set(id, { resolve, reject, timer });
+    const ok = sendNativeMessage({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params,
+    });
+    if (!ok) {
+      if (timer) clearTimeout(timer);
+      pendingNativeRpcs.delete(id);
+      reject(new Error("Failed to send message over Native Messaging port"));
+    }
+  });
+}
+
 function scheduleReconnect(immediate = false) {
   if (nativePort) return;
   if (reconnectTimer) {
@@ -206,17 +420,24 @@ async function connectNativeBridge() {
       if (nativePort === port) {
         nativePort = null;
       }
+      for (const [, pending] of pendingNativeRpcs.entries()) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.reject(new Error(errMsg));
+      }
+      pendingNativeRpcs.clear();
       reconnectAttempt += 1;
       scheduleReconnect(false);
+      buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     });
 
     const ident = await detectBrowserIdentity();
     emitNotification("bridgeHello", {
       extensionId: chrome.runtime.id,
-      version: chrome.runtime.getManifest?.()?.version || "2.0.0",
+      version: chrome.runtime.getManifest?.()?.version || "3.0.0",
       ...ident,
       attachedTabIds: Array.from(attachedTabs),
     });
+    buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return true;
   } catch (err) {
     lastNativeError = err?.message || String(err);
@@ -240,6 +461,7 @@ async function ensureDebuggerAttached(tabId) {
     try {
       await chrome.debugger.attach({ tabId: tid }, "1.3");
       attachedTabs.add(tid);
+      buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
       return { attached: true, alreadyAttached: false };
     } catch (err) {
       const msg = err?.message || String(err);
@@ -273,6 +495,7 @@ async function detachDebuggerSafe(tabId) {
   }
   try {
     await chrome.debugger.detach({ tabId: tid });
+    buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return { detached: true, tabId: tid };
   } catch {
     return { detached: false, tabId: tid };
@@ -431,6 +654,580 @@ async function addTabToSessionGroup(tab, session, { groupTitle, groupColor } = {
   };
 }
 
+/**
+ * Extract clean readable page context via `chrome.scripting.executeScript` (ZERO debugger banner!).
+ */
+async function extractReadableTabContext(tabId, { maxChars = 14000 } = {}) {
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid) || tid <= 0) return null;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tid);
+  } catch {
+    return null;
+  }
+  const rawUrl = tab.url || tab.pendingUrl || "";
+  const baseMeta = {
+    tabId: tab.id,
+    windowId: tab.windowId,
+    title: tab.title || "",
+    url: rawUrl,
+    readable: false,
+    selection: "",
+    metaDescription: "",
+    headings: [],
+    text: "",
+  };
+  if (!isSafeInjectableUrl(rawUrl) || !chrome.scripting?.executeScript) {
+    return baseMeta;
+  }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tid },
+      args: [maxChars],
+      func: (limit) => {
+        const selection = (window.getSelection?.()?.toString() || "").trim().slice(0, 4000);
+        const metaEl =
+          document.querySelector('meta[name="description"]') ||
+          document.querySelector('meta[property="og:description"]');
+        const metaDescription = (metaEl?.getAttribute("content") || "").trim().slice(0, 600);
+        const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
+          .map((h) => (h.innerText || h.textContent || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 20);
+        const root = document.querySelector("main, article, [role='main']") || document.body;
+        const rawText = (root?.innerText || document.body?.innerText || "")
+          .replace(/\r/g, "")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+        return {
+          title: document.title || "",
+          url: location.href,
+          selection,
+          metaDescription,
+          headings,
+          linksCount: document.querySelectorAll("a[href]").length,
+          buttonsCount: document.querySelectorAll("button, [role='button']").length,
+          inputsCount: document.querySelectorAll("input, textarea, select").length,
+          text: rawText.slice(0, limit),
+          truncated: rawText.length > limit,
+        };
+      },
+    });
+    const extracted = results?.[0]?.result;
+    if (extracted && typeof extracted === "object") {
+      return {
+        ...baseMeta,
+        ...extracted,
+        readable: true,
+      };
+    }
+  } catch {}
+  return baseMeta;
+}
+
+async function captureVisibleTabPng(windowId = null) {
+  if (!chrome.tabs?.captureVisibleTab) {
+    throw new Error("Tab screenshot capture is unavailable in this context.");
+  }
+  const dataUrl =
+    typeof windowId === "number" && windowId >= 0
+      ? await chrome.tabs.captureVisibleTab(windowId, { format: "png" })
+      : await chrome.tabs.captureVisibleTab({ format: "png" });
+  const prefix = "data:image/png;base64,";
+  const base64 = dataUrl.startsWith(prefix) ? dataUrl.slice(prefix.length) : dataUrl.split(",")[1] || "";
+  return {
+    dataUrl,
+    base64,
+    mimeType: "image/png",
+  };
+}
+
+function formatTabContextSection(label, ctx, browserFamily) {
+  if (!ctx) return "";
+  const mcpTabId = `ext:${browserFamily}:${ctx.tabId}`;
+  const lines = [
+    `### ${label}`,
+    `- Title: ${ctx.title || "(Untitled)"}`,
+    `- URL: ${ctx.url || "(empty)"}`,
+    `- Browser Tab ID (for computer-use MCP): \`${mcpTabId}\` (numeric tabId: ${ctx.tabId}, windowId: ${ctx.windowId})`,
+  ];
+  if (ctx.metaDescription) {
+    lines.push(`- Meta Description: ${ctx.metaDescription}`);
+  }
+  if (ctx.selection) {
+    lines.push(`- Highlighted Selection on Page:\n"""\n${ctx.selection}\n"""`);
+  }
+  if (Array.isArray(ctx.headings) && ctx.headings.length > 0) {
+    lines.push(`- Key Headings: ${ctx.headings.slice(0, 12).join(" | ")}`);
+  }
+  if (ctx.readable && ctx.text) {
+    lines.push(
+      `- Visible Page Content${ctx.truncated ? " (excerpt)" : ""}:\n\`\`\`text\n${ctx.text}\n\`\`\``,
+    );
+  }
+  return lines.join("\n");
+}
+
+function handleAgentStreamEvent(params = {}) {
+  const { event, requestId, sessionId, update } = params;
+  const turn = requestId ? activeTurnByRequest.get(requestId) : null;
+
+  if (event === "session_created" && sessionId) {
+    if (turn) {
+      turn.sessionId = sessionId;
+      const now = Date.now();
+      const record = {
+        sessionId,
+        title: turn.initialTitle || "New Browser Chat",
+        createdAt: now,
+        updatedAt: now,
+        interactionMode: turn.interactionMode || "chat",
+        permissionMode: turn.permissionMode || "auto",
+        modelId: turn.modelId || "",
+        originUrl: turn.originUrl || "",
+        originTitle: turn.originTitle || "",
+        scheduledTaskName: turn.scheduledTaskName || null,
+        messages: [
+          {
+            role: "user",
+            text: turn.userText,
+            attachments: turn.attachments || [],
+            ts: now,
+          },
+          turn.assistantMsg,
+        ],
+      };
+      chromeSessions.set(sessionId, record);
+      schedulePersistChromeSessions();
+    }
+  } else if (event === "session_update" && sessionId && update) {
+    const rec = chromeSessions.get(sessionId);
+    if (rec) {
+      rec.updatedAt = Date.now();
+      if (update.sessionUpdate === "session_info_update" && update.title) {
+        rec.title = update.title;
+        schedulePersistChromeSessions();
+      }
+      const targetMsg = turn?.assistantMsg || rec.messages?.[rec.messages.length - 1];
+      if (targetMsg && targetMsg.role === "assistant") {
+        if (update.sessionUpdate === "agent_message_chunk" && update.content?.text) {
+          targetMsg.text = (targetMsg.text || "") + update.content.text;
+        } else if (update.sessionUpdate === "agent_thought_chunk" && update.content?.text) {
+          targetMsg.thoughts = (targetMsg.thoughts || "") + update.content.text;
+        } else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+          if (!Array.isArray(targetMsg.toolCalls)) targetMsg.toolCalls = [];
+          const existing = targetMsg.toolCalls.find((tc) => tc.toolCallId === update.toolCallId);
+          if (existing) {
+            if (update.status) existing.status = update.status;
+            if (update.title) existing.title = update.title;
+          } else {
+            targetMsg.toolCalls.push({
+              toolCallId: update.toolCallId,
+              name: update.name || "tool",
+              title: update.title || update.name || "Tool",
+              status: update.status || "in_progress",
+              kind: update.kind || "other",
+            });
+          }
+        }
+        schedulePersistChromeSessions();
+      }
+    }
+  }
+
+  broadcastToSidePanels({
+    type: "sidepanel:agentEvent",
+    payload: params,
+  });
+}
+
+async function runSidePanelPrompt({
+  requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  sessionId = null,
+  userText = "",
+  interactionMode = "chat",
+  permissionMode = "auto",
+  autoApprovePermissions = false,
+  modelId = null,
+  includeActiveTab = true,
+  activeTabId = null,
+  mentionedTabIds = [],
+  screenshotBase64 = null,
+  scheduledTaskName = null,
+} = {}) {
+  await ensureLocalStateLoaded();
+  const ident = await detectBrowserIdentity();
+  const browserFamily = ident.browserFamily || "chrome";
+
+  // Verify existing Chrome session if resuming
+  if (sessionId && !chromeSessions.has(sessionId)) {
+    throw new Error(
+      "Conversations created in the Antigravity Desktop App cannot be opened in Antigravity in Chrome. Start a new chat here to view it in both Chrome and the Desktop App.",
+    );
+  }
+
+  let resolvedActiveTabId = activeTabId;
+  if (includeActiveTab && !resolvedActiveTabId) {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (active?.id) resolvedActiveTabId = active.id;
+    } catch {}
+  }
+
+  const contextSections = [];
+  const attachments = [];
+  let originUrl = "";
+  let originTitle = "";
+
+  if (includeActiveTab && resolvedActiveTabId) {
+    const activeCtx = await extractReadableTabContext(resolvedActiveTabId, { maxChars: 14_000 });
+    if (activeCtx) {
+      originUrl = activeCtx.url || "";
+      originTitle = activeCtx.title || "";
+      attachments.push({
+        kind: "active-tab",
+        tabId: activeCtx.tabId,
+        title: activeCtx.title || activeCtx.url || `Tab #${activeCtx.tabId}`,
+        url: activeCtx.url || "",
+      });
+      contextSections.push(formatTabContextSection("Active Webpage Tab", activeCtx, browserFamily));
+    }
+  }
+
+  const uniqueMentions = Array.from(new Set((mentionedTabIds || []).map(Number).filter((n) => n > 0 && n !== resolvedActiveTabId)));
+  for (const mTabId of uniqueMentions.slice(0, 6)) {
+    const mCtx = await extractReadableTabContext(mTabId, { maxChars: 8_000 });
+    if (mCtx) {
+      attachments.push({
+        kind: "mentioned-tab",
+        tabId: mCtx.tabId,
+        title: mCtx.title || mCtx.url || `Tab #${mCtx.tabId}`,
+        url: mCtx.url || "",
+      });
+      contextSections.push(formatTabContextSection(`@-Mentioned Tab (#${mCtx.tabId})`, mCtx, browserFamily));
+    }
+  }
+
+  if (screenshotBase64) {
+    attachments.push({ kind: "screenshot", label: "Tab Screenshot" });
+  }
+
+  const modeBanner =
+    interactionMode === "agent"
+      ? `[Interaction Mode: Agent / Browser Control — Use computer-use MCP tools (browser_tab_state, browser_tab_action, browser_open_tab, browser_manage) to inspect and act on the live ${ident.browserName} browser.]`
+      : `[Interaction Mode: Chat / Read-Only — Answer directly using the live page/tab context below without mutating browser tabs unless asked to switch to Agent Mode.]`;
+
+  const contextEnvelope = `<browser_sidepanel_context>\n${modeBanner}${
+    contextSections.length > 0 ? `\n\n${contextSections.join("\n\n")}` : ""
+  }\n</browser_sidepanel_context>\n\n`;
+
+  const cleanText = String(userText || "").trim();
+  const fullPromptText = `${contextEnvelope}${cleanText}`;
+
+  const promptBlocks = [];
+  if (screenshotBase64) {
+    promptBlocks.push({
+      type: "image",
+      data: screenshotBase64,
+      mimeType: "image/png",
+    });
+  }
+  promptBlocks.push({
+    type: "text",
+    text: fullPromptText,
+  });
+
+  const assistantMsg = {
+    role: "assistant",
+    text: "",
+    thoughts: "",
+    toolCalls: [],
+    ts: Date.now(),
+  };
+
+  const initialTitle =
+    scheduledTaskName
+      ? `🕒 ${scheduledTaskName}`
+      : cleanText.replace(/\s+/g, " ").slice(0, 64) || originTitle || "Browser Chat";
+
+  const now = Date.now();
+  if (sessionId && chromeSessions.has(sessionId)) {
+    const rec = chromeSessions.get(sessionId);
+    rec.updatedAt = now;
+    rec.interactionMode = interactionMode;
+    rec.permissionMode = permissionMode;
+    if (modelId) rec.modelId = modelId;
+    if (!Array.isArray(rec.messages)) rec.messages = [];
+    rec.messages.push(
+      {
+        role: "user",
+        text: cleanText,
+        attachments,
+        ts: now,
+      },
+      assistantMsg,
+    );
+    schedulePersistChromeSessions();
+  }
+
+  activeTurnByRequest.set(requestId, {
+    requestId,
+    sessionId,
+    userText: cleanText,
+    attachments,
+    initialTitle,
+    interactionMode,
+    permissionMode,
+    modelId: modelId || "",
+    originUrl,
+    originTitle,
+    scheduledTaskName,
+    assistantMsg,
+  });
+
+  try {
+    const res = await callNativeAgentRpc("agent.prompt", {
+      requestId,
+      sessionId,
+      promptBlocks,
+      modeId: permissionMode || "auto",
+      modelId: modelId || null,
+      autoApprovePermissions: Boolean(autoApprovePermissions),
+    });
+    const finalSessionId = res?.sessionId || sessionId;
+    if (finalSessionId && chromeSessions.has(finalSessionId)) {
+      const rec = chromeSessions.get(finalSessionId);
+      if (res?.title) rec.title = res.title;
+      rec.updatedAt = Date.now();
+      await flushChromeSessionsNow();
+    }
+    broadcastToSidePanels({
+      type: "sidepanel:sessionsUpdated",
+      sessions: getChromeSessionsSummaryList(),
+    });
+    return {
+      ok: true,
+      requestId,
+      sessionId: finalSessionId,
+      title: res?.title || chromeSessions.get(finalSessionId)?.title || initialTitle,
+      stopReason: res?.stopReason || "end_turn",
+      usage: res?.usage || null,
+    };
+  } finally {
+    activeTurnByRequest.delete(requestId);
+  }
+}
+
+// Scheduled Browser Tasks Management (`chrome.alarms` + `chrome.storage.local`)
+async function getStoredShortcuts() {
+  let custom = [];
+  try {
+    if (chrome.storage?.local?.get) {
+      const data = await chrome.storage.local.get(["agCustomShortcuts"]);
+      if (Array.isArray(data?.agCustomShortcuts)) custom = data.agCustomShortcuts;
+    }
+  } catch {}
+  return {
+    builtin: BUILTIN_SHORTCUTS,
+    custom,
+  };
+}
+
+async function saveCustomShortcut({ id, command, title, description, prompt, interactionMode = "chat" } = {}) {
+  const cleanCmd = String(command || "")
+    .trim()
+    .replace(/^\/+/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-");
+  if (!cleanCmd || !prompt) {
+    throw new Error("Shortcut requires a command name and prompt text.");
+  }
+  const { custom } = await getStoredShortcuts();
+  const nextId = id || `sc-${Date.now()}`;
+  const item = {
+    id: nextId,
+    command: cleanCmd,
+    title: String(title || `/${cleanCmd}`).trim(),
+    description: String(description || prompt).trim().slice(0, 140),
+    prompt: String(prompt).trim(),
+    interactionMode: interactionMode === "agent" ? "agent" : "chat",
+    builtin: false,
+  };
+  const idx = custom.findIndex((c) => c.id === nextId || c.command === cleanCmd);
+  if (idx !== -1) custom[idx] = item;
+  else custom.unshift(item);
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({ agCustomShortcuts: custom });
+  }
+  return { ok: true, shortcut: item, custom };
+}
+
+async function deleteCustomShortcut({ id } = {}) {
+  const { custom } = await getStoredShortcuts();
+  const filtered = custom.filter((c) => c.id !== id);
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({ agCustomShortcuts: filtered });
+  }
+  return { ok: true, custom: filtered };
+}
+
+async function getScheduledTasks() {
+  try {
+    if (chrome.storage?.local?.get) {
+      const data = await chrome.storage.local.get(["agScheduledTasks"]);
+      if (Array.isArray(data?.agScheduledTasks)) return data.agScheduledTasks;
+    }
+  } catch {}
+  return [];
+}
+
+async function syncScheduleAlarms() {
+  const tasks = await getScheduledTasks();
+  if (chrome.alarms?.getAll && chrome.alarms?.clear) {
+    try {
+      const existing = await chrome.alarms.getAll();
+      for (const a of existing) {
+        if (a.name?.startsWith(SCHEDULE_ALARM_PREFIX)) {
+          const tid = a.name.slice(SCHEDULE_ALARM_PREFIX.length);
+          const match = tasks.find((t) => t.id === tid && t.enabled);
+          if (!match) {
+            await chrome.alarms.clear(a.name);
+          }
+        }
+      }
+    } catch {}
+  }
+  for (const t of tasks) {
+    const alarmName = `${SCHEDULE_ALARM_PREFIX}${t.id}`;
+    if (t.enabled) {
+      const mins = Math.max(1, Number(t.intervalMinutes) || 60);
+      chrome.alarms.create(alarmName, {
+        delayInMinutes: mins,
+        periodInMinutes: mins,
+      });
+    } else if (chrome.alarms?.clear) {
+      try {
+        await chrome.alarms.clear(alarmName);
+      } catch {}
+    }
+  }
+}
+
+async function saveScheduledTask({
+  id,
+  name,
+  prompt,
+  targetUrl = "",
+  intervalMinutes = 60,
+  interactionMode = "chat",
+  enabled = true,
+} = {}) {
+  if (!name || !prompt) {
+    throw new Error("Scheduled task requires a name and prompt.");
+  }
+  const tasks = await getScheduledTasks();
+  const taskId = id || `sched-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const existing = tasks.find((t) => t.id === taskId);
+  const record = {
+    id: taskId,
+    name: String(name).trim(),
+    prompt: String(prompt).trim(),
+    targetUrl: String(targetUrl || "").trim(),
+    intervalMinutes: Math.max(1, Number(intervalMinutes) || 60),
+    interactionMode: interactionMode === "agent" ? "agent" : "chat",
+    enabled: Boolean(enabled),
+    lastRunAt: existing?.lastRunAt || null,
+    lastSessionId: existing?.lastSessionId || null,
+    lastStatus: existing?.lastStatus || null,
+  };
+  const idx = tasks.findIndex((t) => t.id === taskId);
+  if (idx !== -1) tasks[idx] = record;
+  else tasks.unshift(record);
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({ agScheduledTasks: tasks });
+  }
+  await syncScheduleAlarms();
+  return { ok: true, task: record, tasks };
+}
+
+async function deleteScheduledTask({ id } = {}) {
+  const tasks = await getScheduledTasks();
+  const filtered = tasks.filter((t) => t.id !== id);
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({ agScheduledTasks: filtered });
+  }
+  if (chrome.alarms?.clear) {
+    try {
+      await chrome.alarms.clear(`${SCHEDULE_ALARM_PREFIX}${id}`);
+    } catch {}
+  }
+  return { ok: true, tasks: filtered };
+}
+
+async function executeScheduledTask(taskId) {
+  const tasks = await getScheduledTasks();
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) throw new Error(`Scheduled task '${taskId}' not found`);
+
+  let targetTabId = null;
+  let createdScratchTabId = null;
+  if (task.targetUrl && isSafeInjectableUrl(task.targetUrl)) {
+    const allTabs = await chrome.tabs.query({});
+    const existingTab = allTabs.find((t) => (t.url || "").startsWith(task.targetUrl));
+    if (existingTab) {
+      targetTabId = existingTab.id;
+    } else {
+      const created = await rpcHandlers.createTab({
+        sessionId: `sched-${task.id}`,
+        url: task.targetUrl,
+        active: false,
+        groupTitle: `🕒 ${task.name.slice(0, 18)}`,
+        groupColor: "purple",
+      });
+      targetTabId = created.tabId;
+      createdScratchTabId = created.tabId;
+    }
+  }
+
+  task.lastRunAt = Date.now();
+  task.lastStatus = "running";
+  if (chrome.storage?.local?.set) {
+    await chrome.storage.local.set({ agScheduledTasks: tasks });
+  }
+  broadcastToSidePanels({ type: "sidepanel:schedulesUpdated", tasks });
+
+  try {
+    const res = await runSidePanelPrompt({
+      userText: task.prompt,
+      interactionMode: task.interactionMode || "chat",
+      permissionMode: "auto",
+      autoApprovePermissions: task.interactionMode !== "agent",
+      includeActiveTab: Boolean(targetTabId),
+      activeTabId: targetTabId,
+      scheduledTaskName: task.name,
+    });
+    task.lastSessionId = res.sessionId || null;
+    task.lastStatus = "completed";
+    if (createdScratchTabId && task.interactionMode === "chat") {
+      await rpcHandlers.closeTab({ tabId: createdScratchTabId }).catch(() => {});
+    }
+    if (chrome.storage?.local?.set) {
+      await chrome.storage.local.set({ agScheduledTasks: tasks });
+    }
+    broadcastToSidePanels({ type: "sidepanel:schedulesUpdated", tasks });
+    return { ok: true, sessionId: res.sessionId, task };
+  } catch (err) {
+    task.lastStatus = `error: ${err?.message || String(err)}`;
+    if (chrome.storage?.local?.set) {
+      await chrome.storage.local.set({ agScheduledTasks: tasks });
+    }
+    broadcastToSidePanels({ type: "sidepanel:schedulesUpdated", tasks });
+    throw err;
+  }
+}
+
 const rpcHandlers = {
   async ping() {
     const ident = await detectBrowserIdentity();
@@ -441,10 +1238,13 @@ const rpcHandlers = {
     const ident = await detectBrowserIdentity();
     return {
       extensionId: chrome.runtime.id,
-      version: chrome.runtime.getManifest?.()?.version || "2.0.0",
+      version: chrome.runtime.getManifest?.()?.version || "3.0.0",
       ...ident,
       attachedTabIds: Array.from(attachedTabs),
       capabilities: [
+        "sidePanel",
+        "acpChat",
+        "scheduledTasks",
         "cdp",
         "tabGroups",
         "claimTab",
@@ -562,6 +1362,7 @@ const rpcHandlers = {
       } catch {}
     }
     await persistSessionState();
+    buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return {
       ok: true,
       tabId: created.id,
@@ -725,7 +1526,6 @@ const rpcHandlers = {
       } catch {}
     }
     if (normStatus === "handoff") {
-      // Detach debugger on handoff so user interacts cleanly without debugger banner
       await detachDebuggerSafe(tid);
     }
     await persistSessionState();
@@ -771,6 +1571,7 @@ const rpcHandlers = {
       sessionMeta.delete(sessionId);
     }
     await persistSessionState();
+    buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return {
       ok: true,
       closedTabIds,
@@ -897,8 +1698,44 @@ const rpcHandlers = {
 
 async function handleNativeIncoming(msg) {
   if (!msg || typeof msg !== "object") return;
+
+  // 1. Response to an outbound `callNativeAgentRpc` request
+  if (msg.id !== undefined && msg.id !== null && !msg.method) {
+    const key = String(msg.id);
+    const pending = pendingNativeRpcs.get(key);
+    if (pending) {
+      pendingNativeRpcs.delete(key);
+      if (pending.timer) clearTimeout(pending.timer);
+      if (msg.error) {
+        const err = new Error(msg.error.message || JSON.stringify(msg.error));
+        err.code = msg.error.code;
+        pending.reject(err);
+      } else {
+        pending.resolve(msg.result);
+      }
+    }
+    return;
+  }
+
   const { id, method, params } = msg;
   if (!method) return;
+
+  // 2. Native Host -> Side Panel Streaming Events & Telemetry
+  if (method === "agentEvent") {
+    handleAgentStreamEvent(params || {});
+    return;
+  }
+  if (method === "desktopBridgeStatus") {
+    desktopBridgeInfo = {
+      desktopMcpClients: Number(params?.desktopMcpClients || 0),
+      lastMethod: params?.lastMethod || null,
+      ts: Number(params?.ts || Date.now()),
+    };
+    buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
+    return;
+  }
+
+  // 3. Incoming MCP Server -> Extension JSON-RPC request
   const handler = rpcHandlers[method];
   if (!handler) {
     if (id !== undefined) {
@@ -999,6 +1836,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     targetId: source.targetId ?? null,
     reason: reason || "unknown",
   });
+  buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
 });
 
 // Download Lifecycle Notifications
@@ -1037,6 +1875,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
     windowId: removeInfo.windowId,
     isWindowClosing: Boolean(removeInfo.isWindowClosing),
   });
+  broadcastToSidePanels({ type: "sidepanel:tabsChanged" });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -1054,10 +1893,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         status: tab.status || "",
       },
     });
+    broadcastToSidePanels({ type: "sidepanel:tabsChanged", tabId });
   }
 });
 
-// Offscreen Keepalive Port
+if (chrome.tabs?.onActivated?.addListener) {
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    broadcastToSidePanels({ type: "sidepanel:tabsChanged", tabId: activeInfo.tabId });
+  });
+}
+
+// Offscreen Keepalive & Side Panel Live Ports
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "ag-offscreen-keepalive") {
     port.onMessage.addListener(() => {
@@ -1065,10 +1911,17 @@ chrome.runtime.onConnect.addListener((port) => {
         connectNativeBridge();
       }
     });
+    return;
+  }
+  if (port.name === "ag-sidepanel") {
+    sidepanelPorts.add(port);
+    port.onDisconnect.addListener(() => {
+      sidepanelPorts.delete(port);
+    });
   }
 });
 
-// Popup & Internal Runtime Messages
+// Bridge & Side Panel Status Snapshot
 async function buildPopupStatus() {
   const ident = await detectBrowserIdentity();
   const activeGroupIds = new Set();
@@ -1093,17 +1946,21 @@ async function buildPopupStatus() {
     lastNativeError,
     ...ident,
     attachedTabCount: attachedTabs.size,
+    attachedTabIds: Array.from(attachedTabs),
     sessionGroups,
+    desktopBridgeInfo,
   };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return false;
-  if (msg.type === "popup:getStatus") {
+
+  // Legacy Popup & Bridge Status RPCs
+  if (msg.type === "popup:getStatus" || msg.type === "sidepanel:getBridgeStatus") {
     buildPopupStatus().then(sendResponse);
     return true;
   }
-  if (msg.type === "popup:reconnect") {
+  if (msg.type === "popup:reconnect" || msg.type === "sidepanel:reconnect") {
     (async () => {
       if (nativePort) {
         try {
@@ -1117,40 +1974,225 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;
   }
-  if (msg.type === "popup:finishAll") {
+  if (msg.type === "popup:finishAll" || msg.type === "sidepanel:finishAll") {
     (async () => {
       await rpcHandlers.finalizeSession({ sessionId: "*", closeScratchTabs: true, detachAll: true });
       sendResponse(await buildPopupStatus());
     })();
     return true;
   }
+
+  // Side Panel Bootstrap & Agent RPCs
+  if (msg.type === "sidepanel:init") {
+    (async () => {
+      await ensureLocalStateLoaded();
+      const [bridgeStatus, tabs, shortcuts, schedules, agentStatus] = await Promise.all([
+        buildPopupStatus(),
+        buildAllTabsSnapshot().catch(() => []),
+        getStoredShortcuts(),
+        getScheduledTasks(),
+        callNativeAgentRpc("agent.getStatus", { warm: true }, 15_000).catch((err) => ({
+          ok: false,
+          error: err?.message || String(err),
+        })),
+      ]);
+      sendResponse({
+        ok: true,
+        bridgeStatus,
+        tabs,
+        sessions: getChromeSessionsSummaryList(),
+        shortcuts,
+        schedules,
+        agentStatus,
+      });
+    })();
+    return true;
+  }
+
+  if (msg.type === "sidepanel:listTabs") {
+    buildAllTabsSnapshot()
+      .then((tabs) => sendResponse({ ok: true, tabs }))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:captureScreenshot") {
+    captureVisibleTabPng(msg.windowId)
+      .then((shot) => sendResponse({ ok: true, ...shot }))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:sendPrompt") {
+    runSidePanelPrompt(msg.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err), code: err?.code }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:cancelPrompt") {
+    callNativeAgentRpc("agent.cancel", { sessionId: msg.sessionId }, 8_000)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:respondPermission") {
+    callNativeAgentRpc(
+      "agent.respondPermission",
+      {
+        permRequestId: msg.permRequestId,
+        optionId: msg.optionId,
+      },
+      8_000,
+    )
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:loadSession") {
+    (async () => {
+      await ensureLocalStateLoaded();
+      const sid = String(msg.sessionId || "").trim();
+      if (!sid || !chromeSessions.has(sid)) {
+        sendResponse({
+          ok: false,
+          code: -32010,
+          error:
+            "Conversations created in the Antigravity Desktop App cannot be opened in Antigravity in Chrome. Start a chat here to view it in both Chrome and the Desktop App.",
+        });
+        return;
+      }
+      const localRec = chromeSessions.get(sid);
+      try {
+        const live = await callNativeAgentRpc("agent.loadSession", { sessionId: sid }, 18_000);
+        if (live?.ok && Array.isArray(live.messages) && live.messages.length > 0) {
+          const cleanedMessages = live.messages.map((m, idx) => ({
+            ...m,
+            text: m.role === "user" ? stripInjectedBrowserContext(m.text) : m.text,
+            attachments:
+              m.role === "user" && localRec?.messages?.[idx]?.attachments
+                ? localRec.messages[idx].attachments
+                : [],
+          }));
+          localRec.messages = cleanedMessages;
+          if (live.title) localRec.title = live.title;
+          schedulePersistChromeSessions();
+        }
+      } catch {}
+      sendResponse({
+        ok: true,
+        session: localRec,
+      });
+    })();
+    return true;
+  }
+
+  if (msg.type === "sidepanel:deleteSession") {
+    (async () => {
+      await ensureLocalStateLoaded();
+      chromeSessions.delete(String(msg.sessionId || ""));
+      await flushChromeSessionsNow();
+      sendResponse({ ok: true, sessions: getChromeSessionsSummaryList() });
+    })();
+    return true;
+  }
+
+  if (msg.type === "sidepanel:openInDesktopApp") {
+    callNativeAgentRpc("agent.openInDesktopApp", { sessionId: msg.sessionId || null }, 8_000)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:setConfig") {
+    callNativeAgentRpc("agent.setConfig", msg.payload || {}, 8_000)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:groupTabsNow") {
+    rpcHandlers
+      .groupTabs(msg.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  // Shortcuts & Scheduled Tasks RPCs
+  if (msg.type === "sidepanel:saveShortcut") {
+    saveCustomShortcut(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+  if (msg.type === "sidepanel:deleteShortcut") {
+    deleteCustomShortcut(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+  if (msg.type === "sidepanel:saveSchedule") {
+    saveScheduledTask(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+  if (msg.type === "sidepanel:deleteSchedule") {
+    deleteScheduledTask(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+  if (msg.type === "sidepanel:runScheduleNow") {
+    executeScheduledTask(msg.id)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
   return false;
 });
 
-// Watchdog Alarm & Startup Hooks
+// Watchdog & Scheduled Task Alarms
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm?.name) return;
   if (alarm.name === KEEPALIVE_ALARM) {
     ensureOffscreenKeepalive();
     if (!nativePort) {
       connectNativeBridge();
     }
+    return;
+  }
+  if (alarm.name.startsWith(SCHEDULE_ALARM_PREFIX)) {
+    const taskId = alarm.name.slice(SCHEDULE_ALARM_PREFIX.length);
+    executeScheduledTask(taskId).catch(() => {});
   }
 });
 
 chrome.runtime.onInstalled.addListener(() => {
+  configureSidePanelBehavior();
   ensureOffscreenKeepalive();
   connectNativeBridge();
+  syncScheduleAlarms().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  configureSidePanelBehavior();
   ensureOffscreenKeepalive();
   connectNativeBridge();
+  syncScheduleAlarms().catch(() => {});
 });
 
 // Immediate boot initialization
 (async () => {
+  await configureSidePanelBehavior();
   await restoreSessionState();
+  await ensureLocalStateLoaded();
   await ensureOffscreenKeepalive();
   await connectNativeBridge();
+  await syncScheduleAlarms().catch(() => {});
 })();

@@ -3817,35 +3817,40 @@ func handleRequest(_ req: [String: Any]) throws -> Any {
                     } else if action == "unhide_app" {
                         rApp.unhide()
                     } else {
-                        let axApp = AXUIElementCreateApplication(pid)
-                        var quitViaAX = false
-                        if let menuBarRef = axCopyAttr(axApp, kAXMenuBarAttribute as String) {
-                            let menuBar = menuBarRef as! AXUIElement
-                            if let barItems = axCopyAttr(menuBar, kAXChildrenAttribute as String) as? [AXUIElement] {
-                                for barItem in barItems.prefix(2) {
-                                    if let menus = axCopyAttr(barItem, kAXChildrenAttribute as String) as? [AXUIElement] {
-                                        for menu in menus {
-                                            if let items = axCopyAttr(menu, kAXChildrenAttribute as String) as? [AXUIElement] {
-                                                for item in items {
-                                                    let cmdChar = axString(item, "AXMenuItemCmdChar")?.uppercased()
-                                                    let title = (axString(item, kAXTitleAttribute as String) ?? "").lowercased()
-                                                    if cmdChar == "Q" || title == "quit" || title.hasPrefix("quit ") {
-                                                        if AXUIElementPerformAction(item, kAXPressAction as CFString) == .success {
-                                                            quitViaAX = true
-                                                            break
+                        var terminated = onMain { rApp.terminate() }
+                        if !terminated {
+                            let axApp = AXUIElementCreateApplication(pid)
+                            if let menuBarRef = axCopyAttr(axApp, kAXMenuBarAttribute as String) {
+                                let menuBar = menuBarRef as! AXUIElement
+                                if let barItems = axCopyAttr(menuBar, kAXChildrenAttribute as String) as? [AXUIElement] {
+                                    // Never inspect barItems[0] (the system Apple  menu, which contains "Lock Screen" ⌃⌘Q)
+                                    for barItem in barItems.dropFirst().prefix(1) {
+                                        let barSubrole = axString(barItem, kAXSubroleAttribute as String) ?? ""
+                                        let barTitle = (axString(barItem, kAXTitleAttribute as String) ?? "").lowercased()
+                                        if barSubrole == "AXAppleMenuItem" || barTitle == "apple" { continue }
+                                        if let menus = axCopyAttr(barItem, kAXChildrenAttribute as String) as? [AXUIElement] {
+                                            for menu in menus {
+                                                if let items = axCopyAttr(menu, kAXChildrenAttribute as String) as? [AXUIElement] {
+                                                    for item in items {
+                                                        let cmdChar = axString(item, "AXMenuItemCmdChar")?.uppercased()
+                                                        let cmdMods = (axCopyAttr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? 0
+                                                        let title = (axString(item, kAXTitleAttribute as String) ?? "").lowercased()
+                                                        if title.contains("lock") || title.contains("force quit") { continue }
+                                                        if title == "quit" || title.hasPrefix("quit ") || (cmdChar == "Q" && cmdMods == 0) {
+                                                            if AXUIElementPerformAction(item, kAXPressAction as CFString) == .success {
+                                                                terminated = true
+                                                                break
+                                                            }
                                                         }
                                                     }
                                                 }
+                                                if terminated { break }
                                             }
-                                            if quitViaAX { break }
                                         }
+                                        if terminated { break }
                                     }
-                                    if quitViaAX { break }
                                 }
                             }
-                        }
-                        if !quitViaAX {
-                            _ = rApp.terminate()
                         }
                         VirtualCursorManager.shared.removeCursors(forPid: pid)
                     }

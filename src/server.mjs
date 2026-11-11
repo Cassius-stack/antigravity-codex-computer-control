@@ -1727,7 +1727,7 @@ export function createComputerUseServer({
 
   const mcp = new MCPStdioServer({
     name: "computer-use",
-    version: "2.0.0",
+    version: "3.0.0",
     instructions: SERVER_INSTRUCTIONS,
     tools,
     input,

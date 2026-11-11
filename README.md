@@ -51,18 +51,26 @@ Open **Antigravity** on your MacBook and paste this directly into a chat:
 
 ---
 
-## 15-Second "Antigravity in Chrome / Brave" Unpacked Extension Setup
+## 15-Second "Antigravity in Chrome / Brave" Side Panel & Bridge Setup
 
-No `--remote-debugging-port` flags or browser restarts required! To give Antigravity live zero-flag background CDP + **Tab Groups** control in Brave, Chrome, Edge, Arc, Vivaldi, or Opera:
+No `--remote-debugging-port` flags or browser restarts required! To enable the docked **Antigravity Side Panel Chat Bar** (matching **Claude in Chrome** & **Codex / ChatGPT in Chrome**) plus live zero-flag background CDP + **Tab Groups** control in Brave, Chrome, Edge, Arc, Vivaldi, or Opera:
 
 1. Open `brave://extensions` (or `chrome://extensions` / `edge://extensions`) in your browser.
 2. Toggle **Developer mode** ON (top-right corner).
-3. Click **Load unpacked** and select the **`extension/`** folder inside this repository (`~/antigravity-codex-computer-control/extension`).
+3. Click **Load unpacked** (or **Reload `↻`** if upgrading) and select the **`extension/`** folder inside this repository (`~/antigravity-codex-computer-control/extension`).
+4. Click the **Antigravity** toolbar icon (or press **`Cmd + Shift + .`**) to open the **docked Side Panel Chat Bar** right beside any webpage!
 
-The **Antigravity in Chrome** popup (`cnipmpbdggdeocaigfifflifphanoiic`) immediately connects to `com.antigravity.browser_bridge` over Native Messaging:
-- **Zero premature banner**: `browser_list` and `get_state` never attach `chrome.debugger` until Antigravity actually inspects or acts on a tab.
-- **Color-coded Tab Groups**: Agent-opened tabs automatically group under **Antigravity** (`cyan` by default, customizable via `group_title` / `group_color` or `browser_manage`), while your personal tabs are claimed in-place and never moved or closed!
-- **One-Click Take Over & Detach**: Click **`[Antigravity · Take Over]`** in any active tab or **"Finish & Detach All"** in the toolbar popup to detach `chrome.debugger` immediately.
+### How the Two-Way Bridge Works (Claude in Chrome & Codex Parity)
+
+- **Docked Webpage Chat Bar (`sidepanel.html`)**:
+  - **Chat Mode (Reader — Zero Debugger Banner)**: Automatically reads the active tab's content, headings, and highlighted selection (plus multi-tab `@` mentions and `📷` screenshots) without attaching `chrome.debugger`.
+  - **Agent Mode (Browser Control)**: Lets Antigravity click, type, fill forms, upload/download files, and organize color-coded Tab Groups right inside your logged-in browser.
+  - **Slash Shortcuts (`/`) & Scheduled Tasks (`⏰`)**: Run built-in or custom saved `/shortcuts` (`/summarize`, `/extract-table`, `/audit-page`, `/organize-tabs`) and schedule recurring browser workflows via `chrome.alarms`.
+  - **Permission Modes (`Auto` / `Ask` / `Plan`) & Live Model Picker**: Choose your model and approve sensitive actions inline.
+- **Exact One-Way Session Sync + Two-Way Browser Control**:
+  - **Start in Chrome → View in Desktop App**: Conversations started inside the **Antigravity in Chrome Side Panel** run via `agy acp --app-data-dir antigravity`, so they **automatically appear inside your Antigravity Desktop App** where you can view or continue them anytime (click **`↗`** in the Side Panel header to jump straight to `Antigravity.app`).
+  - **Start in Desktop App → Control Browser Tabs**: Conversations started inside the **Antigravity Desktop App** control your live Brave/Chrome tabs seamlessly via the Native Messaging Unix socket bridge, and are intentionally **not** opened inside the Chrome Side Panel's chat list.
+- **One-Click Take Over & Detach**: Click **`[Antigravity · Take Over]`** in any active tab or **"Take Over"** in the Side Panel banner to detach `chrome.debugger` immediately.
 
 ---
 
@@ -176,12 +184,13 @@ computer-use-mcp/
 ├── package.json                     # Zero-dependency ESM package definition (Node >= 22)
 ├── bin/
 │   ├── mac-cua-helper               # Prebuilt Universal (arm64 + x86_64) native macOS helper
-│   └── antigravity-native-host.mjs  # Pure Node >= 22 Native Messaging <-> Unix socket multiplexer
-├── extension/                       # Unpacked "Antigravity in Chrome" MV3 browser extension
-│   ├── manifest.json                # MV3 manifest (deterministic ID cnipmpbdggdeocaigfifflifphanoiic)
-│   ├── background.js                # Native Messaging JSON-RPC 2.0, Tab Groups & lazy CDP router
+│   └── antigravity-native-host.mjs  # Dual Native Messaging <-> Unix socket mux + agy ACP Side Panel host
+├── extension/                       # Unpacked "Antigravity in Chrome" MV3 Side Panel + Bridge extension
+│   ├── manifest.json                # MV3 manifest (sidePanel + deterministic ID cnipmpbdggdeocaigfifflifphanoiic)
+│   ├── background.js                # Side Panel ACP controller, Scheduled Tasks, Tab Groups & lazy CDP router
+│   ├── sidepanel.html / .css / .js  # Docked Side Panel chat bar (Chat/Agent modes, @ tabs, / shortcuts, ⏰ tasks)
 │   ├── offscreen.html / offscreen.js# 20s service-worker keepalive heartbeat
-│   ├── popup.html / popup.css / .js # Live bridge status, Tab Group counter, Reconnect & Detach UI
+│   ├── popup.html / popup.css / .js # Status fallback view
 │   └── icons/                       # 16 / 32 / 48 / 128px extension icons
 ├── plugin/                          # First-class Antigravity Plugin bundle (antigravity-computer-use)
 │   ├── plugin.json                  # Antigravity plugin manifest

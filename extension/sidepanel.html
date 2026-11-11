@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Antigravity in Chrome</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <!-- Top Header -->
+      <header class="topbar">
+        <div class="brand-group">
+          <img class="brand-logo" src="icons/icon48.png" width="24" height="24" alt="Antigravity" />
+          <div class="brand-titles">
+            <div class="brand-row">
+              <span class="brand-name" id="header-title">Antigravity</span>
+              <button
+                type="button"
+                class="bridge-dot-btn"
+                id="bridge-status-btn"
+                title="Native Messaging Bridge status — click to reconnect"
+              >
+                <span class="status-dot" id="bridge-dot"></span>
+                <span id="bridge-label">Connecting…</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <button type="button" class="icon-btn" id="new-chat-btn" title="New Chat">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M10 4v12M4 10h12" stroke-linecap="round" />
+            </svg>
+          </button>
+          <button type="button" class="icon-btn" id="history-btn" title="Chrome Chat History">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7">
+              <circle cx="10" cy="10" r="6.8" />
+              <path d="M10 6.5v3.8l2.5 1.6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <button type="button" class="icon-btn" id="schedules-btn" title="Scheduled Browser Tasks">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7">
+              <rect x="3.2" y="4.5" width="13.6" height="12.3" rx="2.2" />
+              <path d="M6.8 2.8v3M13.2 2.8v3M3.2 8.2h13.6" stroke-linecap="round" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="icon-btn accent-link-btn"
+            id="open-desktop-btn"
+            title="View &amp; Continue in Antigravity Desktop App"
+          >
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M7 13L13.5 6.5M8.5 6.5h5v5" stroke-linecap="round" stroke-linejoin="round" />
+              <rect x="3.3" y="3.3" width="13.4" height="13.4" rx="2.8" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Live Desktop App / Debugger Activity Banner -->
+      <section class="desktop-activity-bar hidden" id="desktop-activity-bar">
+        <div class="activity-info">
+          <span class="pulse-dot"></span>
+          <span id="desktop-activity-text">Antigravity bridge active</span>
+        </div>
+        <button type="button" class="mini-btn danger-subtle" id="detach-all-btn" title="Detach debugger &amp; close scratch tabs">
+          Take Over
+        </button>
+      </section>
+
+      <!-- CLI / Bridge Onboarding Notice (shown only if agy CLI or bridge needs setup) -->
+      <section class="setup-banner hidden" id="setup-banner">
+        <div class="setup-title" id="setup-banner-title">Connect Antigravity CLI</div>
+        <p class="setup-desc" id="setup-banner-desc"></p>
+      </section>
+
+      <!-- Slide-Down Drawer: Chrome Chat History -->
+      <aside class="drawer hidden" id="history-drawer">
+        <div class="drawer-header">
+          <div>
+            <h3>Chrome Side Panel Chats</h3>
+            <p class="drawer-note">
+              Chats started here automatically sync to your Antigravity Desktop App. Desktop-started chats control tabs via MCP and stay in the Desktop App.
+            </p>
+          </div>
+          <button type="button" class="icon-btn" id="close-history-btn" title="Close">✕</button>
+        </div>
+        <div class="drawer-list" id="history-list"></div>
+      </aside>
+
+      <!-- Slide-Down Drawer: Scheduled Browser Tasks -->
+      <aside class="drawer hidden" id="schedules-drawer">
+        <div class="drawer-header">
+          <div>
+            <h3>Scheduled Browser Tasks</h3>
+            <p class="drawer-note">Automate recurring page checks or saved prompts while your browser is open.</p>
+          </div>
+          <button type="button" class="icon-btn" id="close-schedules-btn" title="Close">✕</button>
+        </div>
+        <form class="schedule-form" id="schedule-form">
+          <input type="text" id="sched-name" placeholder="Task name (e.g. Morning HN Digest)" required />
+          <input type="url" id="sched-url" placeholder="Optional target URL (https://...)" />
+          <textarea id="sched-prompt" rows="2" placeholder="Prompt or workflow instruction…" required></textarea>
+          <div class="schedule-form-row">
+            <select id="sched-interval" title="Run frequency">
+              <option value="15">Every 15 min</option>
+              <option value="60" selected>Every hour</option>
+              <option value="360">Every 6 hours</option>
+              <option value="1440">Daily (24h)</option>
+            </select>
+            <select id="sched-mode" title="Execution mode">
+              <option value="chat" selected>Chat (Read Page)</option>
+              <option value="agent">Agent (Browser Control)</option>
+            </select>
+            <button type="submit" class="primary-sm-btn">+ Schedule</button>
+          </div>
+        </form>
+        <div class="drawer-list" id="schedules-list"></div>
+      </aside>
+
+      <!-- Main Chat Timeline -->
+      <main class="chat-viewport" id="chat-viewport">
+        <!-- Empty / Welcome State -->
+        <div class="welcome-state" id="welcome-state">
+          <div class="welcome-hero">
+            <img src="icons/icon128.png" width="46" height="46" alt="Antigravity" class="welcome-logo" />
+            <h2>Antigravity in Chrome</h2>
+            <p>
+              Chat with your live webpage, compare open tabs with <code>@</code>, trigger workflows with <code>/</code>, or switch to <strong>Agent Mode</strong> to let Antigravity drive your browser.
+            </p>
+          </div>
+
+          <div class="quick-grid" id="quick-grid">
+            <button type="button" class="quick-card" data-shortcut="summarize">
+              <span class="quick-cmd">/summarize</span>
+              <span class="quick-label">Summarize this page &amp; key takeaways</span>
+            </button>
+            <button type="button" class="quick-card" data-shortcut="extract-table">
+              <span class="quick-cmd">/extract-table</span>
+              <span class="quick-label">Pull structured tables, prices, or specs</span>
+            </button>
+            <button type="button" class="quick-card" data-shortcut="audit-page">
+              <span class="quick-cmd">/audit-page</span>
+              <span class="quick-label">Inspect console errors &amp; UX issues</span>
+            </button>
+            <button type="button" class="quick-card" data-shortcut="organize-tabs">
+              <span class="quick-cmd">/organize-tabs</span>
+              <span class="quick-label">Group open tabs into color Tab Groups</span>
+            </button>
+          </div>
+
+          <div class="sync-hint-card">
+            <span>Synced two-way bridge:</span> Start chats here and view or continue them anytime inside the <strong>Antigravity Desktop App</strong>.
+          </div>
+        </div>
+
+        <!-- Dynamic Messages -->
+        <div class="messages-list" id="messages-list"></div>
+      </main>
+
+      <!-- Composer Area -->
+      <footer class="composer-dock">
+        <!-- Popover: / Slash Shortcuts & Save Shortcut -->
+        <div class="popover hidden" id="slash-popover">
+          <div class="popover-header">
+            <span>Slash Shortcuts &amp; Skills</span>
+            <button type="button" class="text-link-btn" id="open-save-shortcut-btn">+ Save Custom</button>
+          </div>
+          <div class="save-shortcut-box hidden" id="save-shortcut-box">
+            <input type="text" id="custom-sc-cmd" placeholder="Command name (e.g. weekly-brief)" />
+            <input type="text" id="custom-sc-title" placeholder="Short description" />
+            <textarea id="custom-sc-prompt" rows="2" placeholder="Reusable prompt template…"></textarea>
+            <div class="save-shortcut-actions">
+              <select id="custom-sc-mode">
+                <option value="chat">Chat Mode</option>
+                <option value="agent">Agent Mode</option>
+              </select>
+              <button type="button" class="primary-sm-btn" id="save-custom-sc-btn">Save /shortcut</button>
+            </div>
+          </div>
+          <div class="popover-list" id="slash-list"></div>
+        </div>
+
+        <!-- Popover: @ Open Tabs Picker -->
+        <div class="popover hidden" id="tabs-popover">
+          <div class="popover-header">
+            <span>Attach Open Tabs (<code>@</code>)</span>
+            <button type="button" class="text-link-btn" id="group-mentioned-btn" title="Group attached tabs in browser">
+              Group Attached
+            </button>
+          </div>
+          <div class="popover-list" id="tabs-picker-list"></div>
+        </div>
+
+        <!-- Active Tab & Attachments Context Bar -->
+        <div class="context-bar">
+          <label class="active-tab-pill" id="active-tab-pill" title="Include active tab content in your prompt">
+            <input type="checkbox" id="include-active-tab" checked />
+            <span class="tab-pill-title" id="active-tab-title">Current Tab</span>
+          </label>
+
+          <div class="context-tools">
+            <button type="button" class="chip-btn" id="mention-tabs-btn" title="Attach additional open tabs (@)">
+              @ Tabs
+            </button>
+            <button type="button" class="chip-btn" id="screenshot-btn" title="Attach visible tab screenshot">
+              📷
+            </button>
+            <button type="button" class="chip-btn" id="slash-btn" title="Browse / shortcuts &amp; skills">
+              /
+            </button>
+          </div>
+        </div>
+
+        <!-- Attached @-Tabs & Screenshot Chips -->
+        <div class="attachment-chips hidden" id="attachment-chips"></div>
+
+        <!-- Prompt Input Box -->
+        <div class="input-frame">
+          <textarea
+            id="prompt-input"
+            rows="2"
+            placeholder="Ask about this page, type / for shortcuts, @ for tabs…"
+          ></textarea>
+
+          <div class="composer-controls">
+            <div class="left-controls">
+              <!-- Chat vs Agent Mode Switch -->
+              <div class="mode-segmented" role="group" aria-label="Interaction mode">
+                <button
+                  type="button"
+                  class="seg-btn active"
+                  id="mode-chat-btn"
+                  data-mode="chat"
+                  title="Chat Mode: Read &amp; analyze pages without debugger banner"
+                >
+                  Chat
+                </button>
+                <button
+                  type="button"
+                  class="seg-btn"
+                  id="mode-agent-btn"
+                  data-mode="agent"
+                  title="Agent Mode: Click, type, navigate &amp; manage Tab Groups"
+                >
+                  Agent
+                </button>
+              </div>
+
+              <!-- Permission Policy Selector -->
+              <select id="permission-select" class="compact-select" title="Permission mode">
+                <option value="auto" selected>Auto</option>
+                <option value="default">Ask</option>
+                <option value="plan">Plan</option>
+              </select>
+
+              <!-- Model Selector -->
+              <select id="model-select" class="compact-select model-select" title="Antigravity Model">
+                <option value="gemini-4-carbon-medium">Gemini 4 Carbon</option>
+              </select>
+            </div>
+
+            <div class="right-controls">
+              <button type="button" class="send-btn" id="send-btn" title="Send (Enter)">
+                <svg id="send-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1">
+                  <path d="M10 15V5M5.5 9.5L10 5l4.5 4.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <svg id="stop-icon" class="hidden" viewBox="0 0 20 20" width="14" height="14" fill="currentColor">
+                  <rect x="5" y="5" width="10" height="10" rx="2" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </div>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>

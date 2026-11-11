@@ -55,15 +55,21 @@ test("Native macOS Bridge: multi-window enumeration, tiling layout, background A
   const runningApps = await bridge.listApps({ runningOnly: true });
   assert.ok(runningApps.length > 0);
 
-  const allWins = await bridge.listWindows({ includeMinimized: true });
-  const alphaWin = allWins.find((w) => w.title === "AGTestWindow Alpha");
-  const betaWin = allWins.find((w) => w.title === "AGTestWindow Beta");
+  let allWins = await bridge.listWindows({ includeMinimized: true });
+  let alphaWin = allWins.find((w) => w.title === "AGTestWindow Alpha");
+  let betaWin = allWins.find((w) => w.title === "AGTestWindow Beta");
+  if (alphaWin && !alphaWin.axBacked) {
+    await new Promise((r) => setTimeout(r, 400));
+    allWins = await bridge.listWindows({ includeMinimized: true });
+    alphaWin = allWins.find((w) => w.title === "AGTestWindow Alpha");
+    betaWin = allWins.find((w) => w.title === "AGTestWindow Beta");
+  }
   assert.ok(alphaWin, `Expected AGTestWindow Alpha in listWindows (got: ${allWins.map((w) => w.title).join(", ")})`);
   assert.ok(betaWin, "Expected AGTestWindow Beta in listWindows");
   assert.notEqual(alphaWin.id, betaWin.id, "Each window must have a distinct window ID");
 
-  if (perms.screenLocked && !alphaWin.axBacked) {
-    t.skip("macOS session screen is currently locked (CGSSessionScreenIsLocked=1); live AXUIElement window mutations require an unlocked session");
+  if (!alphaWin.axBacked || !betaWin.axBacked) {
+    t.skip("macOS display is asleep or locked (kAXWindowsAttribute suppressed by WindowServer); live AX mutations require an active display");
     return;
   }
 

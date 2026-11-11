@@ -9,8 +9,9 @@ Control the user's live Chromium browser (Brave, Chrome, Edge, Arc, Vivaldi, Ope
 
 ## Browser Discovery & Modes (`browser_list`)
 
-1. **`extension_cdp` (Preferred — "Antigravity in Chrome" unpacked extension)**:
+1. **`extension_cdp` (Preferred — "Antigravity in Chrome" unpacked Side Panel extension)**:
    - Full background CDP control over the user's live browser profile, cookies, and sessions.
+   - **Docked Side Panel + Two-Way Bridge**: Clicking the **Antigravity in Chrome** toolbar icon (`Cmd+Shift+.`) opens a docked Chrome Side Panel Chat Bar alongside any webpage (powered by `agy acp --app-data-dir antigravity`). Chats started in the Chrome Side Panel sync directly into the **Antigravity Desktop App**, while Desktop App chats drive live browser tabs via this MCP bridge without cluttering Chrome's Side Panel chat list.
    - **Lazy debugger attach**: `browser_list` and `get_state` never trigger Chrome/Brave's debugging banner. A tab is attached only when inspected (`browser_tab_state`) or acted on (`browser_tab_action`).
    - If `browser_list` shows a `setupHint` on Brave/Chrome (`controlMode: "apple_events"`), tell the user the 15-second one-time step: open `brave://extensions` or `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select the `extension/` folder shown in `setupHint`.
 2. **`cdp` / `iab` (Raw CDP & Managed Background Chromium)**:
