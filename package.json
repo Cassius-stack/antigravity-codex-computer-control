@@ -1,0 +1,25 @@
+{
+  "name": "antigravity-codex-computer-control",
+  "version": "1.0.0",
+  "description": "Self-contained macOS Multi-Window App & Multi-Browser Computer-Use MCP Server for Antigravity (1:1 Codex CUA, Sky, & Fluid Cursor Parity)",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "type": "module",
+  "main": "src/server.mjs",
+  "bin": {
+    "antigravity-computer-use-mcp": "src/server.mjs"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "setup": "node scripts/setup-antigravity.mjs",
+    "check": "node scripts/setup-antigravity.mjs --check",
+    "uninstall-mcp": "node scripts/setup-antigravity.mjs --uninstall",
+    "start": "node src/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+*.dSYM/
+
+# Runtime & temporary data
+node_modules/
+.browser-profiles/
+*.log
+*.backup*
+.env
+.env.*
