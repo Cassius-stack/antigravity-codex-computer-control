@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Antigravity in Chrome",
+  "version": "2.0.0",
+  "description": "Zero-flag live browser bridge, color-coded Tab Groups, file transfers, and multi-tab control for Antigravity Computer Control.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAujQ0qI6nTtNuaXTAnwCVtoLuwwiL92EgeiVGl2YunJI3trBq4eXI1JUM3MiSAHxzXoQKrVR02yOup1OYXnannjSPWW/HB5q05W2KQdB9fMlTJ/xuVvB8PRx+eKuIGxkWzFDnHqyhGVnbYCsZ0DiPb4zOeGm0/T20+UZN1Bvno4Vp2Nd+tbMwdMSgCUquBYSJl4Rj0zQ1Sl97vZ69fPXgxOfTHxU7FEkkqWPiGf7BUZRLAvEk0F+8WqBrRwE+Q0RLQSn3V/yqYF2UiEbhXwb0PS8I/UWJaW1YXyqa7NTAlJ8GkyQxMwrsnCSAQNeRPTq1M3vWKaBmqF6pOyZCGCPC4QIDAQAB",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Antigravity in Chrome",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "downloads",
+    "cookies",
+    "storage",
+    "history",
+    "bookmarks",
+    "webNavigation",
+    "scripting",
+    "nativeMessaging",
+    "alarms",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

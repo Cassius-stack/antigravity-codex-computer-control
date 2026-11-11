@@ -84,5 +84,5 @@ else
   exit 1
 fi
 
-# Register into ~/.gemini/config/mcp_config.json and verify all 16 MCP tools
+# Register MCP server, NativeMessagingHosts, and Antigravity plugin bundle, and verify all 17 MCP tools
 "$NODE_BIN" "$ROOT_DIR/scripts/setup-antigravity.mjs" "$@"

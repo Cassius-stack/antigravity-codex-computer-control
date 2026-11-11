@@ -720,7 +720,7 @@ export class CUAReplRuntime {
       click: (target, opts) => ctrl.click(target, opts),
       hover: (target, opts) => ctrl.hover(target, opts),
       moveCursor: (target, opts) =>
-        ctrl.hover(target, { ...opts, dispatchMoveEvent: false, badge: opts?.badge ?? "Move" }),
+        ctrl.hover(target, { ...opts, dispatchMoveEvent: false }),
       highlight: (target, opts) => ctrl.highlight(target, opts),
       hideCursor: () => ctrl.hideCursor(),
       getCursorState: () => ctrl.getCursorState(),
@@ -739,10 +739,33 @@ export class CUAReplRuntime {
       close: () => ctrl.close(),
       evaluate: (expr) => ctrl.evaluate(expr),
       locator: (sel) => ctrl.locator(sel),
-      uploadFiles: (target, files) => ctrl.uploadFiles(target, files),
+      frameLocator: (sel) => ctrl.frameLocator(sel),
+      uploadFiles: (target, files, opts) => ctrl.uploadFiles(target, files, opts),
       waitFor: (selOrMs, timeout) => ctrl.waitFor(selOrMs, timeout),
-      markDeliverable: async () => {},
-      markHandoff: async () => {},
+      waitForDownload: (opts) => ctrl.waitForDownload(opts),
+      downloads: (opts) => ctrl.listDownloads(opts),
+      listDownloads: (opts) => ctrl.listDownloads(opts),
+      getDialog: () => ctrl.getDialog(),
+      handleDialog: (opts) => ctrl.handleDialog(opts),
+      logs: (opts) => ctrl.getConsoleLogs(opts),
+      getConsoleLogs: (opts) => ctrl.getConsoleLogs(opts),
+      network: (opts) => ctrl.getNetworkRequests(opts),
+      getNetworkRequests: (opts) => ctrl.getNetworkRequests(opts),
+      networkBody: (reqId) => ctrl.getNetworkBody(reqId),
+      getNetworkBody: (reqId) => ctrl.getNetworkBody(reqId),
+      cookies: (opts) => ctrl.getCookies(opts),
+      getCookies: (opts) => ctrl.getCookies(opts),
+      setCookies: (cookies) => ctrl.setCookies(cookies),
+      clearCookies: (opts) => ctrl.clearCookies(opts),
+      storage: (opts) => ctrl.getStorage(opts),
+      getStorage: (opts) => ctrl.getStorage(opts),
+      setStorage: (opts) => ctrl.setStorage(opts),
+      claimInPlace: (sessionId) => ctrl.claimInPlace?.(sessionId),
+      markTab: (status, opts) => ctrl.markTab?.(status, opts),
+      markDeliverable: (opts) => ctrl.markDeliverable?.(opts),
+      markHandoff: (opts) => ctrl.markHandoff?.(opts),
+      markScratch: (opts) => ctrl.markScratch?.(opts),
+      detach: () => ctrl.detach?.(),
     };
   }
 
@@ -967,23 +990,83 @@ export class CUAReplRuntime {
         const browsers = await self.browserManager.listBrowsersWithTabs();
         let chosen = browsers[0];
         if (options.id) {
+          const q = String(options.id).toLowerCase();
           chosen =
-            browsers.find((b) => b.id.toLowerCase() === String(options.id).toLowerCase()) ??
-            browsers[0];
+            browsers.find(
+              (b) =>
+                b.id.toLowerCase() === q ||
+                String(b.brand || "").toLowerCase() === q ||
+                b.name.toLowerCase().includes(q),
+            ) ?? browsers[0];
         }
         const browserId = chosen?.id ?? "iab";
         return {
           browserId,
           async documentation() {
-            return "Use cua.createBrowserTab(browserId, url, { visible }) or cua.getTab(tabId, { browser: browserId }).";
+            return "Use cua.createBrowserTab(browserId, url, { groupTitle, groupColor, visible }), cua.getTab(tabId), browser.nameSession(name), browser.groupTabs(tabIds, opts), or browser.finalize().";
           },
           tabs: {
             list: () => self.browserManager.listTabs({ browser: browserId }),
             get: async (id) => self.wrapTabHandle(await self.browserManager.getTab(id, { browser: browserId })),
-            new: async (url) => self.wrapTabHandle(await self.browserManager.createTab(browserId, url)),
+            new: async (url, opts = {}) =>
+              self.wrapTabHandle(await self.browserManager.createTab(browserId, url, opts)),
           },
+          status: () => self.browserManager.manage("status", { browserId }),
+          nameSession: (name, opts = {}) =>
+            self.browserManager.manage("name_session", {
+              browserId,
+              ...(typeof name === "object" && name !== null ? name : { name, ...opts }),
+            }),
+          groupTabs: (tabIds, opts = {}) =>
+            self.browserManager.manage("group_tabs", {
+              browserId,
+              ...(Array.isArray(tabIds)
+                ? { tabIds, ...opts }
+                : tabIds && typeof tabIds === "object"
+                  ? tabIds
+                  : { tabIds: [tabIds], ...opts }),
+            }),
+          createTabGroup: (tabIds, opts = {}) =>
+            self.browserManager.manage("create_tab_group", {
+              browserId,
+              ...(Array.isArray(tabIds)
+                ? { tabIds, ...opts }
+                : tabIds && typeof tabIds === "object"
+                  ? tabIds
+                  : { tabIds: [tabIds], ...opts }),
+            }),
+          ungroupTabs: (tabIds) =>
+            self.browserManager.manage("ungroup_tabs", { browserId, tabIds }),
+          listTabGroups: (opts = {}) =>
+            self.browserManager.manage("list_tab_groups", { browserId, ...opts }),
+          updateTabGroup: (groupId, opts = {}) =>
+            self.browserManager.manage("update_tab_group", { browserId, groupId, ...opts }),
+          claimTab: (tabId, opts = {}) =>
+            self.browserManager.manage("claim_tab", { browserId, tabId, ...opts }),
+          markTab: (tabId, status = "deliverable", opts = {}) =>
+            self.browserManager.manage("mark_tab", { browserId, tabId, status, ...opts }),
+          finalize: (opts = {}) =>
+            self.browserManager.manage("finalize_session", { browserId, ...opts }),
+          finalizeSession: (opts = {}) =>
+            self.browserManager.manage("finalize_session", { browserId, ...opts }),
+          history: (query = "", opts = {}) =>
+            self.browserManager.manage("search_history", {
+              browserId,
+              ...(typeof query === "object" && query !== null ? query : { query, ...opts }),
+            }),
+          bookmarks: (query, opts = {}) =>
+            self.browserManager.manage("list_bookmarks", {
+              browserId,
+              ...(typeof query === "object" && query !== null
+                ? query
+                : { ...(query !== undefined ? { query } : {}), ...opts }),
+            }),
+          createBookmark: (opts = {}) =>
+            self.browserManager.manage("create_bookmark", { browserId, ...opts }),
         };
       },
+
+      browserManage: (action, params = {}) => self.browserManager.manage(action, params),
 
       async createBrowserTab(browserId, url = "about:blank", options = {}) {
         const ctrl = await self.browserManager.createTab(browserId, url, options);
@@ -1187,6 +1270,8 @@ export class CUAReplRuntime {
         list: () => self.browserManager.listBrowsersWithTabs(),
         get: (id) => cua.getBrowser({ id }),
         getDefault: () => cua.getBrowser({}),
+        manage: (action, params = {}) => self.browserManager.manage(action, params),
+        finalize: (params = {}) => self.browserManager.manage("finalize_session", params),
       },
     };
 

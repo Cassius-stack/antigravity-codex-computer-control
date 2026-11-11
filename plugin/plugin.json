@@ -1,0 +1,13 @@
+{
+  "name": "antigravity-computer-use",
+  "displayName": "Antigravity Computer Control",
+  "version": "2.0.0",
+  "description": "Codex-parity macOS desktop, multi-window, and live Chromium/Safari browser control via the computer-use MCP server and Antigravity in Chrome extension.",
+  "logo": "assets/logo.png",
+  "repository": "https://github.com/Cassius-stack/antigravity-codex-computer-control",
+  "suggestedPrompts": [
+    "Open Calculator and Notes, tile them side by side with manage_windows, and watch the virtual cursor compute 37 × 24",
+    "List my open browser tabs, group research tabs into a color-coded Tab Group, and summarize the top results",
+    "Open Hacker News in an Antigravity Tab Group, inspect console/network activity, and clean up scratch tabs when done"
+  ]
+}

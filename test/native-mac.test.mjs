@@ -62,6 +62,11 @@ test("Native macOS Bridge: multi-window enumeration, tiling layout, background A
   assert.ok(betaWin, "Expected AGTestWindow Beta in listWindows");
   assert.notEqual(alphaWin.id, betaWin.id, "Each window must have a distinct window ID");
 
+  if (perms.screenLocked && !alphaWin.axBacked) {
+    t.skip("macOS session screen is currently locked (CGSSessionScreenIsLocked=1); live AXUIElement window mutations require an unlocked session");
+    return;
+  }
+
   // 4. Multi-window layout in one call: tile_left_right across Alpha & Beta
   const layoutRes = await bridge.manageWindows({
     layout: "tile_left_right",

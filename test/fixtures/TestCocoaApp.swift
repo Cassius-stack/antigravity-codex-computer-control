@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         winAlpha.title = "AGTestWindow Alpha"
         winAlpha.isReleasedWhenClosed = false
+        winAlpha.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let alphaContent = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 240))
         counterLabel = NSTextField(labelWithString: "Counter: 0")
@@ -82,6 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         winBeta.title = "AGTestWindow Beta"
         winBeta.isReleasedWhenClosed = false
+        winBeta.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let betaContent = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 240))
         betaStatusLabel = NSTextField(labelWithString: "Beta: Ready")

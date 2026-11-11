@@ -7,26 +7,29 @@ import { BrowserManager } from "./cdp-client.mjs";
 import { CUAReplRuntime } from "./cua-repl.mjs";
 import { MCPStdioServer } from "./protocol.mjs";
 
-const SERVER_INSTRUCTIONS = `Unified Computer Use & Multi-Window/Multi-Browser MCP Server (Codex + Sky Parity).
+const SERVER_INSTRUCTIONS = `Unified Computer Use & Multi-Window/Multi-Browser MCP Server (Codex + Antigravity Extension Parity).
 
 Core Capabilities & Best Practices:
 1. Non-Intrusive Background Control:
    - Prefer element_index actions (from get_window_state / browser_tab_state) over raw (x, y) coordinates.
    - Element-indexed AX actions on macOS windows and CDP actions on browser tabs operate in the background without stealing the user's mouse cursor or focus.
    - Native paste automatically snapshots and restores the user's macOS clipboard (supports "text", "md", and "html"); browser paste dispatches ClipboardEvent directly in the tab without touching the OS clipboard.
-2. Multi-Window & Multi-Tab One-Click Control:
+2. Extension-First Browser Control & Tab Groups:
+   - Live Chromium browsers (Brave, Chrome, Edge, Arc, Vivaldi, Opera) with the "Antigravity in Chrome" unpacked extension are controlled natively via Extension CDP without requiring --remote-debugging-port.
+   - Agent-created tabs open in a dedicated color-coded Chrome Tab Group (default "Antigravity" in cyan; customize via group_title / group_color in browser_open_tab or browser_manage).
+   - User tabs inspected or acted on are claimed in-place (never pulled into the agent group and never closed on finalize_session). Call browser_manage action="finalize_session" when done to close scratch tabs and detach debuggers cleanly.
+   - If CAPTCHA / anti-bot protection appears ([HANDOFF REQUIRED: ...]), NEVER attempt to solve it — call browser_manage action="mark_tab" status="handoff" and ask the user.
+3. Multi-Window & Multi-Tab One-Click Control:
    - Use manage_windows to tile, grid, quadrant-snap, cascade, move, resize, minimize, raise, or close multiple macOS windows in a single call.
-   - Use browser_open_tab with urls: [...] to open multiple background tabs simultaneously.
-   - Use batch_execute to control multiple macOS app windows AND multiple browser tabs in parallel in one single tool call.
-3. Codex cua_repl JavaScript Mode (js / js_reset):
-   - Persistent async JavaScript VM exposing Codex's exact cua, sky, agent, and nodeRepl globals.
-   - Top-level let/const/function bindings persist across calls; use Promise.all([...]) to drive many apps and tabs concurrently.
-4. Smart Accessibility Diffing:
+   - Use browser_open_tab with urls: [...] to open multiple grouped background tabs simultaneously.
+   - Use batch_execute or js (cua_repl) to control multiple macOS app windows AND multiple browser tabs in parallel in one single tool call.
+4. Smart Accessibility Diffing & Rich DevTools Inspection:
    - Repeated get_window_state / browser_tab_state calls return compact line diffs so context stays clean. Pass disable_diff: true whenever you want the full tree.
-5. Live 1:1 Codex Virtual Cursor & Unified Coordinates:
-   - Every macOS window and browser tab displays a smooth 120Hz click-through Codex AgentCursor (240Hz Velocity-Verlet Scoot & 20-candidate curved Bezier glide, FogCursorStyle sky-blue mist, click ripples, drag trail, element highlight frame, and optional action pill badge when 'badge' is specified).
+   - browser_tab_action supports Two-Tier upload_files (including DataTransfer fallback & file-chooser interception), wait_for_download / list_downloads, non-blocking JS dialogs (get_dialog / handle_dialog), console logs, network requests/bodies, cookies, and localStorage/sessionStorage.
+5. Daintier Pill-Free 1:1 Virtual Cursor & Unified Coordinates:
+   - Every macOS window and browser tab displays a sleek 0.72x-scale click-through Codex AgentCursor (240Hz Velocity-Verlet Scoot & curved Bezier glide, FogCursorStyle sky-blue mist, daintier click ripples, drag trail, and element highlight frame — zero badge pill clutter).
    - AX element @(x,y WxH) bounds, isolated window screenshots, and window_action (x, y) share a unified 1:1 window-relative point space.
-   - Screenshots omit the cursor overlay by default; pass include_cursor: true to composite the live cursor, or call cursor_control to inspect, move, highlight, hide, or configure cursors.`;
+   - Screenshots omit the cursor and active-tab Take Over indicator by default; pass include_cursor: true to composite the live cursor.`;
 
 export function createComputerUseServer({
   input = process.stdin,
@@ -34,11 +37,13 @@ export function createComputerUseServer({
   macBridge: customMacBridge = null,
   browserManager: customBrowserManager = null,
   jxaRunner = null,
+  extensionSockDir = null,
 } = {}) {
   const diffTracker = new AXDiffTracker();
   const macBridge = customMacBridge ?? new MacBridge({ diffTracker });
   const browserManager =
-    customBrowserManager ?? new BrowserManager({ diffTracker, macBridge, jxaRunner });
+    customBrowserManager ??
+    new BrowserManager({ diffTracker, macBridge, jxaRunner, extensionSockDir });
   browserManager.setMacBridge?.(macBridge);
   const repl = new CUAReplRuntime({ macBridge, browserManager, diffTracker });
 
@@ -266,13 +271,17 @@ export function createComputerUseServer({
 
   async function resolveTabFromArgs(args = {}) {
     const tabId = args.tab_id ?? args.tabId;
-    const tabUrl = args.tab_url ?? args.tabUrl ?? (args.action !== "goto" ? args.url : undefined);
+    const act = String(args.action ?? "").trim().toLowerCase();
+    const urlIsActionParam =
+      act === "goto" || act === "wait_for_download" || act === "get_cookies" || act === "clear_cookies";
+    const tabUrl = args.tab_url ?? args.tabUrl ?? (!urlIsActionParam ? args.url : undefined);
     const browser = args.browser_id ?? args.browserId;
-    if (tabId) {
-      return browserManager.getTab(String(tabId), { browser });
+    const sessionId = args.session_id ?? args.sessionId;
+    if (tabId != null && String(tabId).trim() !== "") {
+      return browserManager.getTab(String(tabId), { browser, sessionId });
     }
     if (tabUrl) {
-      return browserManager.getTab({ url: String(tabUrl) }, { browser });
+      return browserManager.getTab({ url: String(tabUrl) }, { browser, sessionId });
     }
     throw new TypeError("Specify 'tab_id' (e.g. 'tab-1') or 'tab_url' to identify the target browser tab");
   }
@@ -294,10 +303,25 @@ export function createComputerUseServer({
     const returnState = args.return_state ?? args.returnState ?? true;
     const includeScreenshot = Boolean(args.include_screenshot ?? args.includeScreenshot);
     const includeCursor = Boolean(args.include_cursor ?? args.includeCursor);
+    const groupTitle = args.group_title ?? args.groupTitle;
+    const groupColor = args.group_color ?? args.groupColor;
+    const sessionId = args.session_id ?? args.sessionId;
+    const windowId = args.window_id ?? args.windowId;
 
-    const tabs = await Promise.all(
-      urls.map((u) => browserManager.createTab(browserId, u, visible !== undefined ? { visible: Boolean(visible) } : {})),
-    );
+    const createOpts = {
+      ...(visible !== undefined ? { visible: Boolean(visible) } : {}),
+      ...(args.active !== undefined ? { active: Boolean(args.active) } : {}),
+      ...(windowId != null ? { windowId: Number(windowId) } : {}),
+      ...(sessionId ? { sessionId: String(sessionId) } : {}),
+      ...(groupTitle !== undefined ? { groupTitle: String(groupTitle) } : {}),
+      ...(groupColor !== undefined ? { groupColor: String(groupColor) } : {}),
+      ...(args.ungroup !== undefined ? { ungroup: Boolean(args.ungroup) } : {}),
+    };
+
+    const tabs = [];
+    for (const u of urls) {
+      tabs.push(await browserManager.createTab(browserId, u, createOpts));
+    }
 
     const content = [];
     for (const ctrl of tabs) {
@@ -378,6 +402,7 @@ export function createComputerUseServer({
     };
 
     let actionSummary = `Executed '${action}' on ${ctrl.id}`;
+    let defaultReturnState = true;
 
     switch (action) {
       case "click": {
@@ -552,12 +577,159 @@ export function createComputerUseServer({
       }
 
       case "upload_files": {
-        const target = elIdx ?? selector;
-        if (target == null) throw new TypeError("upload_files requires 'element_index' or 'selector'");
+        const trigEl = args.trigger_element_index ?? args.triggerElementIndex;
+        const trigSel = args.trigger_selector ?? args.triggerSelector;
+        const triggerTarget =
+          trigEl != null ? Number(trigEl) : trigSel != null ? String(trigSel) : null;
+        const target = elIdx ?? selector ?? null;
+        if (target == null && triggerTarget == null) {
+          throw new TypeError(
+            "upload_files requires 'element_index'/'selector' or 'trigger_element_index'/'trigger_selector'",
+          );
+        }
         if (!Array.isArray(args.files) || args.files.length === 0) {
           throw new TypeError("upload_files requires a non-empty 'files' array");
         }
-        await ctrl.uploadFiles(target, args.files);
+        const upRes = await ctrl.uploadFiles(target, args.files, {
+          triggerTarget,
+          showCursor,
+          preferDataTransfer: Boolean(args.prefer_data_transfer ?? args.preferDataTransfer),
+          timeoutMs: args.timeout_ms ?? args.timeoutMs,
+        });
+        actionSummary = `Uploaded ${upRes?.count ?? args.files.length} file(s) on ${ctrl.id}${upRes?.tier ? ` (${upRes.tier})` : ""}`;
+        break;
+      }
+
+      case "wait_for_download": {
+        const clickEl = args.click_element_index ?? args.clickElementIndex ?? elIdx;
+        const clickSel = args.click_selector ?? args.clickSelector ?? selector;
+        const clickTarget =
+          clickEl != null
+            ? Number(clickEl)
+            : clickSel != null
+              ? String(clickSel)
+              : args.x != null && args.y != null
+                ? [Number(args.x), Number(args.y)]
+                : null;
+        const dlRes = await ctrl.waitForDownload({
+          clickTarget,
+          url: args.url ?? null,
+          timeoutMs: Number(args.timeout_ms ?? args.timeoutMs ?? 30000),
+          showCursor,
+        });
+        actionSummary = `Download complete on ${ctrl.id}: ${JSON.stringify(dlRes.download)}`;
+        break;
+      }
+
+      case "list_downloads": {
+        const downloads = await ctrl.listDownloads({ limit: args.limit ?? 30 });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify({ downloads }, null, 2);
+        break;
+      }
+
+      case "get_dialog": {
+        const dlg = ctrl.getDialog();
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(dlg, null, 2);
+        break;
+      }
+
+      case "handle_dialog": {
+        const dlgRes = await ctrl.handleDialog({
+          accept: args.accept ?? true,
+          promptText: args.prompt_text ?? args.promptText,
+        });
+        actionSummary = `Handled JS dialog on ${ctrl.id}: ${JSON.stringify(dlgRes)}`;
+        break;
+      }
+
+      case "get_console_logs": {
+        const logs = ctrl.getConsoleLogs({
+          level: args.level ?? null,
+          clear: Boolean(args.clear),
+          limit: args.limit ?? 200,
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(logs, null, 2);
+        break;
+      }
+
+      case "get_network_requests": {
+        const net = ctrl.getNetworkRequests({
+          urlFilter: args.url_filter ?? args.urlFilter ?? null,
+          method: args.method ?? null,
+          status: args.status ?? null,
+          clear: Boolean(args.clear),
+          limit: args.limit ?? 200,
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(net, null, 2);
+        break;
+      }
+
+      case "get_network_body": {
+        const reqId = args.request_id ?? args.requestId;
+        if (!reqId) throw new TypeError("get_network_body requires 'request_id'");
+        const bodyRes = await ctrl.getNetworkBody(String(reqId));
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(bodyRes, null, 2);
+        break;
+      }
+
+      case "get_cookies": {
+        const cookieUrls = args.urls ?? (args.url ? [String(args.url)] : null);
+        const ck = await ctrl.getCookies({
+          urls: cookieUrls,
+          domain: args.domain ?? null,
+          name: args.name ?? null,
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(ck, null, 2);
+        break;
+      }
+
+      case "set_cookies": {
+        if (!args.cookies) throw new TypeError("set_cookies requires 'cookies'");
+        const setRes = await ctrl.setCookies(args.cookies);
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(setRes, null, 2);
+        break;
+      }
+
+      case "clear_cookies": {
+        const clrRes = await ctrl.clearCookies({
+          url: args.url ?? null,
+          domain: args.domain ?? null,
+          name: args.name ?? null,
+          allBrowser: Boolean(args.all_browser ?? args.allBrowser),
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(clrRes, null, 2);
+        break;
+      }
+
+      case "get_storage": {
+        const stType = args.storage_type ?? args.storageType ?? args.type ?? "local";
+        const stRes = await ctrl.getStorage({
+          type: stType,
+          key: args.key ?? null,
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(stRes, null, 2);
+        break;
+      }
+
+      case "set_storage": {
+        const stType = args.storage_type ?? args.storageType ?? args.type ?? "local";
+        const stRes = await ctrl.setStorage({
+          type: stType,
+          entries: args.entries ?? {},
+          clear: Boolean(args.clear),
+          removeKeys: args.remove_keys ?? args.removeKeys ?? [],
+        });
+        defaultReturnState = false;
+        actionSummary = JSON.stringify(stRes, null, 2);
         break;
       }
 
@@ -569,12 +741,12 @@ export function createComputerUseServer({
 
       default:
         throw new TypeError(
-          `Unsupported browser_tab_action '${action}'. Supported: click, hover, move, set_value, type_text, press_key, paste, select_text, perform_secondary_action, scroll, drag, goto, back, forward, reload, close, evaluate, upload_files, wait_for`,
+          `Unsupported browser_tab_action '${action}'. Supported: click, hover, move, set_value, type_text, press_key, paste, select_text, perform_secondary_action, scroll, drag, goto, back, forward, reload, close, evaluate, upload_files, wait_for_download, list_downloads, get_dialog, handle_dialog, get_console_logs, get_network_requests, get_network_body, get_cookies, set_cookies, clear_cookies, get_storage, set_storage, wait_for`,
         );
     }
 
     const content = [{ type: "text", text: actionSummary }];
-    const returnState = args.return_state ?? args.returnState ?? true;
+    const returnState = args.return_state ?? args.returnState ?? defaultReturnState;
     const includeScreenshot = Boolean(args.include_screenshot ?? args.includeScreenshot);
     if (returnState) {
       const ax = await ctrl.getAXState({ disableDiffing: false });
@@ -744,6 +916,11 @@ export function createComputerUseServer({
     );
   }
 
+  async function runBrowserManage(args = {}) {
+    const action = String(args.action ?? "status").trim().toLowerCase();
+    return browserManager.manage(action, args);
+  }
+
   async function executeBatchStep(step, index) {
     if (!step || typeof step !== "object") {
       throw new TypeError(`Step #${index + 1} must be an object`);
@@ -768,13 +945,17 @@ export function createComputerUseServer({
         return runBrowserTabState(step);
       case "browser_tab_action":
         return runBrowserTabAction(step);
+      case "browser_manage": {
+        const out = await runBrowserManage(step);
+        return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+      }
       case "cursor_control": {
         const out = await runCursorControl(step);
         return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
       }
       default:
         throw new TypeError(
-          `Step #${index + 1} has unsupported kind '${step.kind}'. Supported kinds: window_action, get_window_state, manage_windows, launch_app, browser_open_tab, browser_tab_state, browser_tab_action, cursor_control`,
+          `Step #${index + 1} has unsupported kind '${step.kind}'. Supported kinds: window_action, get_window_state, manage_windows, launch_app, browser_open_tab, browser_tab_state, browser_tab_action, browser_manage, cursor_control`,
         );
     }
   }
@@ -1096,7 +1277,7 @@ export function createComputerUseServer({
     {
       name: "browser_open_tab",
       description:
-        "Open one or multiple controllable browser tabs in the background (auto-connects to open CDP browser or auto-launches headless/visible Chromium, or opens Safari tabs when browser_id='safari') and return their indexed DOM/AX trees.",
+        "Open one or multiple controllable browser tabs in the background (uses live Antigravity Extension Chrome Tab Group when connected, or auto-connects to CDP / auto-launches Chromium, or opens Safari tabs when browser_id='safari') and return their indexed DOM/AX trees.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1108,11 +1289,37 @@ export function createComputerUseServer({
           },
           browser_id: {
             type: "string",
-            description: "Target browser ('default' uses active CDP browser or launches managed; 'iab' forces background managed browser; 'safari' opens in Safari).",
+            description:
+              "Target browser ('default' prefers live Antigravity Extension browser, then CDP, then managed Chromium; 'brave'/'chrome'/'edge'/'arc' targets that browser; 'iab' forces background managed browser; 'safari' opens in Safari).",
           },
           visible: {
             type: "boolean",
-            description: "If false, runs in headless background browser; if true, opens in a visible browser window.",
+            description: "If false on 'default'/'iab', runs in headless background browser; if true, opens in a visible browser window.",
+          },
+          active: {
+            type: "boolean",
+            description: "When opening in an extension browser, bring the new tab to the foreground (default false so the user's active tab is undisturbed).",
+          },
+          window_id: {
+            type: "number",
+            description: "Optional Chrome windowId to open the tab inside.",
+          },
+          session_id: {
+            type: "string",
+            description: "Logical session ID for grouping agent-created tabs (default 'default').",
+          },
+          group_title: {
+            type: "string",
+            description: "Tab Group title for newly created extension tabs (default 'Antigravity').",
+          },
+          group_color: {
+            type: "string",
+            enum: ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"],
+            description: "Tab Group color for newly created extension tabs (default 'cyan').",
+          },
+          ungroup: {
+            type: "boolean",
+            description: "If true, do not place the newly created extension tab into a Tab Group.",
           },
           return_state: { type: "boolean", description: "Return initial indexed AX state for each opened tab (default true)." },
           include_screenshot: { type: "boolean", description: "Include initial live CDP JPEG screenshot(s) (default false)." },
@@ -1145,13 +1352,14 @@ export function createComputerUseServer({
     {
       name: "browser_tab_action",
       description:
-        "Operate any browser tab in the background via CDP or AppleEvents without stealing focus (with live in-tab virtual cursor, click ripples, and element highlight): click, hover, move, set_value, type_text, press_key, paste (text/md/html without touching OS clipboard), select_text, perform_secondary_action, scroll, drag, goto, back, forward, reload, close, evaluate, upload_files, wait_for.",
+        "Operate any browser tab in the background via Extension CDP, raw CDP, or AppleEvents without stealing focus (with live 0.72x in-tab virtual cursor, click ripples, and element highlight): click, hover, move, set_value, type_text, press_key, paste (text/md/html without touching OS clipboard), select_text, perform_secondary_action, scroll, drag, goto, back, forward, reload, close, evaluate, upload_files (Two-Tier CDP + DataTransfer fallback), wait_for_download, list_downloads, get_dialog, handle_dialog, get_console_logs, get_network_requests, get_network_body, get_cookies, set_cookies, clear_cookies, get_storage, set_storage, wait_for.",
       inputSchema: {
         type: "object",
         required: ["action"],
         properties: {
           tab_id: { type: "string", description: "Tab ID (e.g. 'tab-1' or 'safari:w1:t1')." },
           tab_url: { type: "string", description: "Alternative: match an open tab by URL." },
+          browser_id: { type: "string", description: "Optional browser filter when matching by tab_url." },
           action: {
             type: "string",
             enum: [
@@ -1173,15 +1381,31 @@ export function createComputerUseServer({
               "close",
               "evaluate",
               "upload_files",
+              "wait_for_download",
+              "list_downloads",
+              "get_dialog",
+              "handle_dialog",
+              "get_console_logs",
+              "get_network_requests",
+              "get_network_body",
+              "get_cookies",
+              "set_cookies",
+              "clear_cookies",
+              "get_storage",
+              "set_storage",
               "wait_for",
             ],
           },
           element_index: { type: "number", description: "Element index [N] from browser_tab_state." },
           from_element_index: { type: "number", description: "Optional drag start element index [N]." },
           to_element_index: { type: "number", description: "Optional drag destination element index [N]." },
+          trigger_element_index: { type: "number", description: "For upload_files: button element index [N] that opens a file chooser dialog." },
+          click_element_index: { type: "number", description: "For wait_for_download: element index [N] to click to start the download." },
           selector: { type: "string", description: "CSS selector, 'text=...', or 'role=...' target." },
           from_selector: { type: "string", description: "Optional drag start selector." },
           to_selector: { type: "string", description: "Optional drag destination selector." },
+          trigger_selector: { type: "string", description: "For upload_files: CSS/text selector of button that opens a file chooser dialog." },
+          click_selector: { type: "string", description: "For wait_for_download: CSS/text selector to click to start the download." },
           x: { type: "number", description: "Viewport X coordinate." },
           y: { type: "number", description: "Viewport Y coordinate." },
           from_x: { type: "number" },
@@ -1190,7 +1414,6 @@ export function createComputerUseServer({
           to_y: { type: "number" },
           show_cursor: { type: "boolean", description: "Animate the in-tab virtual cursor & highlight overlay for this action (default true)." },
           dispatch_move_event: { type: "boolean", description: "For hover/move, dispatch mouseMoved event (default true for hover, false for move)." },
-          badge: { type: "string", description: "Optional custom pill label next to the virtual cursor." },
           ripple: { type: "boolean", description: "Emit click-style ripple ring on hover/move (default false)." },
           mouse_button: { type: "string", enum: ["left", "right", "middle"] },
           click_count: { type: "number" },
@@ -1205,16 +1428,101 @@ export function createComputerUseServer({
           suffix: { type: "string" },
           selection_type: { type: "string", enum: ["text", "cursor_before", "cursor_after"] },
           secondary_action: { type: "string", description: "Secondary action ('ShowMenu', 'Expand', 'Collapse', 'Increment', 'Decrement')." },
-          url: { type: "string", description: "Target URL for action='goto'." },
+          url: { type: "string", description: "Target URL for action='goto', 'wait_for_download', 'get_cookies', or 'clear_cookies'." },
+          urls: { type: "array", items: { type: "string" }, description: "URLs filter for action='get_cookies'." },
           expression: { type: "string", description: "JavaScript expression for action='evaluate'." },
           files: { type: "array", items: { type: "string" }, description: "Local file paths for action='upload_files'." },
-          timeout_ms: { type: "number", description: "Timeout in ms for action='wait_for'." },
-          return_state: { type: "boolean", description: "Automatically return updated AX state diff after action (default true)." },
+          prefer_data_transfer: { type: "boolean", description: "For upload_files: force Tier-2 in-page DataTransfer File construction." },
+          accept: { type: "boolean", description: "For handle_dialog: true to accept/OK, false to dismiss/Cancel (default true)." },
+          prompt_text: { type: "string", description: "For handle_dialog: text to enter into window.prompt()." },
+          level: { type: "string", description: "For get_console_logs: optional level filter ('log', 'warn', 'error', 'info', 'debug')." },
+          url_filter: { type: "string", description: "For get_network_requests: case-insensitive URL substring filter." },
+          method: { type: "string", description: "For get_network_requests: HTTP method filter (e.g. 'GET', 'POST')." },
+          status: { type: "number", description: "For get_network_requests: HTTP status code filter (e.g. 200, 500)." },
+          request_id: { type: "string", description: "For get_network_body: requestId from get_network_requests." },
+          domain: { type: "string", description: "Cookie domain filter for get_cookies / clear_cookies." },
+          name: { type: "string", description: "Cookie name filter for get_cookies / clear_cookies." },
+          cookies: {
+            type: "array",
+            description: "Cookies array ({ name, value, url?, domain?, path?, secure?, httpOnly?, sameSite?, expires? }) for set_cookies.",
+            items: { type: "object", additionalProperties: true },
+          },
+          all_browser: { type: "boolean", description: "For clear_cookies on non-extension CDP browsers: clear all browser cookies." },
+          storage_type: { type: "string", enum: ["local", "session"], description: "For get_storage / set_storage: 'local' or 'session' (default 'local')." },
+          key: { type: "string", description: "Key chord for press_key/click, OR single storage key for get_storage." },
+          entries: { type: "object", additionalProperties: true, description: "Key-value map to write for set_storage." },
+          remove_keys: { type: "array", items: { type: "string" }, description: "Keys to remove for set_storage." },
+          clear: { type: "boolean", description: "Clear buffer/storage for get_console_logs, get_network_requests, or set_storage." },
+          limit: { type: "number", description: "Max entries to return for list_downloads, get_console_logs, or get_network_requests." },
+          timeout_ms: { type: "number", description: "Timeout in ms for wait_for, upload_files, or wait_for_download." },
+          return_state: { type: "boolean", description: "Automatically return updated AX state diff after action (default true for mutations, false for inspection queries)." },
           include_screenshot: { type: "boolean", description: "Include updated live screenshot (default false)." },
           include_cursor: { type: "boolean", description: "Include virtual cursor overlay in returned screenshot (default false)." },
         },
       },
       handler: runBrowserTabAction,
+    },
+
+    {
+      name: "browser_manage",
+      description:
+        "Manage browser sessions, Chrome Tab Groups, tab ownership/lifecycle, history, and bookmarks via the Antigravity Browser Extension bridge: status, list_tab_groups, create_tab_group, group_tabs, update_tab_group, name_session, ungroup_tabs, claim_tab (in-place without moving user's tab), mark_tab ('deliverable' | 'handoff' | 'scratch'), finalize_session (closes scratch tabs + detaches debuggers so Chrome/Brave banner vanishes), search_history, list_bookmarks, create_bookmark.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: [
+              "status",
+              "list_tab_groups",
+              "create_tab_group",
+              "group_tabs",
+              "update_tab_group",
+              "name_session",
+              "ungroup_tabs",
+              "claim_tab",
+              "mark_tab",
+              "finalize_session",
+              "search_history",
+              "list_bookmarks",
+              "create_bookmark",
+            ],
+            description: "Browser management operation (default 'status').",
+          },
+          browser_id: { type: "string", description: "Optional target extension browser ID or brand (e.g. 'brave', 'chrome', 'ext-brave')." },
+          session_id: { type: "string", description: "Agent session ID (default 'default')." },
+          tab_id: { type: "string", description: "Single tab ID (e.g. 'tab-1' or numeric Chrome tabId) for claim_tab / mark_tab / group_tabs." },
+          tab_ids: {
+            type: "array",
+            items: { anyOf: [{ type: "string" }, { type: "number" }] },
+            description: "Tab IDs (e.g. ['tab-1', 'tab-2'] or Chrome tabIds) for create_tab_group / group_tabs / ungroup_tabs.",
+          },
+          group_id: { type: "number", description: "Existing Chrome Tab Group ID for group_tabs or update_tab_group." },
+          window_id: { type: "number", description: "Optional Chrome windowId filter/target." },
+          title: { type: "string", description: "Title for Tab Group or bookmark." },
+          name: { type: "string", description: "Session / Tab Group name for name_session or group_tabs." },
+          color: {
+            type: "string",
+            enum: ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"],
+            description: "Tab Group color.",
+          },
+          collapsed: { type: "boolean", description: "Collapse or expand the Tab Group." },
+          status: {
+            type: "string",
+            enum: ["deliverable", "handoff", "scratch"],
+            description: "Tab lifecycle status for action='mark_tab'.",
+          },
+          activate: { type: "boolean", description: "For mark_tab status='handoff': focus the tab for the user (default true on handoff)." },
+          close_scratch_tabs: { type: "boolean", description: "For finalize_session: close unmarked agent-created scratch tabs (default true)." },
+          detach_all: { type: "boolean", description: "For finalize_session: detach chrome.debugger from all attached tabs across sessions." },
+          query: { type: "string", description: "Search query for search_history or list_bookmarks." },
+          url: { type: "string", description: "Bookmark URL for create_bookmark." },
+          parent_id: { type: "string", description: "Optional parent bookmark folder ID for create_bookmark." },
+          max_results: { type: "number", description: "Max results for search_history (default 25)." },
+          count: { type: "number", description: "Max recent bookmarks for list_bookmarks when query is omitted (default 25)." },
+        },
+      },
+      handler: runBrowserManage,
     },
 
     {
@@ -1271,7 +1579,7 @@ export function createComputerUseServer({
           steps: {
             type: "array",
             description:
-              "Heterogeneous steps to execute. Each item specifies 'kind' ('window_action', 'get_window_state', 'manage_windows', 'launch_app', 'browser_open_tab', 'browser_tab_state', 'browser_tab_action', 'cursor_control') plus that tool's parameters.",
+              "Heterogeneous steps to execute. Each item specifies 'kind' ('window_action', 'get_window_state', 'manage_windows', 'launch_app', 'browser_open_tab', 'browser_tab_state', 'browser_tab_action', 'browser_manage', 'cursor_control') plus that tool's parameters.",
             items: {
               type: "object",
               required: ["kind"],
@@ -1286,6 +1594,7 @@ export function createComputerUseServer({
                     "browser_open_tab",
                     "browser_tab_state",
                     "browser_tab_action",
+                    "browser_manage",
                     "cursor_control",
                   ],
                 },
@@ -1418,7 +1727,7 @@ export function createComputerUseServer({
 
   const mcp = new MCPStdioServer({
     name: "computer-use",
-    version: "1.0.0",
+    version: "2.0.0",
     instructions: SERVER_INSTRUCTIONS,
     tools,
     input,

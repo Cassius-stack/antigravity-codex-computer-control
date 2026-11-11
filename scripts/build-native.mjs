@@ -37,7 +37,7 @@ function buildUniversalOrNative(srcRel, outRel) {
   const x64Out = path.join(tmpDir, "bin-x86_64");
 
   try {
-    const commonFlags = ["-O", "-swift-version", "5", "-parse-as-library", srcPath];
+    const commonFlags = ["-O", "-swift-version", "5", "-parse-as-library", "-file-prefix-map", `${ROOT}=.`, srcPath];
     const armRes = run(swiftc, [...commonFlags, "-target", "arm64-apple-macosx13.0", "-o", armOut]);
     const x64Res = run(swiftc, [...commonFlags, "-target", "x86_64-apple-macosx13.0", "-o", x64Out]);
 

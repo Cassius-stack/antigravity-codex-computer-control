@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Antigravity in Chrome</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="card">
+      <header class="header">
+        <img class="logo" src="icons/icon48.png" width="34" height="34" alt="Antigravity" />
+        <div class="title-wrap">
+          <h1>Antigravity in Chrome</h1>
+          <p class="subtitle" id="browser-label">Detecting browser…</p>
+        </div>
+        <span class="status-pill disconnected" id="bridge-pill">
+          <span class="status-dot"></span>
+          <span id="bridge-status-text">Offline</span>
+        </span>
+      </header>
+
+      <section class="metrics">
+        <div class="metric-box">
+          <span class="metric-label">Active Tab Groups</span>
+          <span class="metric-value" id="group-count">0</span>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Attached Tabs</span>
+          <span class="metric-value" id="attached-count">0</span>
+        </div>
+      </section>
+
+      <section class="group-summary" id="group-summary">
+        No active agent Tab Group yet. Tabs opened by Antigravity are automatically grouped cleanly.
+      </section>
+
+      <footer class="actions">
+        <button type="button" class="btn btn-secondary" id="reconnect-btn">Reconnect</button>
+        <button type="button" class="btn btn-primary" id="finish-btn">Finish &amp; Detach All</button>
+      </footer>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

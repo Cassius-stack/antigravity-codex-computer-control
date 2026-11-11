@@ -1680,17 +1680,17 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
     let hy = snapshot.hotspotInCanvas.y
     let rgbSpace = CGColorSpaceCreateDeviceRGB()
 
-    // 1. FogCursorStyle Dynamic Luminous Frosted Backdrop Aura (scales 1.0x -> 2.5x with velocity)
+    // 1. FogCursorStyle Dynamic Luminous Frosted Backdrop Aura (0.72x daintier scale, 1.0x -> 2.5x with velocity)
     if alpha > 0.01 {
         cg.saveGState()
         let rotRad = (snapshot.rotationDegrees + snapshot.scootRotationDegrees) * (.pi / 180.0)
-        // Offset aura slightly along body axis behind tip so the mist surrounds the pointer body
-        let bodyCenterOffset: CGFloat = 10.5 * snapshot.pressScale
+        // Offset aura slightly along body axis behind tip so the mist surrounds the daintier pointer body
+        let bodyCenterOffset: CGFloat = 7.5 * snapshot.pressScale
         let fogCenter = CGPoint(
             x: hx - sin(rotRad) * bodyCenterOffset,
             y: hy + cos(rotRad) * bodyCenterOffset
         )
-        let fogRadius = (snapshot.isDragging ? 24.0 : 19.5) * max(1.0, min(2.5, snapshot.fogScale))
+        let fogRadius = (snapshot.isDragging ? 17.5 : 13.5) * max(1.0, min(2.5, snapshot.fogScale))
         // Authentic Codex FogCursorStyle sky-blue luminous mist (Package_ComputerUse.bundle LensSequence/Lens_frame_22.png: #0B9EFF -> #3EC0FF -> #BCE9FC)
         let fogColors = [
             CGColor(red: 0.043, green: 0.620, blue: 1.000, alpha: 0.34 * alpha),
@@ -1711,7 +1711,7 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
         cg.restoreGState()
     }
 
-    // 2. Crisp Click Pulse Rings (anchored in screen coordinates)
+    // 2. Daintier Click Pulse Rings (anchored in screen coordinates)
     for ripple in snapshot.ripples {
         let elapsed = snapshot.now - ripple.startTime
         if elapsed < 0 || elapsed > ripple.duration { continue }
@@ -1722,9 +1722,9 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
 
         cg.saveGState()
         if p < 0.24 {
-            let flashAlpha = (1.0 - p / 0.24) * 0.36
+            let flashAlpha = (1.0 - p / 0.24) * 0.34
             cg.setFillColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: flashAlpha))
-            cg.fillEllipse(in: CGRect(x: rx - 6.0, y: ry - 6.0, width: 12.0, height: 12.0))
+            cg.fillEllipse(in: CGRect(x: rx - 4.2, y: ry - 4.2, width: 8.4, height: 8.4))
         }
 
         let rings = max(1, min(3, ripple.ringCount))
@@ -1733,10 +1733,10 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
             if p < delay { continue }
             let rp = min(1.0, (p - delay) / max(0.2, 1.0 - delay))
             let eased = 1.0 - pow(1.0 - rp, 2.6)
-            let radius = 8.0 + 24.0 * eased
-            let ringAlpha = pow(1.0 - rp, 1.55) * 0.88
+            let radius = 5.5 + 16.5 * eased
+            let ringAlpha = pow(1.0 - rp, 1.55) * 0.86
             cg.setStrokeColor(CGColor(red: accent.r, green: accent.g, blue: accent.b, alpha: ringAlpha))
-            cg.setLineWidth(max(1.1, 2.2 * (1.0 - rp * 0.55)))
+            cg.setLineWidth(max(0.85, 1.5 * (1.0 - rp * 0.55)))
             cg.strokeEllipse(in: CGRect(x: rx - radius, y: ry - radius, width: radius * 2.0, height: radius * 2.0))
         }
         cg.restoreGState()
@@ -1749,36 +1749,36 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
         if waveAlpha > 0.02 {
             cg.saveGState()
             cg.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: waveAlpha))
-            cg.setShadow(offset: CGSize(width: 0, height: 1), blur: 3.0, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.45 * waveAlpha))
-            cg.setLineWidth(1.9)
+            cg.setShadow(offset: CGSize(width: 0, height: 1), blur: 2.5, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.42 * waveAlpha))
+            cg.setLineWidth(1.5)
             cg.setLineCap(.round)
             cg.setLineJoin(.round)
 
-            let drift = (sp - 0.5) * 9.0
+            let drift = (sp - 0.5) * 7.0
             for idx in 0..<2 {
-                let step = CGFloat(idx) * 6.0
+                let step = CGFloat(idx) * 4.8
                 let path = CGMutablePath()
                 switch dir {
                 case "up", "u":
-                    let cy = hy - 13.0 - step + drift
-                    path.move(to: CGPoint(x: hx - 4.5, y: cy + 3.2))
+                    let cy = hy - 10.0 - step + drift
+                    path.move(to: CGPoint(x: hx - 3.6, y: cy + 2.5))
                     path.addLine(to: CGPoint(x: hx, y: cy))
-                    path.addLine(to: CGPoint(x: hx + 4.5, y: cy + 3.2))
+                    path.addLine(to: CGPoint(x: hx + 3.6, y: cy + 2.5))
                 case "left", "l":
-                    let cx = hx - 13.0 - step + drift
-                    path.move(to: CGPoint(x: cx + 3.2, y: hy - 4.5))
+                    let cx = hx - 10.0 - step + drift
+                    path.move(to: CGPoint(x: cx + 2.5, y: hy - 3.6))
                     path.addLine(to: CGPoint(x: cx, y: hy))
-                    path.addLine(to: CGPoint(x: cx + 3.2, y: hy + 4.5))
+                    path.addLine(to: CGPoint(x: cx + 2.5, y: hy + 3.6))
                 case "right", "r":
-                    let cx = hx + 18.0 + step - drift
-                    path.move(to: CGPoint(x: cx - 3.2, y: hy - 4.5))
+                    let cx = hx + 14.0 + step - drift
+                    path.move(to: CGPoint(x: cx - 2.5, y: hy - 3.6))
                     path.addLine(to: CGPoint(x: cx, y: hy))
-                    path.addLine(to: CGPoint(x: cx - 3.2, y: hy + 4.5))
+                    path.addLine(to: CGPoint(x: cx - 2.5, y: hy + 3.6))
                 default:
-                    let cy = hy + 24.0 + step - drift
-                    path.move(to: CGPoint(x: hx - 4.5, y: cy - 3.2))
+                    let cy = hy + 18.0 + step - drift
+                    path.move(to: CGPoint(x: hx - 3.6, y: cy - 2.5))
                     path.addLine(to: CGPoint(x: hx, y: cy))
-                    path.addLine(to: CGPoint(x: hx + 4.5, y: cy - 3.2))
+                    path.addLine(to: CGPoint(x: hx + 3.6, y: cy - 2.5))
                 }
                 cg.addPath(path)
                 cg.strokePath()
@@ -1787,7 +1787,7 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
         }
     }
 
-    // 4. Exact 1:1 Codex AgentCursor (Rounded Cubic Bezier Black Body + Crisp White Border + Velocity/Scoot/Press Transform)
+    // 4. Daintier 0.72x Codex AgentCursor (Tip anchored at exact (0, 0), ~16.5pt tall, sleek ~2.0pt white border, pill-free)
     if alpha > 0.01 {
         cg.saveGState()
         cg.translateBy(x: hx, y: hy)
@@ -1805,21 +1805,22 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
         let totalRotRad = (snapshot.rotationDegrees + snapshot.scootRotationDegrees) * (.pi / 180.0)
         cg.rotate(by: totalRotRad)
 
-        let combinedScale = visScale * snapshot.pressScale
+        let baseCursorScale: CGFloat = 0.72
+        let combinedScale = visScale * snapshot.pressScale * baseCursorScale
         let dartWidthScale = max(0.65, min(1.0, snapshot.velocityStretch)) * combinedScale
         cg.scaleBy(x: dartWidthScale, y: combinedScale)
 
-        // Soft ambient drop shadow + crisp white border (FogCursorStyle / SoftwareCursorStyle)
-        let visBlurExtra = (1.0 - visClamped) * 5.0
+        // Soft ambient drop shadow + sleek white border (~2.0pt effective screen width: 2.78 * 0.72 = 2.00pt)
+        let visBlurExtra = (1.0 - visClamped) * 4.0
         cg.saveGState()
         cg.setShadow(
-            offset: CGSize(width: 0.0, height: 2.0),
-            blur: 5.0 + visBlurExtra,
-            color: CGColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.38 * alpha)
+            offset: CGSize(width: 0.0, height: 1.5),
+            blur: 3.8 + visBlurExtra,
+            color: CGColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.36 * alpha)
         )
         cg.setLineJoin(.round)
         cg.setLineCap(.round)
-        cg.setLineWidth(3.2)
+        cg.setLineWidth(2.78)
         cg.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.98 * alpha))
         cg.addPath(codexAgentCursorCanonicalPath)
         cg.strokePath()
@@ -1848,57 +1849,6 @@ func drawCodexCursorGraphics(in cg: CGContext, canvasSize: CGSize, snapshot: Cur
         cg.restoreGState()
 
         cg.restoreGState()
-    }
-
-    // 5. Optional Explicit Badge Pill (only rendered when caller explicitly passes badge)
-    if let badge = snapshot.badgeText, !badge.isEmpty, snapshot.badgeOpacity * alpha > 0.02 {
-        let bAlpha = snapshot.badgeOpacity * alpha
-        let font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor(calibratedWhite: 0.98, alpha: bAlpha)
-        ]
-        let textSize = (badge as NSString).size(withAttributes: textAttrs)
-        let pillW = ceil(textSize.width) + 22.0
-        let pillH: CGFloat = 19.0
-        var pillX = hx + 16.0
-        var pillY = hy + 18.0
-        if pillX + pillW > canvasSize.width - 4.0 {
-            pillX = max(4.0, hx - pillW - 8.0)
-        }
-        if pillY + pillH > canvasSize.height - 4.0 {
-            pillY = max(4.0, hy - pillH - 8.0)
-        }
-        let pillRect = CGRect(x: pillX, y: pillY, width: pillW, height: pillH)
-        let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 9.5, cornerHeight: 9.5, transform: nil)
-        let accent = cursorAccentRGB(snapshot.badgeColorKind)
-
-        cg.saveGState()
-        cg.setShadow(
-            offset: CGSize(width: 0, height: 1.5),
-            blur: 4.0,
-            color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.35 * bAlpha)
-        )
-        cg.setFillColor(CGColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 0.90 * bAlpha))
-        cg.addPath(pillPath)
-        cg.fillPath()
-        cg.restoreGState()
-
-        cg.saveGState()
-        cg.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.24 * bAlpha))
-        cg.setLineWidth(1.0)
-        cg.addPath(pillPath)
-        cg.strokePath()
-
-        let dotRect = CGRect(x: pillX + 7.0, y: pillY + (pillH - 5.5) * 0.5, width: 5.5, height: 5.5)
-        cg.setFillColor(CGColor(red: accent.r, green: accent.g, blue: accent.b, alpha: 0.95 * bAlpha))
-        cg.fillEllipse(in: dotRect)
-        cg.restoreGState()
-
-        (badge as NSString).draw(
-            at: NSPoint(x: pillX + 16.0, y: pillY + (pillH - textSize.height) * 0.5),
-            withAttributes: textAttrs
-        )
     }
 }
 
@@ -2410,7 +2360,6 @@ final class VirtualCursorInstance {
         }()
         let visVal = deterministicForScreenshot ? 1.0 : CGFloat(max(0.0, min(1.0, visibilitySpring.value)))
         let effOpacity = deterministicForScreenshot ? max(opacity, 1.0) : opacity
-        let badgeOp: CGFloat = badgeText != nil ? effOpacity : 0.0
         let velNorm = min(1.0, max(0.0, (abs(positionXSpring.velocity) + abs(positionYSpring.velocity)) * 0.5 / 3000.0))
         let fogScale = deterministicForScreenshot ? 1.0 : CGFloat(1.0 + velNorm * 1.5)
 
@@ -2431,9 +2380,9 @@ final class VirtualCursorInstance {
             ripples: ripples,
             scrollDirection: scrollProg < 1.0 ? scrollDirection : nil,
             scrollProgress: scrollProg,
-            badgeText: badgeOp > 0.01 ? badgeText : nil,
+            badgeText: nil,
             badgeColorKind: badgeColorKind,
-            badgeOpacity: badgeOp,
+            badgeOpacity: 0.0,
             now: now
         )
     }
@@ -2684,13 +2633,9 @@ final class VirtualCursorManager {
                 inst.highlightOpacity = 0.0
             }
 
-            if let b = badge, !b.isEmpty {
-                inst.badgeText = b
-                inst.badgeColorKind = badgeColorKind
-                inst.badgeSetTime = now
-            } else {
-                inst.badgeText = nil
-            }
+            // Mouse pill permanently suppressed (always nil)
+            inst.badgeText = nil
+            inst.badgeColorKind = badgeColorKind
 
             if !wasVisible {
                 if self.glideEnabled {
@@ -4078,7 +4023,6 @@ func handleRequest(_ req: [String: Any]) throws -> Any {
         let customBadgeRaw = (params["badge"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         func effectiveBadge(_ fallback: String) -> String? {
-            if let cb = customBadgeRaw, !cb.isEmpty { return cb }
             return nil
         }
 
@@ -4847,8 +4791,7 @@ func handleRequest(_ req: [String: Any]) throws -> Any {
             let appQ = params["app"] as? String
             let winTitle = params["windowTitle"] as? String
             let globalCoords = asBool(params["globalCoordinates"]) ?? false
-            let rawBadge = (params["badge"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let badgeText: String? = (rawBadge?.isEmpty == false) ? rawBadge : nil
+            let badgeText: String? = nil
 
             if wid == nil && (appQ == nil || appQ!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
                 guard globalCoords, let gx = asDouble(params["x"]), let gy = asDouble(params["y"]) else {

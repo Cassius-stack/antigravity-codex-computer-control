@@ -70,7 +70,8 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
   function isVisible(el, style, rect) {
     if (!style) return false;
     if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
-    if (parseFloat(style.opacity || "1") === 0 && document.activeElement !== el) return false;
+    const ownerDoc = el.ownerDocument || document;
+    if (parseFloat(style.opacity || "1") === 0 && ownerDoc.activeElement !== el) return false;
     if (el.hasAttribute?.("hidden") || el.getAttribute?.("aria-hidden") === "true") return false;
     if (rect.width < 1 && rect.height < 1 && el.tagName !== "OPTION") return false;
     return true;
@@ -87,18 +88,19 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
   }
 
   function getAccessibleName(el, role) {
+    const ownerDoc = el.ownerDocument || document;
     const ariaLabel = el.getAttribute?.("aria-label")?.trim();
     if (ariaLabel) return ariaLabel;
 
     const labelledBy = el.getAttribute?.("aria-labelledby")?.trim();
     if (labelledBy) {
-      const parts = labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.innerText?.trim()).filter(Boolean);
+      const parts = labelledBy.split(/\\s+/).map((id) => ownerDoc.getElementById(id)?.innerText?.trim()).filter(Boolean);
       if (parts.length) return parts.join(" ");
     }
 
     if (el.id) {
       try {
-        const lbl = document.querySelector(\`label[for="\${CSS.escape(el.id)}"]\`);
+        const lbl = ownerDoc.querySelector(\`label[for="\${CSS.escape(el.id)}"]\`);
         if (lbl) {
           const t = lbl.innerText?.replace(/\\s+/g, " ").trim();
           if (t) return t;
@@ -136,8 +138,35 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
   let nextIdx = 1;
   const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
   const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+  const captchaSignalSet = new Set();
 
-  function walk(node, depth) {
+  function detectCaptchaInDoc(doc) {
+    if (!doc || typeof doc.querySelector !== "function") return;
+    try {
+      if (
+        doc.querySelector(".cf-turnstile, [data-turnstile-callback], iframe[src*='challenges.cloudflare.com'], #challenge-running, #cf-challenge-running, form#challenge-form")
+      ) {
+        captchaSignalSet.add("cloudflare-turnstile");
+      }
+      if (
+        doc.querySelector(".g-recaptcha, iframe[src*='google.com/recaptcha'], iframe[src*='recaptcha.net/recaptcha']")
+      ) {
+        captchaSignalSet.add("recaptcha");
+      }
+      if (
+        doc.querySelector(".h-captcha, iframe[src*='hcaptcha.com']")
+      ) {
+        captchaSignalSet.add("hcaptcha");
+      }
+      if (doc.querySelector("altcha-widget")) {
+        captchaSignalSet.add("altcha");
+      }
+    } catch {}
+  }
+
+  detectCaptchaInDoc(document);
+
+  function walk(node, depth, offsetX = 0, offsetY = 0) {
     if (nextIdx > MAX || !node || node.nodeType !== Node.ELEMENT_NODE) return;
     if (node.id === "__ag_cua_cursor_host__" || node.hasAttribute?.("data-ag-cua-ignore")) return;
     const tag = node.tagName;
@@ -145,9 +174,16 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
       return;
     }
 
-    const style = window.getComputedStyle(node);
+    const ownerWin = node.ownerDocument?.defaultView || window;
+    const ownerDoc = node.ownerDocument || document;
+    const style = ownerWin.getComputedStyle(node);
     const rect = node.getBoundingClientRect();
     if (!isVisible(node, style, rect)) return;
+
+    const rx = Math.round(rect.left + offsetX);
+    const ry = Math.round(rect.top + offsetY);
+    const rw = Math.round(rect.width);
+    const rh = Math.round(rect.height);
 
     const role = getRole(node);
     const hasClickAttr = node.hasAttribute("onclick") || style.cursor === "pointer" && (node.tabIndex >= 0 || node.getAttribute("tabindex") !== null);
@@ -201,18 +237,14 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
 
         if (node.disabled || node.getAttribute("aria-disabled") === "true") parts.push("disabled");
         if (node.readOnly) parts.push("readonly");
-        if (document.activeElement === node) parts.push("focused");
+        if (ownerDoc.activeElement === node) parts.push("focused");
         if (node.getAttribute("aria-expanded") === "true" || (tag === "DETAILS" && node.open)) parts.push("expanded");
         else if (node.getAttribute("aria-expanded") === "false") parts.push("collapsed");
         if (node.getAttribute("aria-selected") === "true") parts.push("selected");
         if (node.getAttribute("aria-checked") === "true" && tag !== "INPUT") parts.push("checked");
 
-        const rx = Math.round(rect.left);
-        const ry = Math.round(rect.top);
-        const rw = Math.round(rect.width);
-        const rh = Math.round(rect.height);
         parts.push(\`@(\${rx},\${ry} \${rw}x\${rh})\`);
-        if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+        if (ry + rh < 0 || ry > vh || rx + rw < 0 || rx > vw) {
           parts.push("offscreen");
         }
 
@@ -222,10 +254,6 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
       const idx = nextIdx++;
       store.set(idx, node);
       const indent = "  ".repeat(Math.min(8, depth));
-      const rx = Math.round(rect.left);
-      const ry = Math.round(rect.top);
-      const rw = Math.round(rect.width);
-      const rh = Math.round(rect.height);
       lines.push(\`\${indent}[\${idx}] text "\${directText.replace(/"/g, '\\\\"').slice(0, 160)}" @(\${rx},\${ry} \${rw}x\${rh})\`);
       emitted = true;
     }
@@ -238,26 +266,33 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
     const nextDepth = emitted ? depth + 1 : depth;
     if (node.shadowRoot) {
       for (const sc of node.shadowRoot.children) {
-        walk(sc, nextDepth);
+        walk(sc, nextDepth, offsetX, offsetY);
       }
     }
     for (const child of node.children) {
       if (nextIdx > MAX) break;
-      walk(child, nextDepth);
+      walk(child, nextDepth, offsetX, offsetY);
     }
     if (tag === "IFRAME") {
       try {
+        const srcAttr = String(node.getAttribute("src") || "").toLowerCase();
+        if (srcAttr.includes("challenges.cloudflare.com")) captchaSignalSet.add("cloudflare-turnstile");
+        if (srcAttr.includes("recaptcha")) captchaSignalSet.add("recaptcha");
+        if (srcAttr.includes("hcaptcha.com")) captchaSignalSet.add("hcaptcha");
         if (node.contentDocument?.body) {
-          walk(node.contentDocument.body, nextDepth + 1);
+          detectCaptchaInDoc(node.contentDocument);
+          const childOffsetX = offsetX + rect.left + (node.clientLeft || 0);
+          const childOffsetY = offsetY + rect.top + (node.clientTop || 0);
+          walk(node.contentDocument.body, nextDepth + 1, childOffsetX, childOffsetY);
         }
       } catch {}
     }
   }
 
   if (document.body) {
-    walk(document.body, 1);
+    walk(document.body, 1, 0, 0);
   } else if (document.documentElement) {
-    walk(document.documentElement, 1);
+    walk(document.documentElement, 1, 0, 0);
   }
 
   return {
@@ -266,11 +301,48 @@ export const BUILD_AX_SNAPSHOT_EXPR = (maxElements = 600) => `(() => {
     viewport: { width: vw, height: vh },
     scroll: { x: Math.round(window.scrollX || 0), y: Math.round(window.scrollY || 0) },
     elementCount: nextIdx - 1,
+    captchaSignals: Array.from(captchaSignalSet),
     lines
   };
 })()`;
 
 const QUERY_SMART_FN_SOURCE = `
+  function getTopLevelRect(el) {
+    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 200, top: 200, width: 40, height: 24 };
+    let offX = 0;
+    let offY = 0;
+    try {
+      let curWin = el.ownerDocument?.defaultView;
+      while (curWin && curWin !== window && curWin.frameElement) {
+        const fr = curWin.frameElement.getBoundingClientRect();
+        offX += fr.left + (curWin.frameElement.clientLeft || 0);
+        offY += fr.top + (curWin.frameElement.clientTop || 0);
+        curWin = curWin.parent;
+      }
+    } catch {}
+    return {
+      left: r.left + offX,
+      top: r.top + offY,
+      width: r.width,
+      height: r.height
+    };
+  }
+
+  function queryAcrossSameOriginFrames(fn) {
+    const rootMatch = fn(document);
+    if (rootMatch) return rootMatch;
+    const iframes = document.querySelectorAll("iframe");
+    for (const ifr of iframes) {
+      try {
+        if (ifr.contentDocument) {
+          const m = fn(ifr.contentDocument);
+          if (m) return m;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
   function resolveTargetElement(spec) {
     if (typeof spec === "number") {
       const mapped = window.__agCuaMap?.get(spec) || null;
@@ -284,19 +356,21 @@ const QUERY_SMART_FN_SOURCE = `
       let found = null;
       if (sel.startsWith("text=")) {
         const needle = sel.slice(5).trim().toLowerCase();
-        const all = document.querySelectorAll("button,a,input,textarea,select,label,span,div,h1,h2,h3,h4,li,[role]");
-        for (const cand of all) {
-          if (cand.id === "__ag_cua_cursor_host__" || cand.closest?.("[data-ag-cua-ignore]")) continue;
-          if ((cand.innerText || cand.value || "").trim().toLowerCase().includes(needle)) {
-            found = cand;
-            break;
+        found = queryAcrossSameOriginFrames((doc) => {
+          const all = doc.querySelectorAll("button,a,input,textarea,select,label,span,div,h1,h2,h3,h4,li,[role]");
+          for (const cand of all) {
+            if (cand.id === "__ag_cua_cursor_host__" || cand.closest?.("[data-ag-cua-ignore]")) continue;
+            if ((cand.innerText || cand.value || "").trim().toLowerCase().includes(needle)) {
+              return cand;
+            }
           }
-        }
+          return null;
+        });
       } else if (sel.startsWith("role=")) {
         const r = sel.slice(5).trim();
-        found = document.querySelector(\`[role="\${CSS.escape(r)}"]:not([data-ag-cua-ignore])\`);
+        found = queryAcrossSameOriginFrames((doc) => doc.querySelector(\`[role="\${CSS.escape(r)}"]:not([data-ag-cua-ignore])\`));
       } else {
-        found = document.querySelector(sel);
+        found = queryAcrossSameOriginFrames((doc) => doc.querySelector(sel));
       }
       if (!found || !found.isConnected) {
         return { el: null, error: \`No element matched selector: \${sel}\` };
@@ -324,7 +398,7 @@ export function buildPrepareElementExpr(targetSpec, { focus = false } = {}) {
     if (focus && typeof el.focus === "function") {
       el.focus({ preventScroll: true });
     }
-    const r = el.getBoundingClientRect();
+    const r = getTopLevelRect(el);
     return {
       ok: true,
       tag: el.tagName,
@@ -389,7 +463,7 @@ export function buildSetValueExpr(targetSpec, value) {
     }
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     if (typeof el.focus === "function") el.focus({ preventScroll: true });
-    const r = el.getBoundingClientRect();
+    const r = getTopLevelRect(el);
     const geom = {
       x: r.left + r.width / 2,
       y: r.top + r.height / 2,
@@ -423,7 +497,8 @@ export function buildSetValueExpr(targetSpec, value) {
       return { ok: true, value, ...geom };
     }
 
-    const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement?.prototype : window.HTMLInputElement?.prototype;
+    const ownerWin = el.ownerDocument?.defaultView || window;
+    const proto = el.tagName === "TEXTAREA" ? ownerWin.HTMLTextAreaElement?.prototype : ownerWin.HTMLInputElement?.prototype;
     const setter = proto ? Object.getOwnPropertyDescriptor(proto, "value")?.set : null;
     if (setter) {
       setter.call(el, value);
@@ -459,7 +534,7 @@ export function buildSelectTextExpr(targetSpec, text, options = {}) {
     }
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     if (typeof el.focus === "function") el.focus({ preventScroll: true });
-    const r = el.getBoundingClientRect();
+    const r = getTopLevelRect(el);
     const geom = {
       x: r.left + r.width / 2,
       y: r.top + r.height / 2,
@@ -490,7 +565,9 @@ export function buildSelectTextExpr(targetSpec, text, options = {}) {
     const targetStart = pos + prefix.length;
     const targetEnd = targetStart + text.length;
 
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const ownerDoc = el.ownerDocument || document;
+    const ownerWin = ownerDoc.defaultView || window;
+    const walker = ownerDoc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     let offset = 0;
     let startNode = null, startOffset = 0, endNode = null, endOffset = 0;
     let current;
@@ -510,7 +587,7 @@ export function buildSelectTextExpr(targetSpec, text, options = {}) {
     if (!startNode || !endNode) {
       return { ok: false, error: "Could not resolve DOM text nodes for selection" };
     }
-    const range = document.createRange();
+    const range = ownerDoc.createRange();
     if (selectionType === "cursor_before") {
       range.setStart(startNode, startOffset);
       range.setEnd(startNode, startOffset);
@@ -521,7 +598,7 @@ export function buildSelectTextExpr(targetSpec, text, options = {}) {
       range.setStart(startNode, startOffset);
       range.setEnd(endNode, endOffset);
     }
-    const sel = window.getSelection();
+    const sel = ownerWin.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
     return { ok: true, start: targetStart, end: targetEnd, ...geom };
@@ -553,7 +630,7 @@ export function buildPasteExpr(targetSpec, text, format = "text") {
     }
     if (!el) el = document.body;
     if (typeof el.focus === "function") el.focus({ preventScroll: true });
-    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { left: 200, top: 200, width: 40, height: 24 };
+    const r = getTopLevelRect(el);
     const geom = {
       x: r.left + r.width / 2,
       y: r.top + r.height / 2,
@@ -602,22 +679,24 @@ export function buildPasteExpr(targetSpec, text, format = "text") {
     }
 
     if (notCancelled) {
+      const ownerDoc = el.ownerDocument || document;
+      const ownerWin = ownerDoc.defaultView || window;
       if (el.isContentEditable) {
         if (format === "html") {
           try {
-            document.execCommand("insertHTML", false, text);
+            ownerDoc.execCommand("insertHTML", false, text);
           } catch {
-            document.execCommand("insertText", false, plainFallback);
+            ownerDoc.execCommand("insertText", false, plainFallback);
           }
         } else {
-          document.execCommand("insertText", false, text);
+          ownerDoc.execCommand("insertText", false, text);
         }
       } else if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
         const insertStr = format === "html" ? plainFallback : text;
         const start = typeof el.selectionStart === "number" ? el.selectionStart : el.value.length;
         const end = typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
         const nextVal = el.value.slice(0, start) + insertStr + el.value.slice(end);
-        const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement?.prototype : window.HTMLInputElement?.prototype;
+        const proto = el.tagName === "TEXTAREA" ? ownerWin.HTMLTextAreaElement?.prototype : ownerWin.HTMLInputElement?.prototype;
         const setter = proto ? Object.getOwnPropertyDescriptor(proto, "value")?.set : null;
         if (setter) setter.call(el, nextVal);
         else el.value = nextVal;
@@ -648,7 +727,7 @@ export function buildSecondaryActionExpr(targetSpec, action) {
     if (!el) {
       return { ok: false, error };
     }
-    const r = el.getBoundingClientRect();
+    const r = getTopLevelRect(el);
     const geom = {
       x: r.left + r.width / 2,
       y: r.top + r.height / 2,
@@ -700,6 +779,153 @@ export function buildSecondaryActionExpr(targetSpec, action) {
       return { ok: true, ...geom };
     }
     return { ok: false, error: \`Unsupported secondary action "\${action}". Supported: Focus, Blur, Check, Uncheck, Expand, Collapse, ShowMenu, Submit, Press\` };
+  })()`;
+}
+
+/**
+ * Tier-2 Zero-Config File Upload Helpers:
+ * Stage chunked base64 file buffers in window.__agCuaUploadStaging and construct real File + DataTransfer objects
+ * to assign onto <input type="file"> OR dispatch dragenter/dragover/drop onto custom dropzones!
+ */
+export function buildInitUploadStagingExpr(uploadId) {
+  return `(() => {
+    if (!window.__agCuaUploadStaging) {
+      Object.defineProperty(window, "__agCuaUploadStaging", {
+        value: new Map(),
+        configurable: true,
+        writable: true,
+        enumerable: false
+      });
+    }
+    window.__agCuaUploadStaging.set(${JSON.stringify(uploadId)}, []);
+    return { ok: true };
+  })()`;
+}
+
+export function buildAppendUploadChunkExpr(uploadId, fileIndex, chunkBase64) {
+  return `(() => {
+    const list = window.__agCuaUploadStaging?.get(${JSON.stringify(uploadId)});
+    if (!list) return { ok: false, error: "Upload staging session missing" };
+    if (!list[${Number(fileIndex)}]) list[${Number(fileIndex)}] = [];
+    list[${Number(fileIndex)}].push(${JSON.stringify(chunkBase64)});
+    return { ok: true };
+  })()`;
+}
+
+export function buildCommitDataTransferUploadExpr({ uploadId, targetSpec = null, fileMetas = [] }) {
+  const payload = JSON.stringify({ uploadId, targetSpec, fileMetas });
+  return `(() => {
+    const { uploadId, targetSpec, fileMetas } = ${payload};
+    ${QUERY_SMART_FN_SOURCE}
+    const staged = window.__agCuaUploadStaging?.get(uploadId);
+    window.__agCuaUploadStaging?.delete(uploadId);
+    if (!staged) {
+      return { ok: false, error: "Upload staging buffers expired or missing" };
+    }
+
+    let el = null;
+    if (targetSpec != null) {
+      const resolved = resolveTargetElement(targetSpec);
+      if (!resolved.el) {
+        return { ok: false, error: resolved.error };
+      }
+      el = resolved.el;
+    } else {
+      el = queryAcrossSameOriginFrames((doc) => doc.querySelector('input[type="file"]'));
+    }
+    if (!el) {
+      return { ok: false, error: "No <input type=\\"file\\"> or dropzone target found" };
+    }
+
+    // If target is a wrapper/label/button containing a hidden <input type="file">, check inside or associated label first
+    let fileInput = null;
+    if (el.tagName === "INPUT" && String(el.type || "").toLowerCase() === "file") {
+      fileInput = el;
+    } else if (el.tagName === "LABEL") {
+      if (el.htmlFor) {
+        const linked = (el.ownerDocument || document).getElementById(el.htmlFor);
+        if (linked && linked.tagName === "INPUT" && String(linked.type || "").toLowerCase() === "file") {
+          fileInput = linked;
+        }
+      }
+      if (!fileInput) {
+        fileInput = el.querySelector?.('input[type="file"]') || null;
+      }
+    } else if (typeof el.querySelector === "function") {
+      fileInput = el.querySelector('input[type="file"]') || null;
+    }
+
+    const ownerWin = (fileInput || el).ownerDocument?.defaultView || window;
+    const DT = ownerWin.DataTransfer || DataTransfer;
+    const FileCtor = ownerWin.File || File;
+    const dt = new DT();
+
+    for (let i = 0; i < fileMetas.length; i++) {
+      const meta = fileMetas[i];
+      const b64 = (staged[i] || []).join("");
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let j = 0; j < bin.length; j++) {
+        bytes[j] = bin.charCodeAt(j);
+      }
+      const f = new FileCtor([bytes], meta.name, {
+        type: meta.type || "application/octet-stream",
+        lastModified: meta.lastModified || Date.now()
+      });
+      dt.items.add(f);
+    }
+
+    const r = getTopLevelRect(el);
+    const geom = {
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      rect: { x: r.left, y: r.top, width: r.width, height: r.height }
+    };
+
+    if (fileInput) {
+      const proto = ownerWin.HTMLInputElement?.prototype;
+      const filesSetter = proto ? Object.getOwnPropertyDescriptor(proto, "files")?.set : null;
+      if (filesSetter) {
+        filesSetter.call(fileInput, dt.files);
+      } else {
+        fileInput.files = dt.files;
+      }
+      fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+      return {
+        ok: true,
+        mechanism: "datatransfer_input",
+        fileCount: dt.files.length,
+        names: Array.from(dt.files).map((f) => f.name),
+        ...geom
+      };
+    }
+
+    // Custom dropzone fallback: dispatch dragenter -> dragover -> drop with populated DataTransfer!
+    const DragEv = ownerWin.DragEvent || (typeof DragEvent === "function" ? DragEvent : Event);
+    for (const evType of ["dragenter", "dragover", "drop"]) {
+      let ev;
+      try {
+        ev = new DragEv(evType, {
+          bubbles: true,
+          cancelable: true,
+          dataTransfer: dt,
+          clientX: geom.x,
+          clientY: geom.y
+        });
+      } catch {
+        ev = new Event(evType, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, "dataTransfer", { value: dt });
+      }
+      el.dispatchEvent(ev);
+    }
+    return {
+      ok: true,
+      mechanism: "datatransfer_dropzone",
+      fileCount: dt.files.length,
+      names: Array.from(dt.files).map((f) => f.name),
+      ...geom
+    };
   })()`;
 }
 
@@ -1172,8 +1398,62 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
 
       const style = document.createElement("style");
       style.textContent = \`
-        :host, * { pointer-events: none !important; user-select: none !important; box-sizing: border-box; }
-        .ag-layer { position: fixed; inset: 0; width: 100%; height: 100%; overflow: hidden; opacity: 0; transition: opacity 220ms ease; }
+        :host { pointer-events: none !important; user-select: none !important; }
+        *:not(.ag-takeover-btn) { pointer-events: none !important; user-select: none !important; box-sizing: border-box; }
+        .ag-session-chrome {
+          position: fixed;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          z-index: 2147483645;
+          display: none;
+        }
+        .ag-viewport-glow {
+          position: fixed;
+          inset: 0;
+          border: 2px solid rgba(56, 189, 248, 0.50);
+          box-shadow: inset 0 0 12px rgba(14, 165, 233, 0.18);
+        }
+        .ag-takeover-btn {
+          pointer-events: auto !important;
+          cursor: pointer !important;
+          user-select: none !important;
+          box-sizing: border-box;
+          position: fixed;
+          top: 10px;
+          right: 12px;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 4px 10px 4px 8px;
+          border-radius: 999px;
+          border: 1px solid rgba(56, 189, 248, 0.42);
+          background: rgba(11, 15, 25, 0.86);
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.32);
+          color: #f8fafc;
+          font: 600 11px/14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          letter-spacing: 0.01em;
+          white-space: nowrap;
+          transition: background 120ms ease, border-color 120ms ease, transform 90ms ease;
+        }
+        .ag-takeover-btn:hover {
+          background: rgba(15, 23, 42, 0.96);
+          border-color: rgba(56, 189, 248, 0.82);
+        }
+        .ag-takeover-btn:active {
+          transform: scale(0.97);
+        }
+        .ag-takeover-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #38bdf8;
+          box-shadow: 0 0 6px rgba(56, 189, 248, 0.85);
+          flex-shrink: 0;
+        }
+        .ag-layer { position: fixed; inset: 0; width: 100%; height: 100%; overflow: hidden; opacity: 0; transition: opacity 220ms ease; z-index: 2147483646; }
         .ag-layer.visible { opacity: 1; transition: none; }
         .ag-highlight {
           position: fixed;
@@ -1209,50 +1489,26 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
         }
         .ag-glow {
           position: absolute;
-          left: -20px; top: -10px;
-          width: 40px; height: 40px;
+          left: -13.5px; top: -13.5px;
+          width: 27px; height: 27px;
           border-radius: 50%;
           transform-origin: 50% 50%;
           background: radial-gradient(circle, rgba(11, 158, 255, 0.34) 0%, rgba(62, 192, 255, 0.18) 52%, rgba(188, 233, 252, 0) 76%);
           will-change: transform, opacity;
         }
-        .ag-badge {
-          position: absolute;
-          left: 16px; top: 18px;
-          display: none;
-          align-items: center;
-          gap: 6px;
-          padding: 2px 9px 2px 7px;
-          border-radius: 999px;
-          background: rgba(15, 17, 23, 0.90);
-          border: 1px solid rgba(255, 255, 255, 0.24);
-          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
-          color: #f8fafc;
-          font: 600 10.5px/14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          white-space: nowrap;
-          opacity: 0;
-          transition: none;
-        }
-        .ag-badge.flip-x { left: auto; right: 8px; }
-        .ag-badge.flip-y { top: auto; bottom: 8px; }
-        .ag-dot {
-          width: 5.5px; height: 5.5px; border-radius: 50%;
-          background: #38bdf8;
-          flex-shrink: 0;
-        }
         @keyframes agRippleExpand {
-          0% { transform: translate(-50%, -50%) scale(0.38); opacity: 0.90; border-width: 2.3px; }
-          45% { transform: translate(-50%, -50%) scale(0.76); opacity: 0.78; border-width: 2.0px; }
-          100% { transform: translate(-50%, -50%) scale(1.06); opacity: 0; border-width: 1.1px; }
+          0% { transform: translate(-50%, -50%) scale(0.36); opacity: 0.88; border-width: 1.7px; }
+          45% { transform: translate(-50%, -50%) scale(0.76); opacity: 0.75; border-width: 1.5px; }
+          100% { transform: translate(-50%, -50%) scale(1.06); opacity: 0; border-width: 0.9px; }
         }
         .ag-ripple {
           position: fixed;
-          width: 56px; height: 56px;
+          width: 38px; height: 38px;
           border-radius: 50%;
-          border: 2.2px solid #38bdf8;
-          box-shadow: 0 0 6px rgba(56, 189, 248, 0.34);
-          transform: translate(-50%, -50%) scale(0.38);
-          animation: agRippleExpand 780ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+          border: 1.6px solid #38bdf8;
+          box-shadow: 0 0 5px rgba(56, 189, 248, 0.32);
+          transform: translate(-50%, -50%) scale(0.36);
+          animation: agRippleExpand 740ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
         .ag-shot-ripple {
           position: fixed;
@@ -1269,11 +1525,28 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
         .ag-scroll-ind {
           position: fixed;
           color: #ffffff;
-          font: 700 13px/1 -apple-system, sans-serif;
+          font: 700 11.5px/1 -apple-system, sans-serif;
           text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
           animation: agScrollPulse 480ms ease-out forwards;
         }
       \`;
+
+      const sessionChrome = document.createElement("div");
+      sessionChrome.className = "ag-session-chrome";
+      const viewportGlow = document.createElement("div");
+      viewportGlow.className = "ag-viewport-glow";
+      const takeoverBtn = document.createElement("button");
+      takeoverBtn.type = "button";
+      takeoverBtn.className = "ag-takeover-btn";
+      takeoverBtn.setAttribute("data-ag-cua-ignore", "true");
+      const takeoverDot = document.createElement("span");
+      takeoverDot.className = "ag-takeover-dot";
+      const takeoverLabel = document.createElement("span");
+      takeoverLabel.textContent = "Antigravity · Take Over";
+      takeoverBtn.appendChild(takeoverDot);
+      takeoverBtn.appendChild(takeoverLabel);
+      sessionChrome.appendChild(viewportGlow);
+      sessionChrome.appendChild(takeoverBtn);
 
       const layer = document.createElement("div");
       layer.className = "ag-layer";
@@ -1294,11 +1567,11 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
 
       const svgNS = "http://www.w3.org/2000/svg";
       const svg = document.createElementNS(svgNS, "svg");
-      svg.setAttribute("width", "32");
-      svg.setAttribute("height", "32");
-      svg.setAttribute("viewBox", "-16 -4 32 30");
+      svg.setAttribute("width", "26");
+      svg.setAttribute("height", "26");
+      svg.setAttribute("viewBox", "-13 -3 26 24");
       svg.setAttribute("fill", "none");
-      svg.style.cssText = "position:absolute;left:-16px;top:-4px;overflow:visible;filter:drop-shadow(0px 2px 4.5px rgba(0,0,0,0.38));";
+      svg.style.cssText = "position:absolute;left:-13px;top:-3px;overflow:visible;filter:drop-shadow(0px 1.5px 3.4px rgba(0,0,0,0.36));";
 
       const defs = document.createElementNS(svgNS, "defs");
       const grad = document.createElementNS(svgNS, "linearGradient");
@@ -1319,13 +1592,18 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       grad.appendChild(stop2);
       defs.appendChild(grad);
 
-      // Exact Codex AgentCursor rounded cubic Bezier path in canonical up-frame with tip apex at (0, 0)
+      // Exact Codex AgentCursor rounded cubic Bezier path in canonical up-frame with tip apex at (0, 0), scaled by 0.72x (~16.5px tall)
       const agentCursorD = "M -2.691 1.684 C -1.613 -0.414 1.287 -0.592 2.258 1.379 L 10.077 17.279 C 11.15 19.465 8.864 22.079 6.527 21.339 L -0.682 19.053 L -8.035 22.234 C -10.421 23.266 -12.576 20.925 -11.381 18.599 Z";
+
+      const geomGroup = document.createElementNS(svgNS, "g");
+      geomGroup.setAttribute("class", "ag-pointer-geom");
+      geomGroup.setAttribute("transform", "scale(0.72)");
 
       const pathBorder = document.createElementNS(svgNS, "path");
       pathBorder.setAttribute("d", agentCursorD);
       pathBorder.setAttribute("stroke", "#FFFFFF");
-      pathBorder.setAttribute("stroke-width", "3.2");
+      // 2.78 * 0.72 = 2.00px effective screen border width (~1.9px-2.1px sleek outline)
+      pathBorder.setAttribute("stroke-width", "2.78");
       pathBorder.setAttribute("stroke-linejoin", "round");
       pathBorder.setAttribute("stroke-linecap", "round");
       pathBorder.setAttribute("fill", "#FFFFFF");
@@ -1335,41 +1613,38 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       pathBody.setAttribute("fill", "url(#agBodyGrad)");
       pathBody.setAttribute("stroke", "none");
 
+      geomGroup.appendChild(pathBorder);
+      geomGroup.appendChild(pathBody);
       svg.appendChild(defs);
-      svg.appendChild(pathBorder);
-      svg.appendChild(pathBody);
+      svg.appendChild(geomGroup);
       ptrWrap.appendChild(svg);
-
-      const badge = document.createElement("div");
-      badge.className = "ag-badge";
-      const dot = document.createElement("span");
-      dot.className = "ag-dot";
-      const badgeLabel = document.createElement("span");
-      badge.appendChild(dot);
-      badge.appendChild(badgeLabel);
 
       cursor.appendChild(glow);
       cursor.appendChild(ptrWrap);
-      cursor.appendChild(badge);
       layer.appendChild(highlight);
       layer.appendChild(fxContainer);
       layer.appendChild(cursor);
       shadow.appendChild(style);
+      shadow.appendChild(sessionChrome);
       shadow.appendChild(layer);
       rootDoc.appendChild(host);
 
       ctrl = {
         host,
         shadow,
+        sessionChrome,
+        viewportGlow,
+        takeoverBtn,
         layer,
         highlight,
         fxContainer,
         cursor,
         glow,
         ptrWrap,
-        badge,
-        dot,
-        badgeLabel,
+        geomGroup,
+        baseScale: 0.72,
+        sessionChromeActive: false,
+        takenOver: false,
         x: null,
         y: null,
         visible: false,
@@ -1387,6 +1662,30 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
         lastFrameAt: 0,
         sim: null,
       };
+
+      const onTakeOverClick = (ev) => {
+        try {
+          ev?.preventDefault?.();
+          ev?.stopPropagation?.();
+        } catch {}
+        ctrl.takenOver = true;
+        ctrl.sessionChromeActive = false;
+        ctrl.visible = false;
+        sessionChrome.style.display = "none";
+        layer.classList.remove("visible");
+        layer.style.opacity = "0";
+        if (typeof window.__agCuaControl === "function") {
+          try {
+            window.__agCuaControl(JSON.stringify({ action: "take_over", ts: Date.now() }));
+          } catch {}
+        }
+      };
+      if (typeof takeoverBtn.addEventListener === "function") {
+        takeoverBtn.addEventListener("click", onTakeOverClick);
+      } else {
+        takeoverBtn.onclick = onTakeOverClick;
+      }
+
       Object.defineProperty(window, "__agCuaCursorCtrl", {
         value: ctrl,
         configurable: true,
@@ -1609,7 +1908,7 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       const velNorm = codexClamp((Math.abs(sim.positionXSpring.velocity) + Math.abs(sim.positionYSpring.velocity)) * 0.5 / 3000, 0, 1);
       const fogScale = Math.round((1 + velNorm * 1.5) * 1000) / 1000;
       const rotRad = totalRot * (Math.PI / 180);
-      const bodyOff = 10.5 * press;
+      const bodyOff = 7.5 * press;
       const gx = Math.round(-Math.sin(rotRad) * bodyOff * 10) / 10;
       const gy = Math.round(Math.cos(rotRad) * bodyOff * 10) / 10;
       ctrl.glow.style.transform = \`translate3d(\${gx}px, \${gy}px, 0) scale(\${fogScale})\`;
@@ -1787,26 +2086,30 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       ctrl.highlightedRect = null;
     }
 
-    const shouldShowBadge = spec.showBadge !== undefined ? Boolean(spec.showBadge && spec.badge) : Boolean(spec.badge);
-    if (spec.badge != null && String(spec.badge).trim() !== "") {
-      ctrl.badgeText = String(spec.badge);
-      ctrl.badgeAccent = accent;
-    } else if (spec.badge === null) {
-      ctrl.badgeText = null;
-    }
-    ctrl.showBadgePill = shouldShowBadge;
+    // Mouse pill next to cursor is permanently suppressed (always null / hidden)
+    ctrl.badgeText = null;
+    ctrl.showBadgePill = false;
 
-    if (shouldShowBadge && ctrl.badgeText) {
-      ctrl.badgeLabel.textContent = ctrl.badgeText;
-      ctrl.dot.style.background = accent;
-      ctrl.badge.style.borderColor = "rgba(255, 255, 255, 0.24)";
-      ctrl.badge.classList.toggle("flip-x", tx > vw - 135);
-      ctrl.badge.classList.toggle("flip-y", ty > vh - 55);
-      ctrl.badge.style.display = "inline-flex";
-      ctrl.badge.style.opacity = "1";
-    } else {
-      ctrl.badge.style.opacity = "0";
-      ctrl.badge.style.display = "none";
+    if (spec.sessionChrome !== undefined) {
+      ctrl.sessionChromeActive = Boolean(spec.sessionChrome);
+    } else if (!ctrl.takenOver) {
+      ctrl.sessionChromeActive = true;
+    }
+    if (ctrl.sessionChrome) {
+      ctrl.sessionChrome.style.display = ctrl.sessionChromeActive ? "block" : "none";
+    }
+
+    if (spec.cursorOnlyChrome) {
+      return {
+        ok: true,
+        visible: Boolean(ctrl.visible),
+        active: Boolean(ctrl.sessionChromeActive),
+        sessionChromeActive: Boolean(ctrl.sessionChromeActive),
+        takenOver: Boolean(ctrl.takenOver),
+        baseScale: 0.72,
+        badge: null,
+        showBadge: false
+      };
     }
 
     if (spec.ripple) {
@@ -1826,7 +2129,7 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
           ring.style.top = \`\${ty}px\`;
           ring.style.borderColor = accent;
           ctrl.fxContainer.appendChild(ring);
-          setTimeout(() => ring.remove(), 820);
+          setTimeout(() => ring.remove(), 780);
         };
         spawnRing();
         for (let r = 1; r < count; r++) {
@@ -1840,8 +2143,8 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       ind.className = "ag-scroll-ind";
       const d = String(spec.scrollDirection).toLowerCase();
       ind.textContent = d.startsWith("u") ? "↑↑" : d.startsWith("l") ? "←←" : d.startsWith("r") ? "→→" : "↓↓";
-      ind.style.left = \`\${tx + 20}px\`;
-      ind.style.top = \`\${ty - 6}px\`;
+      ind.style.left = \`\${tx + 15}px\`;
+      ind.style.top = \`\${ty - 5}px\`;
       ctrl.fxContainer.appendChild(ind);
       setTimeout(() => ind.remove(), 500);
     }
@@ -1858,8 +2161,6 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
         ctrl.sim.visibilitySpring.target = 0;
       }
       ctrl.highlight.style.opacity = "0";
-      ctrl.badge.style.opacity = "0";
-      ctrl.badge.style.display = "none";
       ctrl.highlightedRect = null;
       ctrl.badgeText = null;
       ctrl.showBadgePill = false;
@@ -1876,24 +2177,67 @@ export function buildBrowserCursorOverlayExpr(spec = {}) {
       y: Math.round(ty),
       liveX: Math.round(ctrl.sim.point.x),
       liveY: Math.round(ctrl.sim.point.y),
-      badge: ctrl.badgeText,
-      showBadge: ctrl.showBadgePill,
+      baseScale: 0.72,
+      badge: null,
+      showBadge: false,
       highlightedRect: ctrl.highlightedRect
     };
   })()`;
 }
 
 /**
- * Snap active browser cursor, highlight, explicit badge, and recent ripple ring to deterministic full-visibility
- * computed styles right before `Page.captureScreenshot` (especially critical for occluded/background tabs
- * where requestAnimationFrame may be throttled), and restore cleanly afterward.
+ * Enable or disable the subtle active-tab sky-blue viewport border + top-right [Antigravity · Take Over] pill
+ * without moving or showing the virtual pointer itself.
+ */
+export function buildSetActiveTabIndicatorExpr(active = true) {
+  if (!active) {
+    return `(() => {
+      const ctrl = window.__agCuaCursorCtrl;
+      if (ctrl) {
+        ctrl.sessionChromeActive = false;
+        if (ctrl.sessionChrome) ctrl.sessionChrome.style.display = "none";
+      }
+      return { ok: true, sessionChromeActive: false };
+    })()`;
+  }
+  const initExpr = buildBrowserCursorOverlayExpr({ sessionChrome: true, cursorOnlyChrome: true });
+  return `(() => {
+    const existing = window.__agCuaCursorCtrl;
+    if (existing && existing.host && existing.host.isConnected) {
+      existing.takenOver = false;
+      existing.sessionChromeActive = true;
+      if (existing.sessionChrome) existing.sessionChrome.style.display = "block";
+      return { ok: true, sessionChromeActive: true };
+    }
+    const res = ${initExpr};
+    const ctrl = window.__agCuaCursorCtrl;
+    if (ctrl) {
+      ctrl.visible = false;
+      ctrl.layer.classList.remove("visible");
+      ctrl.layer.style.opacity = "0";
+      ctrl.takenOver = false;
+      ctrl.sessionChromeActive = true;
+      if (ctrl.sessionChrome) ctrl.sessionChrome.style.display = "block";
+    }
+    return res;
+  })()`;
+}
+
+/**
+ * Snap active browser cursor, highlight, and recent ripple ring to deterministic full-visibility
+ * computed styles right before `Page.captureScreenshot` (while hiding `.ag-session-chrome` so screenshots
+ * never show the active-tab border or Take Over button), and restore cleanly afterward.
  */
 export function buildPrepareBrowserCursorForScreenshotExpr(prepare = true, { awaitFrame = false } = {}) {
   const prepBool = Boolean(prepare);
   if (!prepBool) {
     return `(() => {
       const ctrl = window.__agCuaCursorCtrl;
-      if (!ctrl || !ctrl.fxContainer) return { ok: true };
+      if (!ctrl) return { ok: true };
+      if (ctrl.sessionChrome) {
+        ctrl.sessionChrome.style.display = ctrl.sessionChromeActive ? "block" : "none";
+      }
+      if (!ctrl.fxContainer) return { ok: true };
       for (const sr of ctrl.fxContainer.querySelectorAll(".ag-shot-ripple")) {
         sr.remove();
       }
@@ -1911,8 +2255,16 @@ export function buildPrepareBrowserCursorForScreenshotExpr(prepare = true, { awa
   }
   const syncBody = `
     const ctrl = window.__agCuaCursorCtrl;
-    if (!ctrl || !ctrl.visible || !ctrl.host || !ctrl.host.isConnected) {
+    if (!ctrl || !ctrl.host || !ctrl.host.isConnected) {
       return { ok: true, didPrep: false };
+    }
+    // Always hide active-tab viewport border & Take Over pill during screenshots!
+    if (ctrl.sessionChrome) {
+      ctrl.sessionChrome.style.display = "none";
+    }
+    if (!ctrl.visible) {
+      void ctrl.host.offsetWidth;
+      return { ok: true, didPrep: false, hidSessionChrome: true };
     }
     if (typeof ctrl.cancelScheduledFrame === "function") {
       ctrl.cancelScheduledFrame();
@@ -1955,19 +2307,12 @@ export function buildPrepareBrowserCursorForScreenshotExpr(prepare = true, { awa
       const pScale = ctrl.sim ? Math.max(0.7, Math.min(1, ctrl.sim.pressScaleSpring?.value ?? 1)) : 1;
       ctrl.ptrWrap.style.transform = \`rotate(316deg) scale(\${pScale}, \${pScale})\`;
       if (ctrl.glow) {
-        ctrl.glow.style.transform = "translate3d(7.3px, 7.6px, 0) scale(1)";
+        ctrl.glow.style.transform = "translate3d(5.2px, 5.4px, 0) scale(1)";
       }
     }
     if (ctrl.highlightedRect) {
       ctrl.highlight.classList.add("instant");
       ctrl.highlight.style.opacity = "1";
-    }
-    if (ctrl.showBadgePill && ctrl.badgeText) {
-      ctrl.badge.style.display = "inline-flex";
-      ctrl.badge.style.opacity = "1";
-    } else {
-      ctrl.badge.style.opacity = "0";
-      ctrl.badge.style.display = "none";
     }
     for (const old of ctrl.fxContainer.querySelectorAll(".ag-shot-ripple")) {
       old.remove();
@@ -1985,16 +2330,16 @@ export function buildPrepareBrowserCursorForScreenshotExpr(prepare = true, { awa
       const rAccent = ctrl.lastRipple?.accent || ctrl.badgeAccent || "#38bdf8";
       const rCount = Math.max(1, Math.min(3, Number(ctrl.lastRipple?.count) || 1));
       for (let i = 0; i < rCount; i++) {
-        const size = 44 + i * 14;
+        const size = 30 + i * 10;
         const ring = document.createElement("div");
         ring.className = "ag-shot-ripple";
         ring.style.left = \`\${rx}px\`;
         ring.style.top = \`\${ry}px\`;
         ring.style.width = \`\${size}px\`;
         ring.style.height = \`\${size}px\`;
-        ring.style.border = \`2.2px solid \${rAccent}\`;
-        ring.style.boxShadow = "0 0 6px rgba(56, 189, 248, 0.38)";
-        ring.style.opacity = i === 0 ? "0.90" : "0.65";
+        ring.style.border = \`1.6px solid \${rAccent}\`;
+        ring.style.boxShadow = "0 0 5px rgba(56, 189, 248, 0.34)";
+        ring.style.opacity = i === 0 ? "0.88" : "0.62";
         ctrl.fxContainer.appendChild(ring);
       }
     }
@@ -2055,7 +2400,7 @@ export function buildGetBrowserCursorStateExpr() {
   return `(() => {
     const ctrl = window.__agCuaCursorCtrl;
     if (!ctrl || !ctrl.host || !ctrl.host.isConnected) {
-      return { visible: false };
+      return { visible: false, badge: null, showBadge: false, baseScale: 0.72 };
     }
     return {
       visible: Boolean(ctrl.visible),
@@ -2066,8 +2411,11 @@ export function buildGetBrowserCursorStateExpr() {
       mode: ctrl.sim?.mode ?? "idle",
       rotation: ctrl.sim ? Math.round(ctrl.sim.rotation * 10) / 10 : 316,
       pressScale: ctrl.sim?.pressScaleSpring ? Math.round(ctrl.sim.pressScaleSpring.value * 1000) / 1000 : 1,
-      badge: ctrl.badgeText ?? null,
-      showBadge: Boolean(ctrl.showBadgePill),
+      baseScale: 0.72,
+      sessionChromeActive: Boolean(ctrl.sessionChromeActive),
+      takenOver: Boolean(ctrl.takenOver),
+      badge: null,
+      showBadge: false,
       highlightedRect: ctrl.highlightedRect ?? null
     };
   })()`;

@@ -181,7 +181,7 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
   assert.ok(cursorA, "Expected active virtual cursor state for winA");
   assert.equal(cursorA.visible, true);
   assert.ok(cursorA.opacity > 0.5, `Expected visible opacity > 0.5, got ${cursorA.opacity}`);
-  assert.equal(cursorA.badge, "Inspect A");
+  assert.equal(cursorA.badge, null, "Cursor badge pill must be permanently suppressed even when badge is passed");
   assert.ok(cursorA.highlightedBounds != null, "Expected highlightedBounds on winA");
   assert.equal(cursorA.screenX, Math.round(winA.bounds.x + cursorA.x));
   assert.equal(cursorA.screenY, Math.round(winA.bounds.y + cursorA.y));
@@ -251,7 +251,7 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
     );
   }
 
-  // Verify custom badge forwarding on perform_action (hover)
+  // Verify badge pill stays permanently suppressed even when badge is explicitly passed on perform_action (hover)
   const customHover = await bridge.performAction({
     windowId: winA.id,
     action: "hover",
@@ -261,7 +261,7 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
     badge: "Custom Action Badge",
     ripple: true,
   });
-  assert.equal(customHover.cursor?.badge, "Custom Action Badge");
+  assert.equal(customHover.cursor?.badge, null);
 
   // 3. Rapid concurrent retargeting on the same window (verifies CloseEnough callback flushing & zero deadlock)
   await Promise.all([
@@ -417,6 +417,8 @@ test("Browser ShadowRoot Cursor Expressions: Trusted Types CSP safety (zero inne
         if (k === "id") {
           this.id = String(v);
           elementsById.set(this.id, this);
+        } else if (k === "class") {
+          this.className = String(v);
         }
       },
       getAttribute(k) {
@@ -594,7 +596,8 @@ test("Browser ShadowRoot Cursor Expressions: Trusted Types CSP safety (zero inne
   );
   assert.equal(showRes.x, 200);
   assert.equal(showRes.y, 220);
-  assert.equal(showRes.badge, "Click");
+  assert.equal(showRes.badge, null, "Browser cursor badge must be permanently null");
+  assert.equal(cursorHost.shadowRoot.querySelector(".ag-badge"), null, "Zero .ag-badge elements may be rendered");
   assert.deepEqual(JSON.parse(JSON.stringify(showRes.highlightedRect)), { x: 120, y: 200, width: 160, height: 40 });
 
   // 3. Selector-based selectText (cursor_after) + Trusted-Types-safe HTML paste into #notes
@@ -618,7 +621,7 @@ test("Browser ShadowRoot Cursor Expressions: Trusted Types CSP safety (zero inne
   assert.equal(state1.visible, true);
   assert.equal(state1.x, 200);
   assert.equal(state1.y, 220);
-  assert.equal(state1.badge, "Click");
+  assert.equal(state1.badge, null);
 
   // 5. Verify BUILD_AX_SNAPSHOT_EXPR ignores #__ag_cua_cursor_host__ while indexing real elements
   const axSnap = vm.runInContext(BUILD_AX_SNAPSHOT_EXPR(), sandbox);
@@ -716,10 +719,22 @@ test("MCP Server End-to-End: cursor_control, browser_tab_action (hover/move/drag
         if (expr.includes("const spec =")) {
           const m = /const spec = (\{[\s\S]*?\});\n/.exec(expr);
           const spec = m ? JSON.parse(m[1]) : {};
+          if (spec.cursorOnlyChrome) {
+            return {
+              result: {
+                value: {
+                  ok: true,
+                  visible: mockTabDom.cursorHostVisible,
+                  active: Boolean(spec.sessionChrome),
+                  sessionChromeActive: Boolean(spec.sessionChrome),
+                },
+              },
+            };
+          }
           mockTabDom.cursorHostVisible = true;
           mockTabDom.cursorX = Math.round(spec.x ?? 0);
           mockTabDom.cursorY = Math.round(spec.y ?? 0);
-          mockTabDom.cursorBadge = spec.badge ?? null;
+          mockTabDom.cursorBadge = null;
           mockTabDom.cursorRect = spec.rect ?? null;
           return {
             result: {
@@ -869,14 +884,15 @@ test("MCP Server End-to-End: cursor_control, browser_tab_action (hover/move/drag
     await mcp.shutdown();
   });
 
-  // 1. Initialize & verify all 16 MCP tools including cursor_control
+  // 1. Initialize & verify all 17 MCP tools including cursor_control and browser_manage
   const initRes = await rpc("initialize", { protocolVersion: "2024-11-05" });
   assert.equal(initRes.result.serverInfo.name, "computer-use");
 
   const listRes = await rpc("tools/list", {});
   const toolNames = listRes.result.tools.map((tool) => tool.name);
   assert.ok(toolNames.includes("cursor_control"), "cursor_control tool must be registered");
-  assert.equal(toolNames.length, 16);
+  assert.ok(toolNames.includes("browser_manage"), "browser_manage tool must be registered");
+  assert.equal(toolNames.length, 17);
 
   // 2. Browser hover + click + set_value + drag + scroll with virtual cursor tracking
   const hoverCall = await rpc("tools/call", {
@@ -895,7 +911,7 @@ test("MCP Server End-to-End: cursor_control, browser_tab_action (hover/move/drag
   assert.equal(parsedTabCursor.tabCursor.visible, true);
   assert.equal(parsedTabCursor.tabCursor.x, 260);
   assert.equal(parsedTabCursor.tabCursor.y, 160);
-  assert.equal(parsedTabCursor.tabCursor.badge, "Hover");
+  assert.equal(parsedTabCursor.tabCursor.badge, null);
 
   // Clean screenshot vs include_cursor screenshot on browser tab
   const cleanTabShot = await rpc("tools/call", {
@@ -1107,6 +1123,8 @@ test("Safari / AppleEvents BrowserFallbackTabController End-to-End: JXA doJavaSc
         if (k === "id") {
           this.id = String(v);
           elementsById.set(this.id, this);
+        } else if (k === "class") {
+          this.className = String(v);
         }
       },
       getAttribute(k) {
@@ -1374,7 +1392,7 @@ test("Safari / AppleEvents BrowserFallbackTabController End-to-End: JXA doJavaSc
   const safariCursor = JSON.parse(safariCursorRes.result.content[0].text).tabCursor;
   assert.equal(safariCursor.visible, true);
   assert.equal(safariCursor.controlMode, "apple_events");
-  assert.equal(safariCursor.badge, "Safari Click");
+  assert.equal(safariCursor.badge, null);
   assert.equal(safariCursor.x, 170);
   assert.equal(safariCursor.y, 159);
 
@@ -1461,6 +1479,8 @@ test("Codex Browser ShadowRoot Appearance & Physics: AgentCursor Bezier SVG, Fog
         if (k === "id") {
           this.id = String(v);
           elementsById.set(this.id, this);
+        } else if (k === "class") {
+          this.className = String(v);
         }
       },
       getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; },
@@ -1558,14 +1578,20 @@ test("Codex Browser ShadowRoot Appearance & Physics: AgentCursor Bezier SVG, Fog
   );
   const host = elementsById.get("__ag_cua_cursor_host__");
   const sr = host.shadowRoot;
+  const geomGroup = sr.querySelector(".ag-pointer-geom");
+  assert.ok(geomGroup, "Expected daintier .ag-pointer-geom SVG group");
+  assert.equal(geomGroup.getAttribute("transform"), "scale(0.72)", "AgentCursor must render at daintier 0.72x scale");
   const svgPath = sr.querySelector("path");
   assert.ok(svgPath, "Expected SVG <path> inside Codex AgentCursor");
   assert.match(svgPath.getAttribute("d"), /^M -2\.691 1\.684 C -1\.613 -0\.414/, "Must render exact Codex AgentCursor rounded cubic Bezier silhouette");
   assert.equal(svgPath.getAttribute("stroke"), "#FFFFFF");
+  assert.equal(svgPath.getAttribute("stroke-width"), "2.78", "2.78 * 0.72 = ~2.00pt sleek white border");
   const styleEl = sr.querySelector("style");
   assert.match(styleEl.textContent, /rgba\(11,\s*158,\s*255/, "FogCursorStyle .ag-glow must render authentic sky-blue luminous mist");
+  assert.match(styleEl.textContent, /width:\s*27px;\s*height:\s*27px/, "FogCursorStyle .ag-glow must use 13.5pt radius (27px diameter)");
+  assert.match(styleEl.textContent, /width:\s*38px;\s*height:\s*38px[\s\S]*?border:\s*1\.6px solid/, "Click ripple .ag-ripple must use daintier 38px / 1.6px border");
   assert.ok(sr.querySelector(".ag-glow"), "Must render Codex FogCursorStyle ambient glow layer");
-  assert.equal(sr.querySelector(".ag-badge").style.display, "none", "Badge pill must stay hidden on screen when showBadge=false");
+  assert.equal(sr.querySelector(".ag-badge"), null, "Zero .ag-badge pill elements may exist in ShadowRoot");
 
   // 2. Short move <= 196px uses Scoot mode; long move > 196px uses curved Bezier mode
   const scootRes = vm.runInContext(
@@ -1595,7 +1621,7 @@ test("Codex Browser ShadowRoot Appearance & Physics: AgentCursor Bezier SVG, Fog
   assert.notEqual(mid.rotation, 316, "Mid-flight Bezier cursor must dynamically rotate along curve tangent");
 
   // 3. Trigger momentum-preserving click effect (effectOnly: true) before complete stop (CloseEnough handoff)
-  vm.runInContext(
+  const effectRes = vm.runInContext(
     buildBrowserCursorOverlayExpr({
       x: bezierTarget.x,
       y: bezierTarget.y,
@@ -1606,8 +1632,8 @@ test("Codex Browser ShadowRoot Appearance & Physics: AgentCursor Bezier SVG, Fog
     }),
     sandbox,
   );
-  assert.equal(sr.querySelector(".ag-badge").style.display, "inline-flex", "Explicit badge must display pill");
-  assert.equal(sr.querySelector(".ag-badge").children[1].textContent, "Explicit Pill");
+  assert.equal(effectRes.badge, null, "Cursor badge must remain null even when badge & showBadge=true are passed");
+  assert.equal(sr.querySelector(".ag-badge"), null, "Cursor pill must never be rendered even when showBadge=true");
 
   const pressSamples = stepFrames(6);
   const minPressScale = Math.min(...pressSamples.map((s) => s.pressScale));
@@ -1738,7 +1764,7 @@ withExtendedLifetime(delegate) { app.run() }
   assert.equal(clickB.mechanism, "coordinate");
   assert.equal(clickB.cursor.badge, null);
 
-  // 3. Explicit badge still renders when requested
+  // 3. Passing an explicit badge still suppresses the pill permanently (badge === null)
   const explicitHover = await bridge.performAction({
     windowId: wid,
     action: "hover",
@@ -1746,7 +1772,7 @@ withExtendedLifetime(delegate) { app.run() }
     y: titlebarH + 120,
     badge: "Explicit Coord Badge",
   });
-  assert.equal(explicitHover.cursor.badge, "Explicit Coord Badge");
+  assert.equal(explicitHover.cursor.badge, null, "Native cursor pill must remain permanently suppressed even when badge is passed");
 
   // 3.5. Pure [x, y] move (no elementIndex, no coordinateOnly flag) & natural [x, y] click without coordinateOnly
   const moveOnlyRes = await bridge.performAction({

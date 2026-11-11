@@ -1,29 +1,73 @@
 import { spawn, execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   BUILD_AX_SNAPSHOT_EXPR,
+  buildAppendUploadChunkExpr,
   buildBrowserCursorOverlayExpr,
+  buildCommitDataTransferUploadExpr,
   buildGetActiveElementAnchorExpr,
   buildGetBrowserCursorStateExpr,
+  buildInitUploadStagingExpr,
   buildPasteExpr,
   buildPrepareBrowserCursorForScreenshotExpr,
   buildPrepareElementExpr,
   buildRemoveBrowserCursorExpr,
   buildSecondaryActionExpr,
   buildSelectTextExpr,
+  buildSetActiveTabIndicatorExpr,
   buildSetBrowserCursorTemporarilyHiddenExpr,
   buildSetValueExpr,
 } from "./browser-ax.mjs";
+import { ExtensionBridgeManager, ExtensionCDPConnection } from "./extension-bridge.mjs";
 import { CDP_MODIFIER_BITS, parseCDPKeyChord } from "./keys.mjs";
+import { assertSafeBrowserUrl, detectCaptchaChallenge } from "./safety-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const PROFILES_DIR = path.join(PROJECT_ROOT, ".browser-profiles");
+const DEFAULT_DOWNLOAD_DIR = path.join(os.tmpdir(), "antigravity-downloads");
+const RING_BUFFER_LIMIT = 500;
+
+const MIME_BY_EXT = {
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".tsv": "text/tab-separated-values",
+  ".json": "application/json",
+  ".html": "text/html",
+  ".htm": "text/html",
+  ".xml": "application/xml",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
+
+function guessMimeType(filePath) {
+  const ext = path.extname(String(filePath || "")).toLowerCase();
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
 
 const DEFAULT_CDP_PORTS = [9223, 9222, 9224, 9229, 9333];
 
@@ -101,12 +145,17 @@ function getFreePort() {
 /**
  * Multiplexed WebSocket CDP Connection supporting browser-level Target.attachToTarget(flatten: true)
  */
-export class CDPMultiplexConnection {
+export class CDPMultiplexConnection extends EventEmitter {
   /**
    * @param {string} wsUrl
+   * @param {{ downloadDir?: string }} [opts]
    */
-  constructor(wsUrl) {
+  constructor(wsUrl, opts = {}) {
+    super();
     this.wsUrl = wsUrl;
+    this.isExtension = false;
+    this.downloadDir = opts.downloadDir || DEFAULT_DOWNLOAD_DIR;
+    this._downloadConfigured = false;
     /** @type {WebSocket | null} */
     this.ws = null;
     this.connecting = null;
@@ -115,6 +164,10 @@ export class CDPMultiplexConnection {
     this.pending = new Map();
     /** @type {Map<string, string>} targetId -> sessionId */
     this.targetSessions = new Map();
+    /** @type {Map<string, { parentSessionId: string | null, targetInfo: any }>} childSessionId -> route */
+    this.childSessions = new Map();
+    /** @type {Map<string, any>} guid -> download info */
+    this.downloadsByGuid = new Map();
   }
 
   async connect() {
@@ -144,10 +197,66 @@ export class CDPMultiplexConnection {
         } catch {
           return;
         }
+        if (msg.method === "Target.attachedToTarget" && msg.params?.sessionId) {
+          this.childSessions.set(msg.params.sessionId, {
+            parentSessionId: msg.sessionId || null,
+            targetInfo: msg.params.targetInfo || {},
+          });
+        }
         if (msg.method === "Target.detachedFromTarget" && msg.params?.sessionId) {
+          this.childSessions.delete(msg.params.sessionId);
           for (const [tId, sId] of this.targetSessions.entries()) {
-            if (sId === msg.params.sessionId) this.targetSessions.delete(tId);
+            if (sId === msg.params.sessionId) {
+              this.targetSessions.delete(tId);
+              this.emit("cdpDetached", {
+                targetId: tId,
+                sessionId: msg.params.sessionId,
+                reason: "target_detached",
+              });
+            }
           }
+        }
+        if (msg.method === "Browser.downloadWillBegin" && msg.params?.guid) {
+          try {
+            fs.mkdirSync(this.downloadDir, { recursive: true });
+          } catch {}
+          const item = {
+            id: msg.params.guid,
+            guid: msg.params.guid,
+            frameId: msg.params.frameId || null,
+            url: msg.params.url || "",
+            suggestedFilename: msg.params.suggestedFilename || msg.params.guid,
+            filename: path.join(this.downloadDir, msg.params.suggestedFilename || msg.params.guid),
+            state: "in_progress",
+            bytesReceived: 0,
+            totalBytes: -1,
+            startTime: new Date().toISOString(),
+            endTime: "",
+          };
+          this.downloadsByGuid.set(msg.params.guid, item);
+          this.emit("downloadEvent", { event: "created", item });
+        } else if (msg.method === "Browser.downloadProgress" && msg.params?.guid) {
+          const prev = this.downloadsByGuid.get(msg.params.guid) || {
+            id: msg.params.guid,
+            guid: msg.params.guid,
+            filename: path.join(this.downloadDir, msg.params.guid),
+          };
+          const mappedState =
+            msg.params.state === "completed"
+              ? "complete"
+              : msg.params.state === "canceled"
+                ? "interrupted"
+                : "in_progress";
+          const next = {
+            ...prev,
+            ...(msg.params.filePath ? { filename: msg.params.filePath } : {}),
+            state: mappedState,
+            bytesReceived: msg.params.receivedBytes ?? prev.bytesReceived ?? 0,
+            totalBytes: msg.params.totalBytes ?? prev.totalBytes ?? -1,
+            ...(mappedState !== "in_progress" ? { endTime: new Date().toISOString() } : {}),
+          };
+          this.downloadsByGuid.set(msg.params.guid, next);
+          this.emit("downloadEvent", { event: "changed", item: next });
         }
         if (
           msg.method === "Page.screencastFrame" &&
@@ -164,6 +273,27 @@ export class CDPMultiplexConnection {
               }),
             );
           } catch {}
+          return;
+        }
+        if (msg.method && msg.id == null) {
+          const child = msg.sessionId ? this.childSessions.get(msg.sessionId) : null;
+          const rootSessionId = child?.parentSessionId || msg.sessionId || null;
+          let targetId = null;
+          if (rootSessionId) {
+            for (const [tId, sId] of this.targetSessions.entries()) {
+              if (sId === rootSessionId) {
+                targetId = tId;
+                break;
+              }
+            }
+          }
+          this.emit("cdpEvent", {
+            targetId,
+            sessionId: msg.sessionId || null,
+            rootSessionId,
+            method: msg.method,
+            params: msg.params || {},
+          });
           return;
         }
         if (msg.id != null) {
@@ -184,6 +314,7 @@ export class CDPMultiplexConnection {
         if (this.ws === ws) this.ws = null;
         this.connecting = null;
         this.targetSessions.clear();
+        this.childSessions.clear();
         const reason = err instanceof Error ? err : new Error("CDP WebSocket closed");
         for (const [, p] of this.pending) {
           clearTimeout(p.timer);
@@ -239,9 +370,32 @@ export class CDPMultiplexConnection {
       targetId,
       flatten: true,
     });
+    if (!this._downloadConfigured) {
+      this._downloadConfigured = true;
+      try {
+        fs.mkdirSync(this.downloadDir, { recursive: true });
+      } catch {}
+      await this.send("Browser.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: this.downloadDir,
+        eventsEnabled: true,
+      }).catch(() => {});
+    }
     await this.send("Page.enable", {}, sessionId).catch(() => {});
     await this.send("Runtime.enable", {}, sessionId).catch(() => {});
     await this.send("DOM.enable", {}, sessionId).catch(() => {});
+    await this.send("Network.enable", {}, sessionId).catch(() => {});
+    await this.send("Runtime.addBinding", { name: "__agCuaControl" }, sessionId).catch(() => {});
+    await this.send(
+      "Target.setAutoAttach",
+      {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+        filter: [{ type: "iframe", exclude: false }],
+      },
+      sessionId,
+    ).catch(() => {});
     this.targetSessions.set(targetId, sessionId);
     return sessionId;
   }
@@ -257,7 +411,7 @@ export class CDPMultiplexConnection {
 }
 
 /**
- * Controllable CDP Browser Tab — implements full Codex Tab & Target interface + Playwright-style locator()
+ * Controllable CDP Browser Tab — implements full Codex Tab & Target interface + Playwright-style locator() & frameLocator()
  */
 export class CDPTabController {
   /**
@@ -266,9 +420,16 @@ export class CDPTabController {
    *   targetId: string,
    *   browserId: string,
    *   httpEndpoint: string,
-   *   conn: CDPMultiplexConnection,
+   *   conn: CDPMultiplexConnection | ExtensionCDPConnection,
    *   diffTracker: import("./diff.mjs").AXDiffTracker,
-   *   onClosed?: (id: string) => void
+   *   onClosed?: (id: string) => void,
+   *   sessionIdName?: string,
+   *   title?: string,
+   *   url?: string,
+   *   tabGroup?: any,
+   *   groupId?: number,
+   *   windowId?: number,
+   *   ownership?: any
    * }} cfg
    */
   constructor(cfg) {
@@ -277,11 +438,24 @@ export class CDPTabController {
     this.browserId = cfg.browserId;
     this.httpEndpoint = cfg.httpEndpoint;
     this.conn = cfg.conn;
+    this.isExtensionTab = Boolean(this.conn?.isExtension);
+    this.chromeTabId = this.isExtensionTab ? ExtensionCDPConnection.parseChromeTabId(this.targetId) : null;
+    this.sessionIdName = cfg.sessionIdName || "default";
+    this.controllableViaCDP = true;
+    this.controlMode = this.isExtensionTab ? "extension_cdp" : "cdp";
     this.diffTracker = cfg.diffTracker;
     this.onClosed = cfg.onClosed;
     this.getCursorConfig = cfg.getCursorConfig;
     this.screencastActive = false;
     this.screencastTimer = null;
+    this.cachedMeta = {
+      title: cfg.title ?? "",
+      url: cfg.url ?? "",
+      tabGroup: cfg.tabGroup ?? null,
+      groupId: cfg.groupId ?? -1,
+      windowId: cfg.windowId ?? null,
+      ownership: cfg.ownership ?? null,
+    };
     this.cursorState = {
       visible: false,
       x: null,
@@ -290,18 +464,324 @@ export class CDPTabController {
       highlightedRect: null,
       updatedAt: 0,
     };
+    this.consoleLogs = [];
+    this.networkRequests = [];
+    this.networkById = new Map();
+    this.activeDialog = null;
+    this._dialogWaiters = new Set();
+    this._navigatingByAgent = false;
+    this.childFrames = new Map();
+    this.takenOverByUser = false;
+    this._activeIndicatorInjected = false;
+
+    this._boundCdpEvent = (ev) => this._handleConnEvent(ev);
+    this._boundCdpDetached = (ev) => this._handleConnDetached(ev);
+    if (typeof this.conn?.on === "function") {
+      this.conn.on("cdpEvent", this._boundCdpEvent);
+      this.conn.on("cdpDetached", this._boundCdpDetached);
+    }
+  }
+
+  _matchesTabEvent(ev) {
+    if (!ev) return false;
+    if (this.isExtensionTab && this.chromeTabId != null && ev.tabId != null) {
+      return Number(ev.tabId) === this.chromeTabId;
+    }
+    if (ev.targetId && ev.targetId === this.targetId) return true;
+    const rootSession = this.conn.targetSessions?.get(this.targetId);
+    if (rootSession && (ev.sessionId === rootSession || ev.rootSessionId === rootSession)) return true;
+    if (ev.sessionId && this.childFrames.has(ev.sessionId)) return true;
+    return false;
+  }
+
+  _handleConnEvent(ev) {
+    if (!this._matchesTabEvent(ev)) return;
+    const { method, params = {} } = ev;
+
+    if (method === "Target.attachedToTarget" && params.sessionId && params.targetInfo?.type === "iframe") {
+      const childSessionId = params.sessionId;
+      this.childFrames.set(childSessionId, {
+        sessionId: childSessionId,
+        targetId: params.targetInfo.targetId || "",
+        url: params.targetInfo.url || "",
+        title: params.targetInfo.title || "",
+      });
+      this.conn.send("Runtime.enable", {}, childSessionId).catch(() => {});
+      this.conn.send("DOM.enable", {}, childSessionId).catch(() => {});
+      this.conn.send("Page.enable", {}, childSessionId).catch(() => {});
+      return;
+    }
+
+    if (method === "Target.detachedFromTarget" && params.sessionId) {
+      this.childFrames.delete(params.sessionId);
+      return;
+    }
+
+    if (method === "Runtime.bindingCalled" && params.name === "__agCuaControl") {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(params.payload || "{}"));
+      } catch {}
+      if (payload?.action === "take_over") {
+        this._handleUserTakeOver("take_over_button").catch(() => {});
+      }
+      return;
+    }
+
+    if (method === "Page.loadEventFired" || (method === "Page.frameNavigated" && !params.frame?.parentId)) {
+      if (this.conn.targetSessions?.has(this.targetId) && !this.takenOverByUser) {
+        const sid = this.conn.targetSessions.get(this.targetId);
+        if (sid) {
+          this.conn
+            .send(
+              "Runtime.evaluate",
+              { expression: buildSetActiveTabIndicatorExpr(true), returnByValue: true },
+              sid,
+              2000,
+            )
+            .catch(() => {});
+        }
+      }
+      return;
+    }
+
+    if (method === "Page.javascriptDialogOpening") {
+      const dlg = {
+        type: params.type || "alert",
+        message: params.message ?? "",
+        url: params.url || "",
+        defaultPrompt: params.defaultPrompt ?? "",
+        hasBrowserHandler: Boolean(params.hasBrowserHandler),
+        openedAt: Date.now(),
+      };
+      if (dlg.type === "beforeunload" && this._navigatingByAgent) {
+        this.send("Page.handleJavaScriptDialog", { accept: true }, 3000).catch(() => {});
+        return;
+      }
+      this.activeDialog = dlg;
+      for (const resolveWaiter of Array.from(this._dialogWaiters)) {
+        this._dialogWaiters.delete(resolveWaiter);
+        try {
+          resolveWaiter(dlg);
+        } catch {}
+      }
+      return;
+    }
+
+    if (method === "Page.javascriptDialogClosed") {
+      this.activeDialog = null;
+      return;
+    }
+
+    if (method === "Runtime.consoleAPICalled") {
+      const args = Array.isArray(params.args) ? params.args : [];
+      const text = args
+        .map((a) => {
+          if (a == null) return "";
+          if (a.value !== undefined) {
+            return typeof a.value === "string" ? a.value : JSON.stringify(a.value);
+          }
+          return a.description || a.unserializableValue || `[${a.type || "object"}]`;
+        })
+        .join(" ");
+      const topFrame = params.stackTrace?.callFrames?.[0] || null;
+      this.consoleLogs.push({
+        level: params.type || "log",
+        text,
+        timestamp: params.timestamp || Date.now(),
+        url: topFrame?.url || "",
+        lineNumber: topFrame?.lineNumber ?? null,
+      });
+      if (this.consoleLogs.length > RING_BUFFER_LIMIT) {
+        this.consoleLogs.shift();
+      }
+      return;
+    }
+
+    if (method === "Runtime.exceptionThrown") {
+      const det = params.exceptionDetails || {};
+      const text = det.exception?.description || det.text || "Uncaught exception";
+      this.consoleLogs.push({
+        level: "exception",
+        text,
+        timestamp: params.timestamp || Date.now(),
+        url: det.url || "",
+        lineNumber: det.lineNumber ?? null,
+      });
+      if (this.consoleLogs.length > RING_BUFFER_LIMIT) {
+        this.consoleLogs.shift();
+      }
+      return;
+    }
+
+    if (method === "Network.requestWillBeSent" && params.requestId) {
+      const rid = String(params.requestId);
+      let entry = this.networkById.get(rid);
+      if (!entry) {
+        entry = {
+          requestId: rid,
+          url: params.request?.url || "",
+          method: params.request?.method || "GET",
+          resourceType: params.type || "Other",
+          requestHeaders: params.request?.headers || {},
+          postData: params.request?.postData ?? null,
+          status: null,
+          statusText: "",
+          mimeType: "",
+          responseHeaders: {},
+          encodedDataLength: 0,
+          errorText: null,
+          canceled: false,
+          startedAt: Date.now(),
+          finishedAt: null,
+        };
+        this.networkRequests.push(entry);
+        this.networkById.set(rid, entry);
+        if (this.networkRequests.length > RING_BUFFER_LIMIT) {
+          const evicted = this.networkRequests.shift();
+          if (evicted && this.networkById.get(evicted.requestId) === evicted) {
+            this.networkById.delete(evicted.requestId);
+          }
+        }
+      } else {
+        entry.url = params.request?.url || entry.url;
+        entry.method = params.request?.method || entry.method;
+      }
+      return;
+    }
+
+    if (method === "Network.responseReceived" && params.requestId) {
+      const entry = this.networkById.get(String(params.requestId));
+      if (entry && params.response) {
+        entry.status = params.response.status ?? entry.status;
+        entry.statusText = params.response.statusText ?? entry.statusText;
+        entry.mimeType = params.response.mimeType ?? entry.mimeType;
+        entry.responseHeaders = params.response.headers ?? entry.responseHeaders;
+      }
+      return;
+    }
+
+    if (method === "Network.loadingFinished" && params.requestId) {
+      const entry = this.networkById.get(String(params.requestId));
+      if (entry) {
+        entry.encodedDataLength = params.encodedDataLength ?? entry.encodedDataLength;
+        entry.finishedAt = Date.now();
+      }
+      return;
+    }
+
+    if (method === "Network.loadingFailed" && params.requestId) {
+      const entry = this.networkById.get(String(params.requestId));
+      if (entry) {
+        entry.errorText = params.errorText || "Loading failed";
+        entry.canceled = Boolean(params.canceled);
+        entry.finishedAt = Date.now();
+      }
+    }
+  }
+
+  _handleConnDetached(ev) {
+    const matches =
+      (this.isExtensionTab && this.chromeTabId != null && Number(ev?.tabId) === this.chromeTabId) ||
+      (ev?.targetId && ev.targetId === this.targetId);
+    if (!matches) return;
+    this._activeIndicatorInjected = false;
+    this.screencastActive = false;
+    this.cursorState.visible = false;
+    if (ev?.reason === "canceled_by_user") {
+      this._handleUserTakeOver("canceled_by_user").catch(() => {});
+    }
+  }
+
+  async _handleUserTakeOver(reason = "take_over_button") {
+    this.takenOverByUser = true;
+    this.cursorState.visible = false;
+    this._activeIndicatorInjected = false;
+    this.stopCompositorAwake({ sendStop: false });
+
+    const sid = this.conn.targetSessions?.get(this.targetId);
+    if (reason === "take_over_button" && sid) {
+      await this.conn
+        .send("Runtime.evaluate", { expression: buildRemoveBrowserCursorExpr(), returnByValue: true }, sid, 800)
+        .catch(() => {});
+    }
+
+    if (this.isExtensionTab && this.chromeTabId != null) {
+      this.conn.targetSessions?.delete(this.targetId);
+      await this.conn.client
+        .request("markTab", {
+          sessionId: this.sessionIdName,
+          tabId: this.chromeTabId,
+          status: "handoff",
+          activate: false,
+        })
+        .catch(() => {});
+    } else if (sid) {
+      this.conn.targetSessions?.delete(this.targetId);
+      await this.conn.send("Target.detachFromTarget", { sessionId: sid }, undefined, 1500).catch(() => {});
+    }
+  }
+
+  async _raceWithDialog(opPromise, { settleDelayMs = 35 } = {}) {
+    if (this.activeDialog) {
+      opPromise.catch(() => {});
+      const raceRes = await Promise.race([
+        opPromise.then((v) => ({ done: true, value: v })),
+        sleep(settleDelayMs).then(() => ({ done: false, dialog: this.activeDialog })),
+      ]);
+      return raceRes;
+    }
+
+    let waiterFn = null;
+    const dialogTriggered = new Promise((resolve) => {
+      waiterFn = (dlg) => {
+        setTimeout(() => resolve({ done: false, dialog: dlg }), settleDelayMs);
+      };
+      this._dialogWaiters.add(waiterFn);
+    });
+
+    try {
+      return await Promise.race([
+        opPromise.then((v) => ({ done: true, value: v })),
+        dialogTriggered.then((res) => {
+          opPromise.catch(() => {});
+          return res;
+        }),
+      ]);
+    } finally {
+      if (waiterFn) this._dialogWaiters.delete(waiterFn);
+    }
   }
 
   async send(method, params = {}, timeoutMs = 15000) {
+    const injectIndicatorIfFirstAttach = (wasAttached, sessionId) => {
+      if (!wasAttached && !this._activeIndicatorInjected && method !== "Page.captureScreenshot") {
+        this._activeIndicatorInjected = true;
+        this.takenOverByUser = false;
+        this.conn
+          .send(
+            "Runtime.evaluate",
+            { expression: buildSetActiveTabIndicatorExpr(true), returnByValue: true },
+            sessionId,
+            2000,
+          )
+          .catch(() => {});
+      }
+    };
+
     try {
+      const wasAttached = Boolean(this.conn.targetSessions?.has(this.targetId));
       const sessionId = await this.conn.ensureTargetSession(this.targetId);
+      injectIndicatorIfFirstAttach(wasAttached, sessionId);
       return await this.conn.send(method, params, sessionId, timeoutMs);
     } catch (err) {
       // Retry once if session detached (e.g. cross-process navigation)
-      if (/Session with given id not found|No session|Target closed/i.test(err.message)) {
+      if (/Session with given id not found|No session|Target closed|Debugger is not attached/i.test(err.message)) {
         this.conn.targetSessions.delete(this.targetId);
+        this._activeIndicatorInjected = false;
         this.screencastActive = false;
         const sessionId = await this.conn.ensureTargetSession(this.targetId);
+        injectIndicatorIfFirstAttach(false, sessionId);
         return await this.conn.send(method, params, sessionId, timeoutMs);
       }
       throw err;
@@ -371,12 +851,14 @@ export class CDPTabController {
 
   async showVirtualCursor(spec = {}, { showCursor = true } = {}) {
     const cfg = this.getCursorConfig?.() ?? { enabled: true, idleTimeoutMs: 8000 };
-    if (showCursor === false || cfg.enabled === false) return null;
+    if (showCursor === false || cfg.enabled === false || this.activeDialog) return null;
     await this.ensureCompositorAwake();
     try {
       const res = await this.evaluate(
         buildBrowserCursorOverlayExpr({
           ...spec,
+          badge: null,
+          showBadge: false,
           idleTimeoutMs: cfg.idleTimeoutMs,
           instant: cfg.glideEnabled === false ? true : Boolean(spec.instant),
         }),
@@ -386,7 +868,7 @@ export class CDPTabController {
           visible: true,
           x: res.x,
           y: res.y,
-          badge: res.badge ?? null,
+          badge: null,
           highlightedRect: res.highlightedRect ?? null,
           updatedAt: Date.now(),
         };
@@ -410,14 +892,39 @@ export class CDPTabController {
     return res;
   }
 
-  async hideCursor() {
+  async hideCursor({ keepActiveIndicator = true } = {}) {
     this.cursorState.visible = false;
     this.stopCompositorAwake();
     await this.evaluate(buildRemoveBrowserCursorExpr()).catch(() => null);
+    if (keepActiveIndicator && this.conn.targetSessions?.has(this.targetId) && !this.takenOverByUser) {
+      await this.evaluate(buildSetActiveTabIndicatorExpr(true)).catch(() => null);
+    }
     return { ok: true, tabId: this.id, visible: false };
   }
 
+  async detach() {
+    this.cursorState.visible = false;
+    this._activeIndicatorInjected = false;
+    this.stopCompositorAwake({ sendStop: false });
+    const sid = this.conn.targetSessions?.get(this.targetId);
+    if (sid && !this.activeDialog) {
+      await this.conn
+        .send("Runtime.evaluate", { expression: buildRemoveBrowserCursorExpr(), returnByValue: true }, sid, 1200)
+        .catch(() => {});
+    }
+    if (this.isExtensionTab && this.chromeTabId != null) {
+      await this.conn.detachTab(this.chromeTabId);
+    } else if (sid) {
+      this.conn.targetSessions.delete(this.targetId);
+      await this.conn.send("Target.detachFromTarget", { sessionId: sid }, undefined, 1500).catch(() => {});
+    }
+    return { ok: true, tabId: this.id, detached: true };
+  }
+
   async getCursorState() {
+    if (this.activeDialog) {
+      return { tabId: this.id, browserId: this.browserId, visible: false, badge: null };
+    }
     const domState = await this.evaluate(buildGetBrowserCursorStateExpr()).catch(() => ({ visible: false }));
     if (domState?.visible) {
       this.cursorState = {
@@ -425,7 +932,7 @@ export class CDPTabController {
         visible: true,
         x: domState.x,
         y: domState.y,
-        badge: domState.badge,
+        badge: null,
         highlightedRect: domState.highlightedRect,
       };
     } else {
@@ -435,23 +942,49 @@ export class CDPTabController {
       tabId: this.id,
       browserId: this.browserId,
       ...domState,
+      badge: null,
     };
   }
 
   async getMetadata() {
+    if (this.isExtensionTab && this.chromeTabId != null) {
+      const t = await this.conn.client.request("getTab", { tabId: this.chromeTabId }, 3000).catch(() => null);
+      if (t) {
+        this.cachedMeta.title = t.title ?? this.cachedMeta.title;
+        this.cachedMeta.url = t.url ?? this.cachedMeta.url;
+        this.cachedMeta.groupId = t.groupId ?? this.cachedMeta.groupId;
+        this.cachedMeta.windowId = t.windowId ?? this.cachedMeta.windowId;
+      }
+      return {
+        id: this.id,
+        providerTabId: this.targetId,
+        chromeTabId: this.chromeTabId,
+        browserId: this.browserId,
+        controlMode: "extension_cdp",
+        title: this.cachedMeta.title || "",
+        url: this.cachedMeta.url || "",
+        tabGroup: this.cachedMeta.tabGroup || null,
+        ownership: this.cachedMeta.ownership || null,
+      };
+    }
+
     const { targetInfo } = await this.conn.send("Target.getTargetInfo", { targetId: this.targetId });
+    this.cachedMeta.title = targetInfo?.title ?? "";
+    this.cachedMeta.url = targetInfo?.url ?? "";
     return {
       id: this.id,
       providerTabId: this.targetId,
       browserId: this.browserId,
-      title: targetInfo?.title ?? "",
-      url: targetInfo?.url ?? "",
+      controlMode: "cdp",
+      title: this.cachedMeta.title,
+      url: this.cachedMeta.url,
     };
   }
 
   async waitForDomSettled(maxWaitMs = 1500) {
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
+      if (this.activeDialog) return;
       try {
         const res = await this.send(
           "Runtime.evaluate",
@@ -475,11 +1008,25 @@ export class CDPTabController {
 
   isPrivilegedNewTab(url) {
     const u = String(url ?? "").trim().toLowerCase();
-    return u.startsWith("chrome://") || u.startsWith("brave://") || u.startsWith("edge://") || u.startsWith("devtools://");
+    return (
+      u.startsWith("chrome://") ||
+      u.startsWith("brave://") ||
+      u.startsWith("edge://") ||
+      u.startsWith("arc://") ||
+      u.startsWith("devtools://") ||
+      u.startsWith("chrome-extension://")
+    );
+  }
+
+  _formatActiveDialogBanner() {
+    if (!this.activeDialog) return null;
+    const d = this.activeDialog;
+    const promptPart = d.defaultPrompt ? ` defaultPrompt=${JSON.stringify(d.defaultPrompt)}` : "";
+    return `[JS DIALOG OPEN: type="${d.type}" message=${JSON.stringify(d.message)}${promptPart} — call browser_tab_action action="handle_dialog" (accept=true/false, prompt_text=...) before interacting with DOM]`;
   }
 
   /**
-   * Capture indexed AX/DOM state with Codex-compatible diffing.
+   * Capture indexed AX/DOM state with Codex-compatible diffing, JS dialog surfacing, and CAPTCHA handoff detection.
    */
   async getAXState(options = {}) {
     const meta = await this.getMetadata();
@@ -496,13 +1043,71 @@ export class CDPTabController {
       };
     }
 
-    await this.waitForDomSettled(1200);
-    const evalRes = await this.send("Runtime.evaluate", {
-      expression: BUILD_AX_SNAPSHOT_EXPR(options.maxElements ?? 600),
-      returnByValue: true,
-      awaitPromise: false,
-    });
+    if (this.activeDialog) {
+      const dialogBanner = this._formatActiveDialogBanner();
+      const quickEval = await Promise.race([
+        this.send(
+          "Runtime.evaluate",
+          {
+            expression: BUILD_AX_SNAPSHOT_EXPR(options.maxElements ?? 600),
+            returnByValue: true,
+            awaitPromise: false,
+          },
+          400,
+        ).catch(() => null),
+        sleep(220).then(() => null),
+      ]);
+      if (!quickEval || quickEval.exceptionDetails) {
+        const header = `Tab #${this.id} "${meta.title}" url="${meta.url}"`;
+        const fullTree = [
+          dialogBanner,
+          header,
+          `  (DOM main thread paused by active JavaScript '${this.activeDialog.type}' dialog — handle dialog first)`,
+        ].join("\n");
+        const formatted = this.diffTracker.format(diffKey, fullTree, options);
+        return {
+          stateText: formatted.text,
+          fullTree,
+          isDiff: formatted.isDiff,
+          unchanged: formatted.unchanged,
+          elementCount: 0,
+          dialog: { ...this.activeDialog },
+          meta,
+        };
+      }
+    }
 
+    await this.waitForDomSettled(1200);
+    const evalRace = await this._raceWithDialog(
+      this.send("Runtime.evaluate", {
+        expression: BUILD_AX_SNAPSHOT_EXPR(options.maxElements ?? 600),
+        returnByValue: true,
+        awaitPromise: false,
+      }),
+      { settleDelayMs: 60 },
+    );
+
+    if (!evalRace.done) {
+      const dialogBanner = this._formatActiveDialogBanner();
+      const header = `Tab #${this.id} "${meta.title}" url="${meta.url}"`;
+      const fullTree = [
+        ...(dialogBanner ? [dialogBanner] : []),
+        header,
+        `  (DOM main thread paused by active JavaScript '${this.activeDialog?.type || "alert"}' dialog — handle dialog first)`,
+      ].join("\n");
+      const formatted = this.diffTracker.format(diffKey, fullTree, options);
+      return {
+        stateText: formatted.text,
+        fullTree,
+        isDiff: formatted.isDiff,
+        unchanged: formatted.unchanged,
+        elementCount: 0,
+        ...(this.activeDialog ? { dialog: { ...this.activeDialog } } : {}),
+        meta,
+      };
+    }
+
+    const evalRes = evalRace.value;
     if (evalRes.exceptionDetails) {
       throw new Error(
         `Failed to inspect tab DOM: ${evalRes.exceptionDetails.text || evalRes.exceptionDetails.exception?.description}`,
@@ -516,24 +1121,43 @@ export class CDPTabController {
       scroll: { x: 0, y: 0 },
       elementCount: 0,
       lines: [],
+      captchaSignals: [],
     };
 
+    const dialogBanner = this._formatActiveDialogBanner();
+    const captcha = detectCaptchaChallenge(snap);
     const header = `Tab #${this.id} "${snap.title}" url="${snap.url}" viewport=${snap.viewport.width}x${snap.viewport.height} scroll=(${snap.scroll.x},${snap.scroll.y})`;
-    const fullTree = [header, ...(snap.lines ?? [])].join("\n");
+    const treeParts = [
+      ...(dialogBanner ? [dialogBanner] : []),
+      header,
+      ...(snap.lines ?? []),
+      ...(captcha.detected && captcha.banner ? [captcha.banner] : []),
+    ];
+    const fullTree = treeParts.join("\n");
     const formatted = this.diffTracker.format(diffKey, fullTree, options);
+    let stateText = formatted.text;
+    if (captcha.detected && captcha.banner && !stateText.includes(captcha.banner)) {
+      stateText = `${stateText}\n${captcha.banner}`;
+    }
+    if (dialogBanner && !stateText.includes(dialogBanner)) {
+      stateText = `${dialogBanner}\n${stateText}`;
+    }
 
     return {
-      stateText: formatted.text,
+      stateText,
       fullTree,
       isDiff: formatted.isDiff,
       unchanged: formatted.unchanged,
       elementCount: snap.elementCount,
+      captchaDetected: captcha.detected,
+      ...(captcha.detected ? { captchaProviders: captcha.providers } : {}),
+      ...(this.activeDialog ? { dialog: { ...this.activeDialog } } : {}),
       ...(this.isCursorCurrentlyVisible()
         ? {
             cursor: {
               x: this.cursorState.x,
               y: this.cursorState.y,
-              badge: this.cursorState.badge,
+              badge: null,
               highlightedRect: this.cursorState.highlightedRect,
             },
           }
@@ -548,7 +1172,7 @@ export class CDPTabController {
 
   /**
    * Capture background tab screenshot via CDP Page.captureScreenshot (requires zero macOS Screen Recording TCC).
-   * Hides the virtual cursor overlay by default so OCR stays unoccluded unless includeCursor: true is passed.
+   * Hides the virtual cursor overlay (and active-tab Take Over pill/border) by default so screenshots stay clean.
    */
   async getScreenshot({ markOnly = true, format = "jpeg", quality = 82, includeCursor = false } = {}) {
     if (markOnly) {
@@ -557,15 +1181,17 @@ export class CDPTabController {
     const fmt = format === "png" ? "png" : "jpeg";
     let didHideOverlay = false;
     let didPrepCursor = false;
-    if (!includeCursor) {
-      const hideRes = await this.evaluate(buildSetBrowserCursorTemporarilyHiddenExpr(true)).catch(() => null);
-      didHideOverlay = Boolean(hideRes?.wasPresent);
-    } else {
-      await this.ensureCompositorAwake();
-      const prepRes = await this.evaluate(
-        buildPrepareBrowserCursorForScreenshotExpr(true, { awaitFrame: true }),
-      ).catch(() => null);
-      didPrepCursor = Boolean(prepRes?.didPrep);
+    if (!this.activeDialog) {
+      if (!includeCursor) {
+        const hideRes = await this.evaluate(buildSetBrowserCursorTemporarilyHiddenExpr(true)).catch(() => null);
+        didHideOverlay = Boolean(hideRes?.wasPresent);
+      } else {
+        await this.ensureCompositorAwake();
+        const prepRes = await this.evaluate(
+          buildPrepareBrowserCursorForScreenshotExpr(true, { awaitFrame: true }),
+        ).catch(() => null);
+        didPrepCursor = Boolean(prepRes?.didPrep);
+      }
     }
     let shot;
     try {
@@ -613,11 +1239,21 @@ export class CDPTabController {
     if (typeof expression === "function") {
       expression = `(${expression.toString()})()`;
     }
-    const res = await this.send("Runtime.evaluate", {
-      expression: String(expression),
-      returnByValue: true,
-      awaitPromise: true,
-    });
+    const race = await this._raceWithDialog(
+      this.send("Runtime.evaluate", {
+        expression: String(expression),
+        returnByValue: true,
+        awaitPromise: true,
+      }),
+      { settleDelayMs: 40 },
+    );
+    if (!race.done) {
+      return {
+        dialogOpened: true,
+        dialog: race.dialog,
+      };
+    }
+    const res = race.value;
     if (res.exceptionDetails) {
       const desc =
         res.exceptionDetails.exception?.description ||
@@ -636,48 +1272,95 @@ export class CDPTabController {
     if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalized)) {
       normalized = `https://${normalized}`;
     }
+    assertSafeBrowserUrl(normalized);
     this.cursorState.visible = false;
-    await this.send("Page.navigate", { url: normalized }, 20000);
-    await sleep(120);
-    await this.waitForDomSettled(4000);
+    this._navigatingByAgent = true;
+    try {
+      if (this.isExtensionTab && this.chromeTabId != null) {
+        const curMeta = await this.getMetadata().catch(() => ({ url: this.cachedMeta.url }));
+        if (this.isPrivilegedNewTab(curMeta.url) || !this.conn.targetSessions?.has(this.targetId)) {
+          await this.conn.client.request("updateTab", { tabId: this.chromeTabId, url: normalized }, 5000);
+          this.cachedMeta.url = normalized;
+          await sleep(180);
+          if (!this.isPrivilegedNewTab(normalized)) {
+            await this.waitForDomSettled(4000);
+          }
+          return;
+        }
+      }
+      await this.send("Page.navigate", { url: normalized }, 20000);
+      this.cachedMeta.url = normalized;
+      await sleep(120);
+      await this.waitForDomSettled(4000);
+    } finally {
+      this._navigatingByAgent = false;
+    }
   }
 
   async back() {
-    const hist = await this.send("Page.getNavigationHistory");
-    if (hist.currentIndex > 0) {
-      const entry = hist.entries[hist.currentIndex - 1];
-      this.cursorState.visible = false;
-      await this.send("Page.navigateToHistoryEntry", { entryId: entry.id });
-      await sleep(100);
-      await this.waitForDomSettled(3000);
+    this._navigatingByAgent = true;
+    try {
+      const hist = await this.send("Page.getNavigationHistory");
+      if (hist.currentIndex > 0) {
+        const entry = hist.entries[hist.currentIndex - 1];
+        this.cursorState.visible = false;
+        await this.send("Page.navigateToHistoryEntry", { entryId: entry.id });
+        await sleep(100);
+        await this.waitForDomSettled(3000);
+      }
+    } finally {
+      this._navigatingByAgent = false;
     }
   }
 
   async forward() {
-    const hist = await this.send("Page.getNavigationHistory");
-    if (hist.currentIndex < hist.entries.length - 1) {
-      const entry = hist.entries[hist.currentIndex + 1];
-      this.cursorState.visible = false;
-      await this.send("Page.navigateToHistoryEntry", { entryId: entry.id });
-      await sleep(100);
-      await this.waitForDomSettled(3000);
+    this._navigatingByAgent = true;
+    try {
+      const hist = await this.send("Page.getNavigationHistory");
+      if (hist.currentIndex < hist.entries.length - 1) {
+        const entry = hist.entries[hist.currentIndex + 1];
+        this.cursorState.visible = false;
+        await this.send("Page.navigateToHistoryEntry", { entryId: entry.id });
+        await sleep(100);
+        await this.waitForDomSettled(3000);
+      }
+    } finally {
+      this._navigatingByAgent = false;
     }
   }
 
   async reload() {
-    this.cursorState.visible = false;
-    await this.send("Page.reload", {});
-    await sleep(100);
-    await this.waitForDomSettled(3000);
+    this._navigatingByAgent = true;
+    try {
+      this.cursorState.visible = false;
+      await this.send("Page.reload", {});
+      await sleep(100);
+      await this.waitForDomSettled(3000);
+    } finally {
+      this._navigatingByAgent = false;
+    }
   }
 
   async close() {
-    this.cursorState.visible = false;
-    this.stopCompositorAwake({ sendStop: false });
-    await this.conn.send("Target.closeTarget", { targetId: this.targetId }).catch(() => {});
-    this.conn.targetSessions.delete(this.targetId);
-    this.diffTracker.reset(`tab:${this.id}`);
-    this.onClosed?.(this.id);
+    this._navigatingByAgent = true;
+    try {
+      this.cursorState.visible = false;
+      this.stopCompositorAwake({ sendStop: false });
+      if (typeof this.conn?.off === "function") {
+        this.conn.off("cdpEvent", this._boundCdpEvent);
+        this.conn.off("cdpDetached", this._boundCdpDetached);
+      }
+      if (this.isExtensionTab && this.chromeTabId != null) {
+        await this.conn.client.request("closeTab", { tabId: this.chromeTabId }, 5000).catch(() => {});
+      } else {
+        await this.conn.send("Target.closeTarget", { targetId: this.targetId }).catch(() => {});
+      }
+      this.conn.targetSessions?.delete(this.targetId);
+      this.diffTracker.reset(`tab:${this.id}`);
+      this.onClosed?.(this.id);
+    } finally {
+      this._navigatingByAgent = false;
+    }
   }
 
   /**
@@ -705,11 +1388,6 @@ export class CDPTabController {
     }
 
     const finalRect = options.rect ?? rect;
-    const explicitBadge =
-      options.showBadge !== undefined
-        ? Boolean(options.showBadge)
-        : options.badge != null && String(options.badge).trim() !== "";
-    const badge = options.badge ?? options.defaultBadge ?? (options.dispatchMoveEvent === false ? "Move" : "Hover");
     if (options.dispatchMoveEvent !== false) {
       await this.ensureCompositorAwake();
       await this.glideCursorTo(
@@ -717,8 +1395,6 @@ export class CDPTabController {
           x,
           y,
           rect: finalRect,
-          badge,
-          showBadge: explicitBadge,
         },
         { showCursor: options.showCursor },
       );
@@ -733,8 +1409,6 @@ export class CDPTabController {
           x,
           y,
           rect: finalRect,
-          badge,
-          showBadge: explicitBadge,
           ripple: Boolean(options.ripple),
           effectOnly: true,
         },
@@ -746,8 +1420,6 @@ export class CDPTabController {
           x,
           y,
           rect: finalRect,
-          badge,
-          showBadge: explicitBadge,
           ripple: Boolean(options.ripple),
         },
         { showCursor: options.showCursor },
@@ -765,15 +1437,9 @@ export class CDPTabController {
    * Highlight a target element, selector, or [x, y] box in the tab with the virtual cursor without firing DOM click/hover events unless requested.
    */
   async highlight(target, options = {}) {
-    const explicitBadge =
-      options.showBadge !== undefined
-        ? Boolean(options.showBadge)
-        : options.badge != null && String(options.badge).trim() !== "";
     return this.hover(target, {
       ...options,
       dispatchMoveEvent: Boolean(options.dispatchMoveEvent),
-      defaultBadge: "Inspect",
-      showBadge: explicitBadge,
     });
   }
 
@@ -815,21 +1481,6 @@ export class CDPTabController {
     const buttonsMask = button === "right" ? 2 : button === "middle" ? 4 : 1;
     const clickCount = Math.max(1, Math.min(5, Number(options.clickCount ?? 1)));
     const durationMs = Number(options.durationMs ?? 0);
-    const explicitBadge =
-      options.showBadge !== undefined
-        ? Boolean(options.showBadge)
-        : options.badge != null && String(options.badge).trim() !== "";
-    const badge =
-      options.badge ??
-      (button === "right"
-        ? "Right Click"
-        : button === "middle"
-          ? "Middle Click"
-          : clickCount === 2
-            ? "Double Click"
-            : clickCount >= 3
-              ? "Triple Click"
-              : "Click");
 
     await this.ensureCompositorAwake();
 
@@ -840,8 +1491,6 @@ export class CDPTabController {
         y,
         rect,
         button,
-        badge,
-        showBadge: explicitBadge,
       },
       { showCursor: options.showCursor },
     );
@@ -877,39 +1526,43 @@ export class CDPTabController {
           clickCount,
           ripple: options.ripple !== false,
           effectOnly: true,
-          badge,
-          showBadge: explicitBadge,
         },
         { showCursor: options.showCursor },
       );
 
       for (let i = 1; i <= clickCount; i++) {
-        await this.send("Input.dispatchMouseEvent", {
-          type: "mousePressed",
-          x,
-          y,
-          button,
-          buttons: buttonsMask,
-          clickCount: i,
-          modifiers,
-        });
+        await this._raceWithDialog(
+          this.send("Input.dispatchMouseEvent", {
+            type: "mousePressed",
+            x,
+            y,
+            button,
+            buttons: buttonsMask,
+            clickCount: i,
+            modifiers,
+          }),
+        );
+        if (this.activeDialog) break;
         if (durationMs > 0) {
           await sleep(Math.min(10000, durationMs));
         } else {
           await sleep(15);
         }
-        await this.send("Input.dispatchMouseEvent", {
-          type: "mouseReleased",
-          x,
-          y,
-          button,
-          buttons: 0,
-          clickCount: i,
-          modifiers,
-        });
+        await this._raceWithDialog(
+          this.send("Input.dispatchMouseEvent", {
+            type: "mouseReleased",
+            x,
+            y,
+            button,
+            buttons: 0,
+            clickCount: i,
+            modifiers,
+          }),
+        );
+        if (this.activeDialog) break;
       }
     } finally {
-      if (chordSpec) {
+      if (chordSpec && !this.activeDialog) {
         await this.send("Input.dispatchKeyEvent", {
           type: "keyUp",
           key: chordSpec.key,
@@ -920,27 +1573,32 @@ export class CDPTabController {
       }
     }
 
+    if (this.activeDialog) {
+      return { ok: true, x: Math.round(x), y: Math.round(y), dialog: { ...this.activeDialog } };
+    }
+
     // Brief settle in case click triggered navigation or UI update
     await sleep(60);
-    if (isElementTarget && typeof targetSpec === "number") {
+    if (isElementTarget && typeof targetSpec === "number" && !this.activeDialog) {
       await this.waitForDomSettled(800);
     }
 
-    // Refresh cursor timer after input/DOM settle (and re-mount cleanly without duplicate click ripple if page navigated)
-    await this.showVirtualCursor(
-      {
-        x,
-        y,
-        rect,
-        button,
-        clickCount,
-        ripple: false,
-        effectOnly: true,
-        badge,
-        showBadge: explicitBadge,
-      },
-      { showCursor: options.showCursor },
-    );
+    if (!this.activeDialog) {
+      // Refresh cursor timer after input/DOM settle (and re-mount cleanly without duplicate click ripple if page navigated)
+      await this.showVirtualCursor(
+        {
+          x,
+          y,
+          rect,
+          button,
+          clickCount,
+          ripple: false,
+          effectOnly: true,
+        },
+        { showCursor: options.showCursor },
+      );
+    }
+    return { ok: true, x: Math.round(x), y: Math.round(y) };
   }
 
   async setValue(elementIndex, value, options = {}) {
@@ -1372,27 +2030,714 @@ export class CDPTabController {
     await sleep(40);
   }
 
-  async uploadFiles(target, filePaths) {
+  async _uploadViaDataTransfer(target, files, options = {}) {
+    const uploadId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const CHUNK_CHARS = 262_144;
+    await this.evaluate(buildInitUploadStagingExpr(uploadId));
+
+    const metas = [];
+    for (let i = 0; i < files.length; i++) {
+      const fp = files[i];
+      const stat = fs.statSync(fp);
+      const buf = fs.readFileSync(fp);
+      const b64 = buf.toString("base64");
+      for (let off = 0; off < b64.length; off += CHUNK_CHARS) {
+        const chunk = b64.slice(off, off + CHUNK_CHARS);
+        await this.evaluate(buildAppendUploadChunkExpr(uploadId, i, chunk));
+      }
+      const mimeType = guessMimeType(fp);
+      metas.push({
+        name: path.basename(fp),
+        type: mimeType,
+        mime: mimeType,
+        lastModified: Math.round(stat.mtimeMs || Date.now()),
+      });
+    }
+
+    const commitRes = await this.evaluate(
+      buildCommitDataTransferUploadExpr({
+        uploadId,
+        targetSpec: target,
+        fileMetas: metas,
+      }),
+    );
+    if (!commitRes?.ok) {
+      throw new Error(commitRes?.error || `Tier-2 DataTransfer upload failed on target ${JSON.stringify(target)}`);
+    }
+    if (options.showCursor !== false && Number.isFinite(commitRes.x) && Number.isFinite(commitRes.y)) {
+      await this.showVirtualCursor(
+        { x: commitRes.x, y: commitRes.y, rect: commitRes.rect ?? null, ripple: true, effectOnly: true },
+        { showCursor: options.showCursor },
+      );
+    }
+    return {
+      ok: true,
+      tier: "datatransfer",
+      mode: commitRes.mechanism ?? commitRes.mode,
+      count: commitRes.fileCount ?? commitRes.count ?? files.length,
+      files,
+    };
+  }
+
+  /**
+   * Two-Tier Bulletproof File Upload:
+   * - Supports direct `<input type="file">` (`target`) AND button-triggered file choosers (`options.triggerTarget`).
+   * - Tier 1: `DOM.setFileInputFiles` (or `Page.setInterceptFileChooserDialog` + `Page.fileChooserOpened`).
+   * - Tier 2 (Zero-Config Fallback): Chunked base64 -> `new File(..., { type, lastModified })` inside `new DataTransfer()`,
+   *   assigning `input.files = dt.files` + dispatching `input`/`change`, OR dispatching `dragenter`/`dragover`/`drop`
+   *   with `DataTransfer` onto custom dropzones!
+   */
+  async uploadFiles(target, filePaths, options = {}) {
     const files = (Array.isArray(filePaths) ? filePaths : [filePaths]).map((f) => path.resolve(String(f)));
+    if (files.length === 0) {
+      throw new Error("uploadFiles requires at least one file path");
+    }
     for (const f of files) {
-      if (!fs.existsSync(f)) {
-        throw new Error(`Upload file does not exist: ${f}`);
+      if (!fs.existsSync(f) || !fs.statSync(f).isFile()) {
+        throw new Error(`Upload file does not exist or is not a file: ${f}`);
       }
     }
-    // Resolve Runtime.RemoteObjectId for target element, then call DOM.setFileInputFiles
-    const expr =
+
+    const triggerTarget = options.triggerTarget ?? null;
+    if (triggerTarget != null) {
+      await this.send("Page.setInterceptFileChooserDialog", { enabled: true });
+      let onChooserEvent = null;
+      const chooserPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (onChooserEvent && typeof this.conn?.off === "function") {
+            this.conn.off("cdpEvent", onChooserEvent);
+          }
+          reject(new Error(`Timed out waiting for file chooser after clicking ${JSON.stringify(triggerTarget)}`));
+        }, options.timeoutMs ?? 6000);
+
+        onChooserEvent = (ev) => {
+          if (this._matchesTabEvent(ev) && ev.method === "Page.fileChooserOpened") {
+            clearTimeout(timer);
+            if (typeof this.conn?.off === "function") {
+              this.conn.off("cdpEvent", onChooserEvent);
+            }
+            resolve(ev.params || {});
+          }
+        };
+        if (typeof this.conn?.on === "function") {
+          this.conn.on("cdpEvent", onChooserEvent);
+        } else {
+          clearTimeout(timer);
+          reject(new Error("CDP connection does not support fileChooserOpened events"));
+        }
+      });
+
+      try {
+        await this.click(triggerTarget, { showCursor: options.showCursor });
+        const chooser = await chooserPromise;
+        if (chooser.backendNodeId != null && !options.preferDataTransfer) {
+          try {
+            await this.send("DOM.setFileInputFiles", {
+              backendNodeId: chooser.backendNodeId,
+              files,
+            });
+            return { ok: true, tier: "file_chooser_cdp", count: files.length, files };
+          } catch (cdpErr) {
+            if (!/Not allowed|file URLs|Invalid|Cannot/i.test(String(cdpErr?.message || cdpErr))) {
+              throw cdpErr;
+            }
+          }
+        }
+        return await this._uploadViaDataTransfer(target ?? "input[type='file']", files, options);
+      } finally {
+        if (onChooserEvent && typeof this.conn?.off === "function") {
+          this.conn.off("cdpEvent", onChooserEvent);
+        }
+        await this.send("Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+      }
+    }
+
+    if (target == null) {
+      throw new TypeError("uploadFiles requires element_index / selector or trigger_element_index / trigger_selector");
+    }
+
+    if (options.showCursor !== false) {
+      const prep = await this.evaluate(buildPrepareElementExpr(target)).catch(() => null);
+      if (prep?.ok) {
+        await this.glideCursorTo({ x: prep.x, y: prep.y, rect: prep.rect }, { showCursor: options.showCursor });
+      }
+    }
+
+    if (options.preferDataTransfer) {
+      return await this._uploadViaDataTransfer(target, files, options);
+    }
+
+    const resolveExpr =
       typeof target === "number"
         ? `window.__agCuaMap?.get(${target})`
-        : `document.querySelector(${JSON.stringify(String(target))})`;
-    const evalRes = await this.send("Runtime.evaluate", { expression: expr });
+        : `(() => {
+            const s = ${JSON.stringify(String(target))};
+            try { return document.querySelector(s); } catch { return null; }
+          })()`;
+    const evalRes = await this.send("Runtime.evaluate", { expression: resolveExpr }).catch(() => null);
     const objectId = evalRes?.result?.objectId;
-    if (!objectId) {
-      throw new Error(`File input target ${JSON.stringify(target)} not found`);
+
+    if (objectId) {
+      const isFileInput = await this.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: "function() { return this.tagName && this.tagName.toLowerCase() === 'input' && this.type === 'file'; }",
+        returnByValue: true,
+      })
+        .then((r) => Boolean(r?.result?.value))
+        .catch(() => false);
+
+      if (isFileInput) {
+        try {
+          await this.send("DOM.setFileInputFiles", {
+            objectId,
+            files,
+          });
+          return { ok: true, tier: "cdp_dom", count: files.length, files };
+        } catch (err) {
+          if (!/Not allowed|file URLs|Node is not a file input|Cannot find|Invalid/i.test(String(err?.message || err))) {
+            throw err;
+          }
+        }
+      }
     }
-    await this.send("DOM.setFileInputFiles", {
-      objectId,
-      files,
+
+    // Automatic Tier-2 zero-config fallback (works without "Allow access to file URLs" AND on custom dropzones!)
+    return await this._uploadViaDataTransfer(target, files, options);
+  }
+
+  async listDownloads({ limit = 30 } = {}) {
+    const cap = Math.max(1, Math.min(200, Number(limit) || 30));
+    if (this.isExtensionTab && this.conn?.client) {
+      const res = await this.conn.client.request("downloads.list", { limit: cap }, 5000);
+      return res?.downloads || [];
+    }
+    const items = Array.from(this.conn.downloadsByGuid?.values() || []);
+    return items.slice(-cap).reverse();
+  }
+
+  async waitForDownload({ clickTarget = null, url = null, timeoutMs = 30000, showCursor = true } = {}) {
+    const before = await this.listDownloads({ limit: 50 }).catch(() => []);
+    const baselineCompleteIds = new Set(before.filter((d) => d.state === "complete").map((d) => String(d.id)));
+    const startedAfterMs = Date.now() - 250;
+
+    let trackedId = null;
+    let settledDownload = null;
+    let eventResolve = null;
+
+    const eventEmitter = this.isExtensionTab ? this.conn?.client : this.conn;
+    const onDlEvent = () => {
+      if (eventResolve) {
+        const r = eventResolve;
+        eventResolve = null;
+        r();
+      }
+    };
+    if (typeof eventEmitter?.on === "function") {
+      eventEmitter.on("downloadEvent", onDlEvent);
+    }
+
+    try {
+      if (url) {
+        assertSafeBrowserUrl(url);
+        if (this.isExtensionTab && this.conn?.client) {
+          const dlRes = await this.conn.client.request("downloads.download", { url: String(url) }, 8000);
+          if (dlRes?.downloadId != null) trackedId = String(dlRes.downloadId);
+        } else {
+          await this.evaluate(`(() => {
+            const a = document.createElement("a");
+            a.href = ${JSON.stringify(String(url))};
+            a.download = "";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            return true;
+          })()`);
+        }
+      } else if (clickTarget != null) {
+        await this.click(clickTarget, { showCursor });
+      }
+
+      const deadline = Date.now() + Math.max(500, Number(timeoutMs) || 30000);
+      while (Date.now() < deadline) {
+        const current = await this.listDownloads({ limit: 40 }).catch(() => []);
+        const candidate = current.find((d) => {
+          const idStr = String(d.id);
+          if (trackedId != null) return idStr === trackedId;
+          if (baselineCompleteIds.has(idStr)) return false;
+          if (d.startTime) {
+            const parsedStart = Date.parse(d.startTime);
+            if (Number.isFinite(parsedStart) && parsedStart < startedAfterMs - 2000) return false;
+          }
+          return true;
+        });
+
+        if (candidate) {
+          trackedId = String(candidate.id);
+          if (candidate.state === "complete") {
+            settledDownload = candidate;
+            break;
+          }
+          if (candidate.state === "interrupted") {
+            throw new Error(`Download failed/interrupted: ${candidate.error || candidate.filename || candidate.url}`);
+          }
+        }
+
+        await new Promise((resolve) => {
+          const t = setTimeout(resolve, 200);
+          eventResolve = () => {
+            clearTimeout(t);
+            resolve();
+          };
+        });
+      }
+    } finally {
+      if (typeof eventEmitter?.off === "function") {
+        eventEmitter.off("downloadEvent", onDlEvent);
+      }
+    }
+
+    if (!settledDownload) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for download to complete`);
+    }
+    return {
+      ok: true,
+      download: settledDownload,
+    };
+  }
+
+  getDialog() {
+    return this.activeDialog ? { open: true, ...this.activeDialog } : { open: false, dialog: null };
+  }
+
+  async handleDialog({ accept = true, promptText } = {}) {
+    const prev = this.activeDialog ? { ...this.activeDialog } : null;
+    await this.send(
+      "Page.handleJavaScriptDialog",
+      {
+        accept: Boolean(accept),
+        ...(promptText !== undefined ? { promptText: String(promptText) } : {}),
+      },
+      5000,
+    );
+    this.activeDialog = null;
+    await sleep(40);
+    return {
+      ok: true,
+      handled: prev,
+      accepted: Boolean(accept),
+      ...(promptText !== undefined ? { promptText: String(promptText) } : {}),
+    };
+  }
+
+  getConsoleLogs({ level = null, clear = false, limit = 200 } = {}) {
+    const normLevel = level ? String(level).trim().toLowerCase() : null;
+    const filtered = normLevel
+      ? this.consoleLogs.filter((l) => String(l.level).toLowerCase() === normLevel)
+      : [...this.consoleLogs];
+    if (clear) {
+      this.consoleLogs.length = 0;
+    }
+    const cap = Math.max(1, Math.min(RING_BUFFER_LIMIT, Number(limit) || 200));
+    return {
+      logs: filtered.slice(-cap),
+      totalBuffered: this.consoleLogs.length,
+    };
+  }
+
+  getNetworkRequests({ urlFilter = null, method = null, status = null, clear = false, limit = 200 } = {}) {
+    const needle = urlFilter ? String(urlFilter).toLowerCase() : null;
+    const normMethod = method ? String(method).toUpperCase() : null;
+    const statusNum = status != null ? Number(status) : null;
+
+    const filtered = this.networkRequests.filter((r) => {
+      if (needle && !String(r.url || "").toLowerCase().includes(needle)) return false;
+      if (normMethod && String(r.method || "").toUpperCase() !== normMethod) return false;
+      if (statusNum != null && Number.isFinite(statusNum) && r.status !== statusNum) return false;
+      return true;
     });
+
+    if (clear) {
+      this.networkRequests.length = 0;
+      this.networkById.clear();
+    }
+
+    const cap = Math.max(1, Math.min(RING_BUFFER_LIMIT, Number(limit) || 200));
+    return {
+      requests: filtered.slice(-cap),
+      totalBuffered: this.networkRequests.length,
+    };
+  }
+
+  async getNetworkBody(requestId) {
+    if (!requestId) {
+      throw new TypeError("getNetworkBody requires 'requestId'");
+    }
+    const res = await this.send("Network.getResponseBody", { requestId: String(requestId) }, 8000);
+    const entry = this.networkById.get(String(requestId)) || null;
+    return {
+      requestId: String(requestId),
+      url: entry?.url || "",
+      status: entry?.status ?? null,
+      mimeType: entry?.mimeType || "",
+      body: res?.body ?? "",
+      base64Encoded: Boolean(res?.base64Encoded),
+    };
+  }
+
+  async getCookies({ urls = null, domain = null, name = null } = {}) {
+    let urlList = null;
+    if (Array.isArray(urls) && urls.length > 0) {
+      urlList = urls.map(String);
+    } else if (typeof urls === "string" && urls.trim()) {
+      urlList = [urls.trim()];
+    } else {
+      const meta = await this.getMetadata().catch(() => ({ url: this.cachedMeta.url }));
+      if (meta?.url && /^https?:/i.test(meta.url)) {
+        urlList = [meta.url];
+      }
+    }
+
+    let cookies = [];
+    if (this.isExtensionTab && !this.conn.targetSessions?.has(this.targetId) && this.conn?.client) {
+      const res = await this.conn.client.request(
+        "cookies.getAll",
+        {
+          ...(urlList?.[0] ? { url: urlList[0] } : {}),
+          ...(domain ? { domain: String(domain) } : {}),
+          ...(name ? { name: String(name) } : {}),
+        },
+        5000,
+      );
+      cookies = res?.cookies || [];
+    } else {
+      const res = await this.send("Network.getCookies", urlList ? { urls: urlList } : {});
+      cookies = res?.cookies || [];
+      if (domain) {
+        const d = String(domain).toLowerCase().replace(/^\./, "");
+        cookies = cookies.filter((c) => String(c.domain || "").toLowerCase().replace(/^\./, "").endsWith(d));
+      }
+      if (name) {
+        cookies = cookies.filter((c) => c.name === String(name));
+      }
+    }
+    return { cookies };
+  }
+
+  async setCookies(cookies = []) {
+    const list = Array.isArray(cookies) ? cookies : [cookies];
+    if (list.length === 0) return { ok: true, count: 0 };
+    const meta = await this.getMetadata().catch(() => ({ url: this.cachedMeta.url }));
+    const fallbackUrl = meta?.url && /^https?:/i.test(meta.url) ? meta.url : undefined;
+    const normalized = list.map((c) => ({
+      ...c,
+      name: String(c.name),
+      value: String(c.value ?? ""),
+      ...(!c.url && !c.domain && fallbackUrl ? { url: fallbackUrl } : {}),
+    }));
+    await this.send("Network.setCookies", { cookies: normalized });
+    return { ok: true, count: normalized.length };
+  }
+
+  async clearCookies({ url = null, domain = null, name = null, allBrowser = false } = {}) {
+    if (allBrowser && !this.isExtensionTab) {
+      await this.send("Network.clearBrowserCookies", {});
+      return { ok: true, clearedAll: true };
+    }
+    const { cookies } = await this.getCookies({
+      urls: url ? [String(url)] : null,
+      domain,
+      name,
+    });
+    let deletedCount = 0;
+    for (const c of cookies) {
+      await this.send("Network.deleteCookies", {
+        name: c.name,
+        ...(c.domain ? { domain: c.domain } : {}),
+        ...(c.path ? { path: c.path } : {}),
+        ...(url ? { url: String(url) } : {}),
+      }).catch(() => {});
+      deletedCount++;
+    }
+    return { ok: true, deletedCount };
+  }
+
+  async getStorage({ type = "local", key = null } = {}) {
+    const storeExpr = String(type).toLowerCase() === "session" ? "window.sessionStorage" : "window.localStorage";
+    return await this.evaluate(`(() => {
+      const store = ${storeExpr};
+      const k = ${JSON.stringify(key)};
+      if (k != null) {
+        return { type: ${JSON.stringify(type)}, key: k, value: store.getItem(String(k)) };
+      }
+      const entries = {};
+      for (let i = 0; i < store.length; i++) {
+        const itemKey = store.key(i);
+        if (itemKey != null) entries[itemKey] = store.getItem(itemKey);
+      }
+      return { type: ${JSON.stringify(type)}, entries, count: Object.keys(entries).length };
+    })()`);
+  }
+
+  async setStorage({ type = "local", entries = {}, clear = false, removeKeys = [] } = {}) {
+    const storeExpr = String(type).toLowerCase() === "session" ? "window.sessionStorage" : "window.localStorage";
+    return await this.evaluate(`(() => {
+      const store = ${storeExpr};
+      if (${Boolean(clear)}) {
+        store.clear();
+      }
+      for (const rk of ${JSON.stringify(Array.isArray(removeKeys) ? removeKeys : [])}) {
+        store.removeItem(String(rk));
+      }
+      const map = ${JSON.stringify(entries && typeof entries === "object" ? entries : {})};
+      for (const [k, v] of Object.entries(map)) {
+        if (v === null) store.removeItem(k);
+        else store.setItem(k, String(v));
+      }
+      return { ok: true, type: ${JSON.stringify(type)}, count: store.length };
+    })()`);
+  }
+
+  async claimInPlace(sessionId = this.sessionIdName) {
+    if (!this.isExtensionTab || this.chromeTabId == null || !this.conn?.client) {
+      return { ok: true, tabId: this.id, role: "claimed", localOnly: true };
+    }
+    const res = await this.conn.client.request("claimTab", {
+      sessionId: sessionId || "default",
+      tabId: this.chromeTabId,
+    });
+    this.cachedMeta.ownership = { sessionId: sessionId || "default", role: "claimed", createdByAgent: false };
+    return res;
+  }
+
+  async markTab(status = "deliverable", { sessionId = this.sessionIdName, activate } = {}) {
+    if (!this.isExtensionTab || this.chromeTabId == null || !this.conn?.client) {
+      if (status === "handoff") {
+        await this.detach().catch(() => {});
+      }
+      return { ok: true, tabId: this.id, status, localOnly: true };
+    }
+    if (status === "handoff" && this.conn.targetSessions?.has(this.targetId) && !this.activeDialog) {
+      const sid = this.conn.targetSessions.get(this.targetId);
+      if (sid) {
+        await this.conn
+          .send("Runtime.evaluate", { expression: buildRemoveBrowserCursorExpr(), returnByValue: true }, sid, 1000)
+          .catch(() => {});
+      }
+    }
+    const res = await this.conn.client.request("markTab", {
+      sessionId: sessionId || "default",
+      tabId: this.chromeTabId,
+      status,
+      ...(activate !== undefined ? { activate: Boolean(activate) } : {}),
+    });
+    this.cachedMeta.ownership = {
+      ...(this.cachedMeta.ownership || {}),
+      sessionId: sessionId || "default",
+      role: status,
+    };
+    if (status === "handoff") {
+      this._activeIndicatorInjected = false;
+      this.cursorState.visible = false;
+    }
+    return res;
+  }
+
+  async markDeliverable(opts = {}) {
+    return this.markTab("deliverable", opts);
+  }
+
+  async markHandoff(opts = {}) {
+    return this.markTab("handoff", opts);
+  }
+
+  async markScratch(opts = {}) {
+    return this.markTab("scratch", opts);
+  }
+
+  async _resolveFrameTarget(iframeSelector) {
+    await this.send("DOM.enable", {}).catch(() => {});
+    const frameEval = await this.send("Runtime.evaluate", {
+      expression: `document.querySelector(${JSON.stringify(String(iframeSelector))})`,
+    });
+    const objectId = frameEval?.result?.objectId;
+    if (!objectId) {
+      throw new Error(`Iframe selector ${JSON.stringify(iframeSelector)} not found in tab ${this.id}`);
+    }
+
+    const infoRes = await this.send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function() {
+        const r = this.getBoundingClientRect();
+        let sameOrigin = false;
+        try { sameOrigin = Boolean(this.contentDocument && this.contentDocument.body); } catch { sameOrigin = false; }
+        return {
+          left: Math.round(r.left + (this.clientLeft || 0)),
+          top: Math.round(r.top + (this.clientTop || 0)),
+          width: Math.round(this.clientWidth || r.width || 0),
+          height: Math.round(this.clientHeight || r.height || 0),
+          src: this.src || this.getAttribute("src") || "",
+          sameOrigin
+        };
+      }`,
+      returnByValue: true,
+    });
+    const frameMeta = infoRes?.result?.value;
+    if (!frameMeta) {
+      throw new Error(`Could not inspect iframe geometry for ${JSON.stringify(iframeSelector)}`);
+    }
+
+    if (frameMeta.sameOrigin) {
+      return { mode: "same_origin", frameMeta, childSessionId: null };
+    }
+
+    // Cross-origin OOPIF resolution via DOM.describeNode frameId or URL match
+    let frameId = null;
+    try {
+      const desc = await this.send("DOM.describeNode", { objectId });
+      frameId = desc?.node?.frameId || null;
+    } catch {}
+
+    let matched = null;
+    for (const child of this.childFrames.values()) {
+      if (frameId && child.targetId === frameId) {
+        matched = child;
+        break;
+      }
+    }
+    if (!matched && frameMeta.src) {
+      for (const child of this.childFrames.values()) {
+        if (child.url === frameMeta.src || (child.url && frameMeta.src && child.url.startsWith(frameMeta.src))) {
+          matched = child;
+          break;
+        }
+      }
+    }
+    if (!matched && this.childFrames.size === 1) {
+      matched = Array.from(this.childFrames.values())[0];
+    }
+    if (!matched) {
+      throw new Error(
+        `Cross-origin OOPIF target session not attached yet for ${JSON.stringify(iframeSelector)} (src="${frameMeta.src}")`,
+      );
+    }
+    return { mode: "oopif", frameMeta, childSessionId: matched.sessionId };
+  }
+
+  /**
+   * Playwright-compatible `frameLocator(iframeSelector)` supporting both same-origin iframes and cross-origin OOPIFs!
+   */
+  frameLocator(iframeSelector) {
+    const self = this;
+
+    const evalInFrame = async (expression) => {
+      const resolved = await self._resolveFrameTarget(iframeSelector);
+      const exprStr = typeof expression === "function" ? `(${expression.toString()})()` : String(expression);
+      if (resolved.mode === "same_origin") {
+        return {
+          resolved,
+          value: await self.evaluate(`(() => {
+            const frameEl = document.querySelector(${JSON.stringify(String(iframeSelector))});
+            if (!frameEl || !frameEl.contentWindow) throw new Error("Iframe detached");
+            return frameEl.contentWindow.eval(${JSON.stringify(exprStr)});
+          })()`),
+        };
+      }
+      const res = await self.conn.send(
+        "Runtime.evaluate",
+        {
+          expression: exprStr,
+          returnByValue: true,
+          awaitPromise: true,
+        },
+        resolved.childSessionId,
+      );
+      if (res.exceptionDetails) {
+        throw new Error(
+          res.exceptionDetails.exception?.description || res.exceptionDetails.text || "OOPIF evaluation failed",
+        );
+      }
+      return { resolved, value: res.result?.value };
+    };
+
+    const resolveInnerCoords = async (innerTarget, { focus = false } = {}) => {
+      const { resolved, value: prep } = await evalInFrame(buildPrepareElementExpr(innerTarget, { focus }));
+      if (!prep?.ok) {
+        throw new Error(prep?.error || `Failed to locate ${JSON.stringify(innerTarget)} inside iframe ${iframeSelector}`);
+      }
+      const topX = resolved.frameMeta.left + prep.x;
+      const topY = resolved.frameMeta.top + prep.y;
+      const topRect = prep.rect
+        ? {
+            x: resolved.frameMeta.left + prep.rect.x,
+            y: resolved.frameMeta.top + prep.rect.y,
+            width: prep.rect.width,
+            height: prep.rect.height,
+          }
+        : null;
+      return { x: topX, y: topY, rect: topRect };
+    };
+
+    return {
+      async evaluate(expression) {
+        const { value } = await evalInFrame(expression);
+        return value;
+      },
+      async getAXState(opts = {}) {
+        const { resolved, value: snap } = await evalInFrame(BUILD_AX_SNAPSHOT_EXPR(opts.maxElements ?? 400));
+        const header = `Frame "${snap?.title || iframeSelector}" url="${snap?.url || resolved.frameMeta.src}" offset=(${resolved.frameMeta.left},${resolved.frameMeta.top}) size=${resolved.frameMeta.width}x${resolved.frameMeta.height}`;
+        const fullTree = [header, ...(snap?.lines ?? [])].join("\n");
+        return {
+          stateText: fullTree,
+          fullTree,
+          offset: { x: resolved.frameMeta.left, y: resolved.frameMeta.top },
+          elementCount: snap?.elementCount ?? 0,
+        };
+      },
+      async click(innerTarget, opts = {}) {
+        const pt = await resolveInnerCoords(innerTarget);
+        return self.click([pt.x, pt.y], { ...opts, rect: pt.rect });
+      },
+      async hover(innerTarget, opts = {}) {
+        const pt = await resolveInnerCoords(innerTarget);
+        return self.hover([pt.x, pt.y], { ...opts, rect: pt.rect });
+      },
+      async setValue(innerTarget, value, opts = {}) {
+        const { resolved, value: res } = await evalInFrame(buildSetValueExpr(innerTarget, value));
+        if (!res?.ok) {
+          throw new Error(res?.error || `Failed to setValue on ${JSON.stringify(innerTarget)} in ${iframeSelector}`);
+        }
+        if (opts.showCursor !== false && Number.isFinite(res.x) && Number.isFinite(res.y)) {
+          await self.showVirtualCursor(
+            {
+              x: resolved.frameMeta.left + res.x,
+              y: resolved.frameMeta.top + res.y,
+              effectOnly: true,
+              ripple: Boolean(opts.ripple),
+            },
+            { showCursor: opts.showCursor },
+          );
+        }
+        return res;
+      },
+      async typeText(innerTarget, text, opts = {}) {
+        const pt = await resolveInnerCoords(innerTarget, { focus: true });
+        await self.glideCursorTo({ x: pt.x, y: pt.y, rect: pt.rect }, { showCursor: opts.showCursor });
+        return self.typeText(null, text, opts);
+      },
+      locator(innerSelector) {
+        const frameSelf = this;
+        return {
+          click: (opts) => frameSelf.click(innerSelector, opts),
+          hover: (opts) => frameSelf.hover(innerSelector, opts),
+          fill: (val, opts) => frameSelf.setValue(innerSelector, val, opts),
+          type: (txt, opts) => frameSelf.typeText(innerSelector, txt, opts),
+          textContent: () =>
+            frameSelf.evaluate(`document.querySelector(${JSON.stringify(innerSelector)})?.textContent ?? null`),
+          innerText: () =>
+            frameSelf.evaluate(`document.querySelector(${JSON.stringify(innerSelector)})?.innerText ?? null`),
+        };
+      },
+    };
   }
 
   async waitFor(selectorOrMs, timeoutMs = 8000) {
@@ -1432,16 +2777,19 @@ export class CDPTabController {
       async fill(value, opts) {
         return self.setValue(selector, value, opts);
       },
+      async setInputFiles(files, opts) {
+        return self.uploadFiles(selector, files, opts);
+      },
       async type(text, opts) {
         const prep = await self.evaluate(buildPrepareElementExpr(selector, { focus: true }));
         if (!prep?.ok) throw new Error(prep?.error || `No element for selector ${selector}`);
-        await self.showVirtualCursor({ x: prep.x, y: prep.y, rect: prep.rect, badge: "Type" }, opts);
+        await self.showVirtualCursor({ x: prep.x, y: prep.y, rect: prep.rect }, opts);
         return self.typeText(null, text, opts);
       },
       async press(key, opts) {
         const prep = await self.evaluate(buildPrepareElementExpr(selector, { focus: true }));
         if (!prep?.ok) throw new Error(prep?.error || `No element for selector ${selector}`);
-        await self.showVirtualCursor({ x: prep.x, y: prep.y, rect: prep.rect, badge: `Key: ${key}` }, opts);
+        await self.showVirtualCursor({ x: prep.x, y: prep.y, rect: prep.rect }, opts);
         return self.pressKey(null, key, opts);
       },
       async textContent() {
@@ -1627,6 +2975,8 @@ export class BrowserFallbackTabController {
       const res = await this.evaluate(
         buildBrowserCursorOverlayExpr({
           ...spec,
+          badge: null,
+          showBadge: false,
           idleTimeoutMs: cfg.idleTimeoutMs,
           instant: cfg.glideEnabled === false ? true : Boolean(spec.instant),
         }),
@@ -1636,7 +2986,7 @@ export class BrowserFallbackTabController {
           visible: true,
           x: res.x,
           y: res.y,
-          badge: res.badge ?? null,
+          badge: null,
           highlightedRect: res.highlightedRect ?? null,
           updatedAt: Date.now(),
         };
@@ -1670,7 +3020,7 @@ export class BrowserFallbackTabController {
         visible: true,
         x: domState.x,
         y: domState.y,
-        badge: domState.badge,
+        badge: null,
         highlightedRect: domState.highlightedRect,
       };
     } else {
@@ -1681,6 +3031,7 @@ export class BrowserFallbackTabController {
       browserId: this.browserId,
       controlMode: "apple_events",
       ...domState,
+      badge: null,
     };
   }
 
@@ -1704,7 +3055,8 @@ export class BrowserFallbackTabController {
       u.startsWith("safari-") ||
       u.startsWith("chrome://") ||
       u.startsWith("brave://") ||
-      u.startsWith("edge://")
+      u.startsWith("edge://") ||
+      u.startsWith("arc://")
     );
   }
 
@@ -1731,23 +3083,35 @@ export class BrowserFallbackTabController {
       scroll: { x: 0, y: 0 },
       elementCount: 0,
       lines: [],
+      captchaSignals: [],
     };
+    const captcha = detectCaptchaChallenge(snap);
     const header = `Tab #${this.id} "${snap.title}" url="${snap.url}" viewport=${snap.viewport.width}x${snap.viewport.height} scroll=(${snap.scroll.x},${snap.scroll.y})`;
-    const fullTree = [header, ...(snap.lines ?? [])].join("\n");
+    const fullTree = [
+      header,
+      ...(snap.lines ?? []),
+      ...(captcha.detected && captcha.banner ? [captcha.banner] : []),
+    ].join("\n");
     const formatted = this.diffTracker.format(diffKey, fullTree, options);
+    let stateText = formatted.text;
+    if (captcha.detected && captcha.banner && !stateText.includes(captcha.banner)) {
+      stateText = `${stateText}\n${captcha.banner}`;
+    }
 
     return {
-      stateText: formatted.text,
+      stateText,
       fullTree,
       isDiff: formatted.isDiff,
       unchanged: formatted.unchanged,
       elementCount: snap.elementCount,
+      captchaDetected: captcha.detected,
+      ...(captcha.detected ? { captchaProviders: captcha.providers } : {}),
       ...(this.isCursorCurrentlyVisible()
         ? {
             cursor: {
               x: this.cursorState.x,
               y: this.cursorState.y,
-              badge: this.cursorState.badge,
+              badge: null,
               highlightedRect: this.cursorState.highlightedRect,
             },
           }
@@ -1836,6 +3200,7 @@ export class BrowserFallbackTabController {
     if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalized)) {
       normalized = `https://${normalized}`;
     }
+    assertSafeBrowserUrl(normalized);
     this.cursorState.visible = false;
     const jxa = `(() => {
       ${this.buildTabLookupJxa()}
@@ -2537,12 +3902,16 @@ export class BrowserManager {
    * @param {{
    *   diffTracker: import("./diff.mjs").AXDiffTracker,
    *   macBridge?: import("./mac-bridge.mjs").MacBridge,
-   *   jxaRunner?: (script: string, opSpec?: any) => Promise<string>
+   *   jxaRunner?: (script: string, opSpec?: any) => Promise<string>,
+   *   extensionSockDir?: string
    * }} opts
    */
-  constructor({ diffTracker, macBridge = null, jxaRunner = null }) {
+  constructor({ diffTracker, macBridge = null, jxaRunner = null, extensionSockDir = undefined }) {
     this.diffTracker = diffTracker;
     this.macBridge = macBridge;
+    this.extensionBridge = new ExtensionBridgeManager(
+      extensionSockDir ? { sockDir: extensionSockDir } : {},
+    );
     this.jxaRunner =
       jxaRunner ??
       (async (script) => {
@@ -2635,7 +4004,7 @@ export class BrowserManager {
   }
 
   /**
-   * Query open tabs in running macOS Safari / non-CDP Chrome / Brave / Edge without waking closed apps.
+   * Query open tabs in running macOS Safari / non-CDP Chrome / Brave / Edge / Arc without waking closed apps.
    * Uses bulk AppleEvent property arrays per window + short TTL/in-flight deduplication to avoid multi-second stalls.
    */
   async listMacOSAppleEventTabs({ forceRefresh = false } = {}) {
@@ -2652,7 +4021,8 @@ export class BrowserManager {
         { id: "safari", appName: "Safari", kind: "safari" },
         { id: "chrome-app", appName: "Google Chrome", kind: "chromium" },
         { id: "brave-app", appName: "Brave Browser", kind: "chromium" },
-        { id: "edge-app", appName: "Microsoft Edge", kind: "chromium" }
+        { id: "edge-app", appName: "Microsoft Edge", kind: "chromium" },
+        { id: "arc-app", appName: "Arc", kind: "chromium" }
       ];
       for (const c of candidates) {
         try {
@@ -2712,6 +4082,115 @@ export class BrowserManager {
 
     this.appleEventTabsInflight = runPromise;
     return runPromise;
+  }
+
+  getOrRegisterExtensionTabController(extTab, bridgeRec, sessionIdName = "default") {
+    const targetId = `${bridgeRec.browserId}:ext-tab-${extTab.tabId}`;
+    const shortTargetAlias = `ext-tab-${extTab.tabId}`;
+    const existingTabId = this.targetToTabId.get(targetId);
+    if (existingTabId && this.tabs.has(existingTabId)) {
+      const ctrl = this.tabs.get(existingTabId);
+      ctrl.conn = bridgeRec.cdpConn;
+      ctrl.cachedMeta = {
+        title: extTab.title ?? ctrl.cachedMeta.title,
+        url: extTab.url ?? ctrl.cachedMeta.url,
+        tabGroup: extTab.tabGroup ?? ctrl.cachedMeta.tabGroup ?? null,
+        groupId: extTab.groupId ?? ctrl.cachedMeta.groupId ?? -1,
+        windowId: extTab.windowId ?? ctrl.cachedMeta.windowId ?? null,
+        ownership: extTab.ownership ?? ctrl.cachedMeta.ownership ?? null,
+      };
+      return ctrl;
+    }
+
+    const tabId = `tab-${this.nextTabSeq++}`;
+    const ctrl = new CDPTabController({
+      id: tabId,
+      targetId,
+      browserId: bridgeRec.browserId,
+      httpEndpoint: `unix://${bridgeRec.sockPath}`,
+      conn: bridgeRec.cdpConn,
+      diffTracker: this.diffTracker,
+      getCursorConfig: () => this.cursorConfig,
+      sessionIdName,
+      title: extTab.title ?? "",
+      url: extTab.url ?? "",
+      tabGroup: extTab.tabGroup ?? null,
+      groupId: extTab.groupId ?? -1,
+      windowId: extTab.windowId ?? null,
+      ownership: extTab.ownership ?? null,
+      onClosed: (closedId) => {
+        this.tabs.delete(closedId);
+        this.targetToTabId.delete(targetId);
+        if (this.targetToTabId.get(shortTargetAlias) === closedId) {
+          this.targetToTabId.delete(shortTargetAlias);
+        }
+      },
+    });
+    this.tabs.set(tabId, ctrl);
+    this.targetToTabId.set(targetId, tabId);
+    if (!this.targetToTabId.has(shortTargetAlias)) {
+      this.targetToTabId.set(shortTargetAlias, tabId);
+    }
+    return ctrl;
+  }
+
+  async discoverExtensionBrowsers() {
+    const bridges = await this.extensionBridge.refresh();
+    const out = [];
+    for (const rec of bridges) {
+      try {
+        const res = await rec.client.request("listAllTabs", {}, 2500);
+        const rawTabs = Array.isArray(res?.tabs) ? res.tabs : [];
+        const liveTargetIds = new Set();
+        const mappedTabs = rawTabs.map((t) => {
+          const ctrl = this.getOrRegisterExtensionTabController(t, rec);
+          liveTargetIds.add(ctrl.targetId);
+          return {
+            id: ctrl.id,
+            providerTabId: ctrl.targetId,
+            chromeTabId: t.tabId,
+            windowId: t.windowId,
+            active: Boolean(t.active),
+            pinned: Boolean(t.pinned),
+            groupId: t.groupId,
+            tabGroup: t.tabGroup || null,
+            ownership: t.ownership || null,
+            attached: Boolean(t.attached),
+            browserId: rec.browserId,
+            title: t.title || "",
+            url: t.url || "",
+            controllable: true,
+            controllableViaCDP: true,
+            controlMode: "extension_cdp",
+          };
+        });
+
+        // Prune stale controllers for tabs closed in this extension browser
+        for (const [id, ctrl] of Array.from(this.tabs.entries())) {
+          if (ctrl.browserId === rec.browserId && !liveTargetIds.has(ctrl.targetId)) {
+            this.tabs.delete(id);
+            this.targetToTabId.delete(ctrl.targetId);
+          }
+        }
+
+        const brand = String(rec.client.info?.browserFamily || "chrome").toLowerCase();
+        const browserName = rec.client.info?.browserName || "Chromium";
+        out.push({
+          id: rec.browserId,
+          name: `${browserName} (Antigravity Extension)`,
+          family: "chromium",
+          brand,
+          type: "extension",
+          extensionId: rec.client.info?.extensionId || "cnipmpbdggdeocaigfifflifphanoiic",
+          controlMode: "extension_cdp",
+          controllableViaCDP: true,
+          tabs: mappedTabs,
+        });
+      } catch {
+        // Ignore bridge transient disconnect during refresh
+      }
+    }
+    return out;
   }
 
   getOrRegisterFallbackTabController(tabInfo, kb) {
@@ -2856,7 +4335,9 @@ export class BrowserManager {
     const f = String(browserFilter).toLowerCase();
     return (
       String(b.id || "").toLowerCase() === f ||
+      String(b.brand || "").toLowerCase() === f ||
       String(b.name || "").toLowerCase().includes(f) ||
+      (f === "extension" && b.type === "extension") ||
       (f === "chrome" && b.family === "chromium")
     );
   }
@@ -2866,6 +4347,7 @@ export class BrowserManager {
     const f = String(browserFilter).toLowerCase();
     const bid = String(ctrl.browserId || "").toLowerCase();
     if (bid === f || bid.includes(f)) return true;
+    if (f === "extension" && ctrl.isExtensionTab) return true;
     if (ctrl.appName && String(ctrl.appName).toLowerCase().includes(f)) return true;
     const isChromium = ctrl instanceof CDPTabController || ctrl.kind === "chromium";
     if (isChromium && (f === "chrome" || f === "chromium" || f === "cdp")) return true;
@@ -2873,11 +4355,14 @@ export class BrowserManager {
   }
 
   /**
-   * Fast (~8ms) CDP-only tab refresh with zero macOS AppleEvent / osascript invocations.
+   * Fast (~8ms) Extension + CDP-only tab refresh with zero macOS AppleEvent / osascript invocations.
    */
   async refreshCDPTabsOnly() {
-    const cdpEndpoints = await this.discoverCDPEndpoints();
-    return cdpEndpoints.map((ep) => {
+    const [extBrowsers, cdpEndpoints] = await Promise.all([
+      this.discoverExtensionBrowsers(),
+      this.discoverCDPEndpoints(),
+    ]);
+    const rawCdp = cdpEndpoints.map((ep) => {
       const tabs = ep.pages.map((p) => {
         const ctrl = this.getOrRegisterTabController(p.id, ep.id, ep.httpEndpoint, ep.wsUrl);
         return {
@@ -2900,19 +4385,37 @@ export class BrowserManager {
         tabs,
       };
     });
+    return [...extBrowsers, ...rawCdp];
   }
 
   /**
-   * List all available browsers + their currently open tabs.
+   * List all available browsers + their currently open tabs (Extension-First, then raw CDP, then AppleEvents fallback).
+   * Never attaches `chrome.debugger` during listing, so Chrome/Brave's debugging banner never appears on `browser_list` or `get_state`.
    */
   async listBrowsersWithTabs({ forceRefresh = false } = {}) {
-    const [cdpEndpoints, aeBrowsers] = await Promise.all([
+    const [extBrowsers, cdpEndpoints, aeBrowsers] = await Promise.all([
+      this.discoverExtensionBrowsers(),
       this.discoverCDPEndpoints(),
       this.listMacOSAppleEventTabs({ forceRefresh }),
     ]);
 
     const result = [];
+    const extensionCoveredKeys = new Set();
 
+    // 1. Extension-First browsers (Brave, Chrome, Edge, Arc, Vivaldi, Opera)
+    for (const eb of extBrowsers) {
+      result.push(eb);
+      if (eb.brand) {
+        extensionCoveredKeys.add(eb.brand);
+      }
+      const lowerName = String(eb.name || "").toLowerCase();
+      if (lowerName.includes("brave")) extensionCoveredKeys.add("brave");
+      else if (lowerName.includes("edge")) extensionCoveredKeys.add("edge");
+      else if (lowerName.includes("arc")) extensionCoveredKeys.add("arc");
+      else if (lowerName.includes("chrome")) extensionCoveredKeys.add("chrome");
+    }
+
+    // 2. Raw CDP endpoints (ports 9223, 9222, managed iab)
     for (const ep of cdpEndpoints) {
       const tabs = ep.pages.map((p) => {
         const ctrl = this.getOrRegisterTabController(p.id, ep.id, ep.httpEndpoint, ep.wsUrl);
@@ -2948,12 +4451,18 @@ export class BrowserManager {
       });
     }
 
-    // Include installed/running macOS browsers not already covered or Safari
+    // 3. Installed/running macOS browsers not superseded by Extension Bridge (plus Safari)
     const seenFallbackIds = new Set();
+    const unpackedExtDir = path.join(PROJECT_ROOT, "extension");
+
     for (const kb of KNOWN_MAC_BROWSERS) {
+      if (kb.family === "chromium" && extensionCoveredKeys.has(kb.key)) {
+        // Superseded by live Antigravity Extension bridge!
+        continue;
+      }
       const ae = aeBrowsers.find((a) => a.name === kb.name);
       if (!ae && !fs.existsSync(kb.appPath) && kb.key !== "safari") continue;
-      // Avoid duplicating open tabs if this Chromium instance IS the active CDP browser (check overlapping non-blank URLs)
+
       const cdpUrls = new Set(
         cdpEndpoints.flatMap((e) => e.pages.map((p) => p.url)).filter((u) => u && u !== "about:blank"),
       );
@@ -2963,12 +4472,19 @@ export class BrowserManager {
         this.getOrRegisterFallbackTabController(t, kb);
       }
       if (kb.key === "safari" || aeTabs.length > 0) {
+        const extScheme =
+          kb.key === "brave" ? "brave://extensions" : kb.key === "edge" ? "edge://extensions" : "chrome://extensions";
         result.push({
           id: kb.key,
           name: kb.name,
           family: kb.family,
           type: "macos_app",
           bundleId: kb.bundleId,
+          ...(kb.family === "chromium"
+            ? {
+                setupHint: `Load unpacked extension from "${unpackedExtDir}" in ${extScheme} (enable Developer mode -> Load unpacked) for zero-flag background CDP, Tab Groups, uploads, and downloads.`,
+              }
+            : {}),
           tabs: aeTabs.map((t) => ({
             ...t,
             providerTabId: t.id,
@@ -2995,6 +4511,22 @@ export class BrowserManager {
       ? browsers.filter((b) => this.matchesBrowserFilter(b, browser))
       : browsers;
     return filtered.flatMap((b) => b.tabs);
+  }
+
+  async _resolveExtensionBridgeForCreate(browserId = "default", options = {}) {
+    const norm = String(browserId || "default").trim().toLowerCase();
+    if (norm === "iab" || norm === "headless" || norm === "managed" || norm === "safari" || norm.startsWith("cdp-")) {
+      return null;
+    }
+    // If caller explicitly asked for headless background browser (`visible: false`) on `"default"`, use managed headless
+    if (options.visible === false && norm === "default") {
+      return null;
+    }
+    await this.extensionBridge.refresh();
+    if (norm === "default" || norm === "extension") {
+      return this.extensionBridge.getBridge();
+    }
+    return this.extensionBridge.getBridge(norm);
   }
 
   /**
@@ -3043,13 +4575,14 @@ export class BrowserManager {
   }
 
   /**
-   * Open a new controllable browser tab (in background by default unless visible: true activates it).
+   * Open a new controllable browser tab (in background Tab Group by default when using Extension Bridge).
    */
   async createTab(browserId = "default", url = "about:blank", options = {}) {
     let targetUrl = url && String(url).trim() ? String(url).trim() : "about:blank";
     if (targetUrl !== "about:blank" && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(targetUrl)) {
       targetUrl = `https://${targetUrl}`;
     }
+    assertSafeBrowserUrl(targetUrl);
 
     const norm = String(browserId || "default").trim().toLowerCase();
     if (norm === "safari") {
@@ -3079,6 +4612,48 @@ export class BrowserManager {
       return this.getTab(parsed.id || "safari:w1:t1", { forceRefresh: true });
     }
 
+    // Prefer live Antigravity Extension Bridge (creates grouped background tab without stealing focus!)
+    const extBridge = await this._resolveExtensionBridgeForCreate(browserId, options);
+    if (extBridge) {
+      const sessionId = options.sessionId || "default";
+      const created = await extBridge.client.request(
+        "createTab",
+        {
+          sessionId,
+          url: targetUrl,
+          ...(typeof options.windowId === "number" ? { windowId: options.windowId } : {}),
+          active: Boolean(options.active),
+          ...(options.groupTitle !== undefined ? { groupTitle: options.groupTitle } : {}),
+          ...(options.groupColor !== undefined ? { groupColor: options.groupColor } : {}),
+          ungroup: Boolean(options.ungroup),
+        },
+        8000,
+      );
+      const ctrl = this.getOrRegisterExtensionTabController(
+        {
+          tabId: created.tabId,
+          windowId: created.windowId,
+          groupId: created.groupId,
+          tabGroup: created.tabGroup || null,
+          title: created.title || "",
+          url: created.url || targetUrl,
+          ownership: { sessionId, role: "scratch", createdByAgent: true },
+        },
+        extBridge,
+        sessionId,
+      );
+      if (targetUrl !== "about:blank") {
+        // Wait for initial tab load via lightweight chrome.tabs.get without attaching chrome.debugger prematurely
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const info = await extBridge.client.request("getTab", { tabId: created.tabId }, 1500).catch(() => null);
+          if (!info || info.status === "complete") break;
+          await sleep(80);
+        }
+      }
+      return ctrl;
+    }
+
     const endpoint = await this.resolveCDPEndpointForCreate(browserId, options);
     const conn = this.getConnection(endpoint.wsUrl);
     const background = options.visible === true ? false : true;
@@ -3106,12 +4681,18 @@ export class BrowserManager {
     return this.tabs.get(tabId) ?? this.fallbackTabs.get(tabId) ?? null;
   }
 
+  async _autoClaimIfUserExtensionTab(ctrl, sessionId = "default") {
+    if (ctrl && ctrl.isExtensionTab && !ctrl.cachedMeta?.ownership) {
+      await ctrl.claimInPlace(sessionId).catch(() => {});
+    }
+    return ctrl;
+  }
+
   /**
-   * Bind an existing controllable tab by tabId ("tab-1", "safari:w1:t1"), providerTabId, `{ url }`, or `{ mention }`.
-   * Resolves known IDs in 0ms and active CDP tabs in ~8ms without invoking osascript JXA unless fallback is needed.
+   * Bind an existing controllable tab by tabId ("tab-1", "safari:w1:t1"), providerTabId, chromeTabId, `{ url }`, or `{ mention }`.
    */
   async getTab(reference, options = {}) {
-    const isStringRef = typeof reference === "string";
+    const isStringRef = typeof reference === "string" || typeof reference === "number";
     const isObjectRef =
       reference != null &&
       typeof reference === "object" &&
@@ -3122,36 +4703,39 @@ export class BrowserManager {
 
     const browserFilter = options.browser ? String(options.browser).toLowerCase() : null;
     const forceRefresh = Boolean(options.forceRefresh);
+    const sessionId = options.sessionId || "default";
 
     // 1. O(1) in-memory fast path for known tabId or CDP targetId (0ms, zero HTTP/JXA)
     if (isStringRef && !forceRefresh) {
-      const ref = reference.trim();
+      const ref = String(reference).trim();
       const direct = this.resolveControllerById(ref);
       if (direct && this.controllerMatchesBrowserFilter(direct, browserFilter)) {
-        return direct;
+        return await this._autoClaimIfUserExtensionTab(direct, sessionId);
       }
-      const mappedTabId = this.targetToTabId.get(ref);
+      const mappedTabId = this.targetToTabId.get(ref) ?? (/^\d+$/.test(ref) ? this.targetToTabId.get(`ext-tab-${ref}`) : null);
       if (mappedTabId) {
         const byTarget = this.resolveControllerById(mappedTabId);
         if (byTarget && this.controllerMatchesBrowserFilter(byTarget, browserFilter)) {
-          return byTarget;
+          return await this._autoClaimIfUserExtensionTab(byTarget, sessionId);
         }
       }
-      // 2. If not an AppleEvents ":wN:tM" ID, check live CDP endpoints (~8ms, zero osascript)
+      // 2. If not an AppleEvents ":wN:tM" ID, check live Extension + CDP endpoints (~8ms, zero osascript)
       if (!ref.includes(":w") && browserFilter !== "safari") {
         const cdpBrowsers = await this.refreshCDPTabsOnly();
         const candidateCdp = cdpBrowsers
           .filter((b) => this.matchesBrowserFilter(b, browserFilter))
           .flatMap((b) => b.tabs);
-        const foundCdp = candidateCdp.find((t) => t.id === ref || t.providerTabId === ref);
+        const foundCdp = candidateCdp.find(
+          (t) => t.id === ref || t.providerTabId === ref || (t.chromeTabId != null && String(t.chromeTabId) === ref),
+        );
         if (foundCdp) {
           const resolved = this.resolveControllerById(foundCdp.id);
-          if (resolved) return resolved;
+          if (resolved) return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
         }
       }
     }
 
-    // 3. Fast CDP-first resolution for { url } or { mention } (~8ms, zero osascript when CDP matches)
+    // 3. Fast Extension/CDP-first resolution for { url } or { mention } (~8ms, zero osascript when CDP matches)
     if (isObjectRef && !forceRefresh && browserFilter !== "safari") {
       if (typeof reference.url === "string") {
         const needle = reference.url.trim();
@@ -3168,14 +4752,14 @@ export class BrowserManager {
         }
         if (matches.length >= 1) {
           const resolved = this.resolveControllerById((exact[0] ?? matches[0]).id);
-          if (resolved) return resolved;
+          if (resolved) return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
         }
       } else if (typeof reference.mention === "string") {
         const m = reference.mention;
         for (const ctrl of [...this.tabs.values(), ...this.fallbackTabs.values()]) {
           if (!this.controllerMatchesBrowserFilter(ctrl, browserFilter)) continue;
           if ((ctrl.targetId && m.includes(ctrl.targetId)) || m.includes(ctrl.id)) {
-            return ctrl;
+            return await this._autoClaimIfUserExtensionTab(ctrl, sessionId);
           }
         }
         const cdpBrowsers = await this.refreshCDPTabsOnly();
@@ -3185,30 +4769,34 @@ export class BrowserManager {
         const found = fastCdpTabs.find((t) => (t.providerTabId && m.includes(t.providerTabId)) || m.includes(t.id));
         if (found) {
           const resolved = this.resolveControllerById(found.id);
-          if (resolved) return resolved;
+          if (resolved) return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
         }
       }
     }
 
-    // 4. Full inventory fallback (CDP + macOS AppleEvent tabs)
+    // 4. Full inventory fallback (Extension + CDP + macOS AppleEvent tabs)
     const browsers = await this.listBrowsersWithTabs({ forceRefresh });
     const candidateBrowsers = browserFilter
       ? browsers.filter((b) => this.matchesBrowserFilter(b, browserFilter))
       : browsers;
 
-    // Order CDP tabs ahead of AppleEvents fallback tabs when resolving URLs
+    // Order Extension/CDP tabs ahead of AppleEvents fallback tabs when resolving URLs
     const cdpTabs = candidateBrowsers.flatMap((b) => b.tabs).filter((t) => t.controllableViaCDP);
     const fallbackTabs = candidateBrowsers.flatMap((b) => b.tabs).filter((t) => !t.controllableViaCDP);
     const allTabs = [...cdpTabs, ...fallbackTabs];
 
     if (isStringRef) {
-      const ref = reference.trim();
+      const ref = String(reference).trim();
       const direct = this.resolveControllerById(ref);
-      if (direct && this.controllerMatchesBrowserFilter(direct, browserFilter)) return direct;
-      const byProvider = allTabs.find((t) => t.providerTabId === ref || t.id === ref);
+      if (direct && this.controllerMatchesBrowserFilter(direct, browserFilter)) {
+        return await this._autoClaimIfUserExtensionTab(direct, sessionId);
+      }
+      const byProvider = allTabs.find(
+        (t) => t.providerTabId === ref || t.id === ref || (t.chromeTabId != null && String(t.chromeTabId) === ref),
+      );
       if (byProvider) {
         const resolved = this.resolveControllerById(byProvider.id);
-        if (resolved) return resolved;
+        if (resolved) return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
       }
       throw new Error(
         `Controllable tab "${ref}" not found. Available tabs: ${allTabs.map((t) => `${t.id} (${t.url})`).join(", ") || "none"}`,
@@ -3229,13 +4817,261 @@ export class BrowserManager {
           `Ambiguous URL lookup "${needle}" matched ${matches.length} tabs (${matches.map((m) => m.id).join(", ")}). Pass an explicit tab ID.`,
         );
       }
-      return this.resolveControllerById((exact[0] ?? matches[0]).id);
+      const resolved = this.resolveControllerById((exact[0] ?? matches[0]).id);
+      return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
     }
 
     const m = reference.mention;
     const found = allTabs.find((t) => (t.providerTabId && m.includes(t.providerTabId)) || m.includes(t.id));
-    if (found) return this.resolveControllerById(found.id);
+    if (found) {
+      const resolved = this.resolveControllerById(found.id);
+      return await this._autoClaimIfUserExtensionTab(resolved, sessionId);
+    }
     throw new Error(`Could not resolve tab mention "${m}"`);
+  }
+
+  async _resolveNumericChromeTabIds(rawIds = [], bridgeQuery = null) {
+    await this.discoverExtensionBrowsers();
+    let bridge = this.extensionBridge.getBridge(bridgeQuery);
+    const numericIds = [];
+
+    const list = Array.isArray(rawIds) ? rawIds : [rawIds];
+    for (const item of list) {
+      if (typeof item === "number" && Number.isInteger(item)) {
+        numericIds.push(item);
+        continue;
+      }
+      const str = String(item ?? "").trim();
+      if (!str) continue;
+      if (/^\d+$/.test(str)) {
+        numericIds.push(Number(str));
+        continue;
+      }
+      const parsedExt = ExtensionCDPConnection.parseChromeTabId(str);
+      if (parsedExt != null) {
+        numericIds.push(parsedExt);
+        continue;
+      }
+      const ctrl = this.resolveControllerById(str);
+      if (ctrl && ctrl.chromeTabId != null) {
+        numericIds.push(ctrl.chromeTabId);
+        if (!bridge) bridge = this.extensionBridge.getBridge(ctrl.browserId);
+        continue;
+      }
+      throw new Error(`Could not resolve extension Chrome tabId for "${str}". Pass a tabId from an extension browser.`);
+    }
+
+    if (!bridge) {
+      bridge = this.extensionBridge.getBridge(bridgeQuery);
+    }
+    return { bridge, numericIds };
+  }
+
+  /**
+   * Session, Tab Group, Ownership, History & Bookmarks management (`browser_manage` MCP tool & `cua_repl`).
+   */
+  async manage(action, params = {}) {
+    const act = String(action || "status").trim().toLowerCase();
+    const browserQuery = params.browserId ?? params.browser_id ?? null;
+
+    if (act === "status") {
+      const [extBrowsers, rawCdp] = await Promise.all([
+        this.discoverExtensionBrowsers(),
+        this.discoverCDPEndpoints(),
+      ]);
+      const unpackedDir = path.join(PROJECT_ROOT, "extension");
+      const bridges = [];
+      for (const rec of this.extensionBridge.getConnectedBrowsers()) {
+        const groupsRes = await rec.client.request("listTabGroups", {}, 2000).catch(() => ({ groups: [] }));
+        bridges.push({
+          browserId: rec.browserId,
+          sockPath: rec.sockPath,
+          hostPid: rec.client.hostPid,
+          info: rec.client.info,
+          tabGroups: groupsRes.groups || [],
+          openTabCount: extBrowsers.find((b) => b.id === rec.browserId)?.tabs?.length ?? 0,
+        });
+      }
+      return {
+        ok: true,
+        extensionId: "cnipmpbdggdeocaigfifflifphanoiic",
+        unpackedExtensionPath: unpackedDir,
+        nativeHostName: "com.antigravity.browser_bridge",
+        sockDir: this.extensionBridge.sockDir,
+        connectedExtensionBrowsers: bridges,
+        rawCdpEndpoints: rawCdp.map((e) => ({ id: e.id, name: e.name, httpEndpoint: e.httpEndpoint, tabCount: e.pages.length })),
+        setupHint:
+          bridges.length === 0
+            ? `Open brave://extensions or chrome://extensions -> enable Developer mode -> Load unpacked -> select "${unpackedDir}".`
+            : null,
+      };
+    }
+
+    if (act === "finalize_session") {
+      await this.extensionBridge.refresh();
+      const targets = browserQuery
+        ? [this.extensionBridge.getBridge(browserQuery)].filter(Boolean)
+        : this.extensionBridge.getConnectedBrowsers();
+      const sessionId = params.sessionId ?? params.session_id;
+      const closeScratchTabs = params.closeScratchTabs ?? params.close_scratch_tabs ?? true;
+      const detachAll = Boolean(params.detachAll ?? params.detach_all);
+
+      const results = [];
+      for (const rec of targets) {
+        const r = await rec.client.request("finalizeSession", {
+          sessionId,
+          closeScratchTabs,
+          detachAll,
+        });
+        results.push({ browserId: rec.browserId, ...r });
+      }
+
+      // Also detach any raw CDP tabs if detachAll or no extension targets
+      let detachedRawCount = 0;
+      for (const ctrl of this.tabs.values()) {
+        if (!ctrl.isExtensionTab && ctrl.conn.targetSessions?.has(ctrl.targetId)) {
+          await ctrl.detach().catch(() => {});
+          detachedRawCount++;
+        } else if (ctrl.isExtensionTab) {
+          ctrl._activeIndicatorInjected = false;
+          ctrl.cursorState.visible = false;
+        }
+      }
+      await this.discoverExtensionBrowsers().catch(() => {});
+      return {
+        ok: true,
+        results,
+        detachedRawCdpTabs: detachedRawCount,
+      };
+    }
+
+    await this.extensionBridge.refresh();
+    const requireBridge = (resolvedBridge = null) => {
+      const b = resolvedBridge || this.extensionBridge.getBridge(browserQuery);
+      if (!b) {
+        const unpackedDir = path.join(PROJECT_ROOT, "extension");
+        throw new Error(
+          `Action '${act}' requires the Antigravity Browser Extension bridge. Load unpacked extension from "${unpackedDir}" in brave://extensions or chrome://extensions.`,
+        );
+      }
+      return b;
+    };
+
+    switch (act) {
+      case "list_tab_groups": {
+        const b = requireBridge();
+        const windowId = params.windowId ?? params.window_id;
+        return await b.client.request("listTabGroups", windowId != null ? { windowId: Number(windowId) } : {});
+      }
+      case "create_tab_group":
+      case "group_tabs": {
+        const rawTabIds = params.tabIds ?? params.tab_ids ?? (params.tabId ?? params.tab_id ? [params.tabId ?? params.tab_id] : []);
+        const { bridge, numericIds } = await this._resolveNumericChromeTabIds(rawTabIds, browserQuery);
+        const b = requireBridge(bridge);
+        return await b.client.request("groupTabs", {
+          tabIds: numericIds,
+          title: params.title ?? params.name,
+          color: params.color,
+          ...(params.groupId != null || params.group_id != null
+            ? { groupId: Number(params.groupId ?? params.group_id) }
+            : {}),
+          ...(params.windowId != null || params.window_id != null
+            ? { windowId: Number(params.windowId ?? params.window_id) }
+            : {}),
+          ...(typeof params.collapsed === "boolean" ? { collapsed: params.collapsed } : {}),
+        });
+      }
+      case "update_tab_group": {
+        const b = requireBridge();
+        return await b.client.request("updateTabGroup", {
+          groupId: Number(params.groupId ?? params.group_id),
+          title: params.title ?? params.name,
+          color: params.color,
+          ...(typeof params.collapsed === "boolean" ? { collapsed: params.collapsed } : {}),
+        });
+      }
+      case "name_session": {
+        const b = requireBridge();
+        return await b.client.request("nameSession", {
+          sessionId: params.sessionId ?? params.session_id ?? "default",
+          name: params.name ?? params.title,
+          color: params.color,
+          ...(typeof params.collapsed === "boolean" ? { collapsed: params.collapsed } : {}),
+        });
+      }
+      case "ungroup_tabs": {
+        const rawTabIds = params.tabIds ?? params.tab_ids ?? (params.tabId ?? params.tab_id ? [params.tabId ?? params.tab_id] : []);
+        const { bridge, numericIds } = await this._resolveNumericChromeTabIds(rawTabIds, browserQuery);
+        const b = requireBridge(bridge);
+        return await b.client.request("ungroupTabs", { tabIds: numericIds });
+      }
+      case "claim_tab": {
+        const rawId = params.tabId ?? params.tab_id;
+        const { bridge, numericIds } = await this._resolveNumericChromeTabIds([rawId], browserQuery);
+        const b = requireBridge(bridge);
+        if (numericIds.length === 0) throw new TypeError("claim_tab requires tab_id");
+        return await b.client.request("claimTab", {
+          sessionId: params.sessionId ?? params.session_id ?? "default",
+          tabId: numericIds[0],
+        });
+      }
+      case "mark_tab": {
+        const rawId = params.tabId ?? params.tab_id;
+        const status = params.status || "deliverable";
+        const strRef = String(rawId ?? "").trim();
+        const directCtrl = this.resolveControllerById(strRef);
+        if (directCtrl && typeof directCtrl.markTab === "function") {
+          return await directCtrl.markTab(status, {
+            sessionId: params.sessionId ?? params.session_id ?? "default",
+            activate: params.activate,
+          });
+        }
+        const { bridge, numericIds } = await this._resolveNumericChromeTabIds([rawId], browserQuery);
+        const b = requireBridge(bridge);
+        if (numericIds.length === 0) throw new TypeError("mark_tab requires tab_id");
+        return await b.client.request("markTab", {
+          sessionId: params.sessionId ?? params.session_id ?? "default",
+          tabId: numericIds[0],
+          status,
+          ...(params.activate !== undefined ? { activate: Boolean(params.activate) } : {}),
+        });
+      }
+      case "search_history": {
+        const b = requireBridge();
+        return await b.client.request("history.search", {
+          text: params.query ?? params.text ?? "",
+          maxResults: params.maxResults ?? params.max_results ?? params.limit ?? 25,
+          ...(params.startTime != null || params.start_time != null
+            ? { startTime: Number(params.startTime ?? params.start_time) }
+            : {}),
+          ...(params.endTime != null || params.end_time != null
+            ? { endTime: Number(params.endTime ?? params.end_time) }
+            : {}),
+        });
+      }
+      case "list_bookmarks": {
+        const b = requireBridge();
+        const q = params.query ?? params.text;
+        if (q != null && String(q).trim() !== "") {
+          return await b.client.request("bookmarks.search", { query: String(q) });
+        }
+        return await b.client.request("bookmarks.getRecent", {
+          count: params.count ?? params.limit ?? 25,
+        });
+      }
+      case "create_bookmark": {
+        const b = requireBridge();
+        return await b.client.request("bookmarks.create", {
+          ...(params.parentId ?? params.parent_id ? { parentId: String(params.parentId ?? params.parent_id) } : {}),
+          title: params.title ?? params.name ?? "",
+          ...(params.url ? { url: String(params.url) } : {}),
+        });
+      }
+      default:
+        throw new Error(
+          `Unsupported browser_manage action '${action}'. Supported actions: status, list_tab_groups, create_tab_group, group_tabs, update_tab_group, name_session, ungroup_tabs, claim_tab, mark_tab, finalize_session, search_history, list_bookmarks, create_bookmark`,
+        );
+    }
   }
 
   async configureCursor({ enabled, idleTimeoutMs, glideEnabled } = {}) {
@@ -3265,9 +5101,12 @@ export class BrowserManager {
       };
     }
     const activeFallbackTabs = Array.from(this.fallbackTabs.values()).filter((t) => t.isCursorCurrentlyVisible());
+    const activeCdpTabs = Array.from(this.tabs.values()).filter(
+      (t) => !t.isExtensionTab || t.conn.targetSessions?.has(t.targetId),
+    );
     const states = await Promise.all(
-      [...Array.from(this.tabs.values()), ...activeFallbackTabs].map((t) =>
-        t.getCursorState().catch(() => ({ tabId: t.id, visible: false })),
+      [...activeCdpTabs, ...activeFallbackTabs].map((t) =>
+        t.getCursorState().catch(() => ({ tabId: t.id, visible: false, badge: null })),
       ),
     );
     return {
@@ -3280,8 +5119,13 @@ export class BrowserManager {
     const activeFallbackTabs = Array.from(this.fallbackTabs.values()).filter(
       (t) => t.cursorState.visible || t.cursorState.updatedAt > 0,
     );
+    const activeCdpTabs = Array.from(this.tabs.values()).filter(
+      (t) => t.cursorState.visible || t.cursorState.updatedAt > 0,
+    );
     await Promise.all(
-      [...Array.from(this.tabs.values()), ...activeFallbackTabs].map((t) => t.hideCursor().catch(() => null)),
+      [...activeCdpTabs, ...activeFallbackTabs].map((t) =>
+        t.hideCursor({ keepActiveIndicator: false }).catch(() => null),
+      ),
     );
     return { ok: true };
   }
@@ -3290,6 +5134,7 @@ export class BrowserManager {
     for (const t of this.tabs.values()) {
       t.stopCompositorAwake?.({ sendStop: false });
     }
+    this.extensionBridge.closeAll();
     for (const c of this.connections.values()) {
       c.close();
     }
