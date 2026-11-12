@@ -253,6 +253,83 @@ activeTabFaviconEl.addEventListener("error", () => {
   activeTabGlobeEl.classList.remove("hidden");
 });
 
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  "co.uk",
+  "org.uk",
+  "gov.uk",
+  "ac.uk",
+  "me.uk",
+  "net.uk",
+  "com.au",
+  "net.au",
+  "org.au",
+  "edu.au",
+  "gov.au",
+  "co.jp",
+  "or.jp",
+  "ne.jp",
+  "ac.jp",
+  "go.jp",
+  "co.nz",
+  "org.nz",
+  "govt.nz",
+  "ac.nz",
+  "com.br",
+  "org.br",
+  "gov.br",
+  "edu.br",
+  "co.in",
+  "net.in",
+  "org.in",
+  "gov.in",
+  "ac.in",
+  "com.sg",
+  "edu.sg",
+  "gov.sg",
+  "com.hk",
+  "edu.hk",
+  "gov.hk",
+  "co.kr",
+  "or.kr",
+  "go.kr",
+  "com.tw",
+  "org.tw",
+  "gov.tw",
+  "co.za",
+  "org.za",
+  "gov.za",
+  "com.mx",
+  "org.mx",
+  "gob.mx",
+  "com.tr",
+  "gov.tr",
+  "edu.tr",
+  "co.il",
+  "org.il",
+  "gov.il",
+  "com.ar",
+  "org.ar",
+  "gob.ar",
+]);
+
+function getMinRegistrableLabels(parts) {
+  if (parts.length >= 2) {
+    const tail2 = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (MULTI_PART_PUBLIC_SUFFIXES.has(tail2)) {
+      return 3;
+    }
+  }
+  return 2;
+}
+
+function stripLeadingWwwIfRegistrable(hostname) {
+  if (!hostname.startsWith("www.")) return hostname;
+  const rest = hostname.slice(4);
+  if (!rest) return hostname;
+  const restParts = rest.split(".").filter(Boolean);
+  return restParts.length >= getMinRegistrableLabels(restParts) ? rest : hostname;
+}
+
 function normalizeSiteHost(rawHostOrUrl) {
   const raw = String(rawHostOrUrl || "").trim();
   if (!raw) return "";
@@ -260,7 +337,7 @@ function normalizeSiteHost(rawHostOrUrl) {
     try {
       const parsed = new URL(raw);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
-      return parsed.hostname.toLowerCase().replace(/^www\./, "").replace(/\.+$/, "");
+      return stripLeadingWwwIfRegistrable(parsed.hostname.toLowerCase().replace(/\.+$/, ""));
     } catch {
       return "";
     }
@@ -268,6 +345,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const stripped = raw
     .toLowerCase()
     .replace(/\/.*$/, "")
+    .replace(/^\.+/, "")
     .replace(/\.+$/, "");
   if (!stripped) return "";
   if (stripped.startsWith("[")) {
@@ -277,7 +355,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const hostOnly = stripped.includes(":") && stripped.indexOf(":") === stripped.lastIndexOf(":")
     ? stripped.replace(/:\d+$/, "")
     : stripped;
-  return hostOnly.replace(/^www\./, "").replace(/\.+$/, "");
+  return stripLeadingWwwIfRegistrable(hostOnly.replace(/\.+$/, ""));
 }
 
 function getHostCandidateChain(rawHost) {
@@ -287,9 +365,10 @@ function getHostCandidateChain(rawHost) {
     return [host];
   }
   const parts = host.split(".").filter(Boolean);
-  if (parts.length <= 1) return parts;
+  const minLabels = getMinRegistrableLabels(parts);
+  if (parts.length < minLabels) return [host];
   const chain = [];
-  for (let i = 0; i <= parts.length - 2; i += 1) {
+  for (let i = 0; i <= parts.length - minLabels; i += 1) {
     chain.push(parts.slice(i).join("."));
   }
   return chain;
@@ -705,6 +784,7 @@ function inferEffortFromModelId(modelId, fallback = "medium") {
 function formatModelDisplayName(rawName) {
   const cleaned = String(rawName || "Gemini 4 Carbon")
     .replace(/\s*\(.*?\)\s*/g, "")
+    .replace(/^(?:Google|Anthropic|OpenAI)\s+/i, "")
     .replace(/^Claude\s+/i, "")
     .trim();
   return cleaned || "Gemini 4 Carbon";
@@ -2450,6 +2530,7 @@ sitePolicySegmentedEl.addEventListener("click", async (e) => {
     state.sitePermissions = res.permissions;
     renderSettingsPopover();
     syncSharedPageChipUI();
+    refreshLiveSelectionFromActiveTab();
   }
 });
 
@@ -2466,6 +2547,7 @@ previewSitePolicyGroup.addEventListener("click", async (e) => {
   if (res?.permissions) {
     state.sitePermissions = res.permissions;
     syncSharedPageChipUI();
+    refreshLiveSelectionFromActiveTab();
     openBoundedPagePreview();
   }
 });
@@ -2774,7 +2856,9 @@ modeSwitchGroup.addEventListener("click", (e) => {
 unshareActiveTabBtn.addEventListener("click", (e) => {
   e.stopPropagation();
   state.includeActiveTab = false;
+  state.liveSelection = "";
   syncSharedPageChipUI();
+  syncSelectionChipUI();
 });
 
 reshareActiveTabBtn.addEventListener("click", () => {
@@ -3098,6 +3182,8 @@ if (hasExtensionRuntime && chrome.runtime?.connect) {
     } else if (msg.type === "sidepanel:sitePermissionsUpdated") {
       state.sitePermissions = msg.permissions || {};
       syncSharedPageChipUI();
+      refreshLiveSelectionFromActiveTab();
+      if (!settingsPopover.classList.contains("hidden")) renderSettingsPopover();
     } else if (msg.type === "sidepanel:settingsUpdated") {
       state.settings = { ...state.settings, ...(msg.settings || {}) };
       applyTheme(state.settings.theme);
@@ -3124,6 +3210,8 @@ if (hasExtensionRuntime && chrome.runtime?.connect) {
         promptInput.focus();
       }
     } else if (msg.type === "sidepanel:quoteSelection" && msg.selectionText) {
+      const activeHost = parseHost(state.activeTab?.url || "");
+      if (activeHost && getPolicyForHost(activeHost) === "block") return;
       state.dismissedSelectionText = "";
       state.liveSelection = String(msg.selectionText).trim();
       syncSelectionChipUI();

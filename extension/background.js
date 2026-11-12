@@ -162,6 +162,83 @@ let pickerState = {
   startedAt: 0,
 };
 
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  "co.uk",
+  "org.uk",
+  "gov.uk",
+  "ac.uk",
+  "me.uk",
+  "net.uk",
+  "com.au",
+  "net.au",
+  "org.au",
+  "edu.au",
+  "gov.au",
+  "co.jp",
+  "or.jp",
+  "ne.jp",
+  "ac.jp",
+  "go.jp",
+  "co.nz",
+  "org.nz",
+  "govt.nz",
+  "ac.nz",
+  "com.br",
+  "org.br",
+  "gov.br",
+  "edu.br",
+  "co.in",
+  "net.in",
+  "org.in",
+  "gov.in",
+  "ac.in",
+  "com.sg",
+  "edu.sg",
+  "gov.sg",
+  "com.hk",
+  "edu.hk",
+  "gov.hk",
+  "co.kr",
+  "or.kr",
+  "go.kr",
+  "com.tw",
+  "org.tw",
+  "gov.tw",
+  "co.za",
+  "org.za",
+  "gov.za",
+  "com.mx",
+  "org.mx",
+  "gob.mx",
+  "com.tr",
+  "gov.tr",
+  "edu.tr",
+  "co.il",
+  "org.il",
+  "gov.il",
+  "com.ar",
+  "org.ar",
+  "gob.ar",
+]);
+
+function getMinRegistrableLabels(parts) {
+  if (parts.length >= 2) {
+    const tail2 = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (MULTI_PART_PUBLIC_SUFFIXES.has(tail2)) {
+      return 3;
+    }
+  }
+  return 2;
+}
+
+function stripLeadingWwwIfRegistrable(hostname) {
+  if (!hostname.startsWith("www.")) return hostname;
+  const rest = hostname.slice(4);
+  if (!rest) return hostname;
+  const restParts = rest.split(".").filter(Boolean);
+  return restParts.length >= getMinRegistrableLabels(restParts) ? rest : hostname;
+}
+
 function normalizeSiteHost(rawHostOrUrl) {
   const raw = String(rawHostOrUrl || "").trim();
   if (!raw) return "";
@@ -169,7 +246,7 @@ function normalizeSiteHost(rawHostOrUrl) {
     try {
       const parsed = new URL(raw);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
-      return parsed.hostname.toLowerCase().replace(/^www\./, "").replace(/\.+$/, "");
+      return stripLeadingWwwIfRegistrable(parsed.hostname.toLowerCase().replace(/\.+$/, ""));
     } catch {
       return "";
     }
@@ -177,6 +254,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const stripped = raw
     .toLowerCase()
     .replace(/\/.*$/, "")
+    .replace(/^\.+/, "")
     .replace(/\.+$/, "");
   if (!stripped) return "";
   if (stripped.startsWith("[")) {
@@ -186,7 +264,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const hostOnly = stripped.includes(":") && stripped.indexOf(":") === stripped.lastIndexOf(":")
     ? stripped.replace(/:\d+$/, "")
     : stripped;
-  return hostOnly.replace(/^www\./, "").replace(/\.+$/, "");
+  return stripLeadingWwwIfRegistrable(hostOnly.replace(/\.+$/, ""));
 }
 
 function getHostCandidateChain(rawHost) {
@@ -196,9 +274,10 @@ function getHostCandidateChain(rawHost) {
     return [host];
   }
   const parts = host.split(".").filter(Boolean);
-  if (parts.length <= 1) return parts;
+  const minLabels = getMinRegistrableLabels(parts);
+  if (parts.length < minLabels) return [host];
   const chain = [];
-  for (let i = 0; i <= parts.length - 2; i += 1) {
+  for (let i = 0; i <= parts.length - minLabels; i += 1) {
     chain.push(parts.slice(i).join("."));
   }
   return chain;
@@ -254,6 +333,30 @@ function getSitePolicyForUrl(rawUrl) {
   return getSitePolicyForHost(normalizeHostFromUrl(rawUrl));
 }
 
+function assertHostNotBlocked(rawUrlOrHost, surfaceLabel = "Browser control") {
+  const host = normalizeSiteHost(rawUrlOrHost);
+  if (host && getSitePolicyForHost(host) === "block") {
+    const err = new Error(
+      `${surfaceLabel} is blocked on ${host} by Antigravity in Chrome site permissions.`,
+    );
+    err.code = -32021;
+    throw err;
+  }
+}
+
+function pruneOrphanAllowSiteRules() {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [ruleHost, rulePolicy] of Array.from(sitePermissions.entries())) {
+      if (rulePolicy === "allow" && getInheritedParentPolicyForHost(ruleHost) === "allow") {
+        sitePermissions.delete(ruleHost);
+        changed = true;
+      }
+    }
+  }
+}
+
 function getSitePermissionsSnapshot() {
   const out = {};
   for (const [host, policy] of sitePermissions.entries()) {
@@ -267,10 +370,8 @@ async function setSitePermissionForHost(rawHost, rawPolicy) {
   const host = normalizeSiteHost(rawHost);
   if (!host) throw new Error("Valid hostname is required for site access permission.");
   const requested = String(rawPolicy || "").trim().toLowerCase();
-  let effectivePolicy = "allow";
   if (requested === "reset") {
     sitePermissions.delete(host);
-    effectivePolicy = getSitePolicyForHost(host);
   } else {
     const policy = ["allow", "ask", "block"].includes(requested) ? requested : "allow";
     if (policy === "allow" && getInheritedParentPolicyForHost(host) === "allow") {
@@ -278,8 +379,9 @@ async function setSitePermissionForHost(rawHost, rawPolicy) {
     } else {
       sitePermissions.set(host, policy);
     }
-    effectivePolicy = getSitePolicyForHost(host);
   }
+  pruneOrphanAllowSiteRules();
+  const effectivePolicy = getSitePolicyForHost(host);
   const snapshot = getSitePermissionsSnapshot();
   try {
     if (chrome.storage?.local?.set) {
@@ -462,6 +564,7 @@ async function ensureLocalStateLoaded() {
           sitePermissions.set(normalizedHost, policy);
         }
       }
+      pruneOrphanAllowSiteRules();
     }
     if (data?.agExtensionSettings && typeof data.agExtensionSettings === "object") {
       extensionSettings = {
@@ -732,6 +835,12 @@ async function ensureDebuggerAttached(tabId) {
   if (!Number.isInteger(tid) || tid <= 0) {
     throw new Error(`Invalid tabId for debugger attach: ${tabId}`);
   }
+  try {
+    const tabInfo = await chrome.tabs.get(tid);
+    assertHostNotBlocked(tabInfo?.url || tabInfo?.pendingUrl || "");
+  } catch (err) {
+    if (err?.code === -32021) throw err;
+  }
   if (attachedTabs.has(tid)) return { attached: true, alreadyAttached: true };
   if (pendingAttachByTab.has(tid)) {
     return pendingAttachByTab.get(tid);
@@ -800,11 +909,40 @@ async function sendCdpCommand({ tabId, targetId, sessionId, method, params = {},
     }
   }
 
+  if ((method === "Page.navigate" || method === "Target.createTarget") && finalParams.url) {
+    assertHostNotBlocked(String(finalParams.url));
+  }
+
   // Child OOPIF routing when sessionId or explicit child targetId is provided
   const childInfo = sessionId ? childSessionMap.get(sessionId) : null;
   const effectiveChildTargetId = targetId || childInfo?.targetId || null;
 
   if (effectiveChildTargetId) {
+    if (childInfo?.targetInfo?.url) {
+      assertHostNotBlocked(String(childInfo.targetInfo.url));
+    }
+    const checkParentTabId = Number(tabId ?? childInfo?.tabId);
+    if (Number.isInteger(checkParentTabId) && checkParentTabId > 0) {
+      try {
+        const parentTab = await chrome.tabs.get(checkParentTabId);
+        assertHostNotBlocked(parentTab?.url || parentTab?.pendingUrl || "");
+      } catch (err) {
+        if (err?.code === -32021) throw err;
+      }
+    }
+    if (typeof chrome.debugger?.getTargets === "function") {
+      try {
+        const targets = await chrome.debugger.getTargets();
+        const foundTarget = Array.isArray(targets)
+          ? targets.find((t) => t?.id === effectiveChildTargetId)
+          : null;
+        if (foundTarget?.url) {
+          assertHostNotBlocked(String(foundTarget.url));
+        }
+      } catch (err) {
+        if (err?.code === -32021) throw err;
+      }
+    }
     try {
       if (!attachedChildTargets.has(effectiveChildTargetId)) {
         try {
@@ -2109,6 +2247,9 @@ function appendRecordedStep(rawStep = {}, senderTabId = null) {
   if (senderTabId && recordingState.tabId && Number(senderTabId) !== Number(recordingState.tabId)) {
     return { ok: false, ignored: true, recording: getRecordingSnapshot() };
   }
+  if (rawStep.url && getSitePolicyForUrl(String(rawStep.url)) === "block") {
+    return { ok: false, blocked: true, recording: getRecordingSnapshot() };
+  }
   if (recordingState.steps.length >= MAX_RECORDED_ACTIONS) {
     const cappedSnapshot = { ...getRecordingSnapshot(), capped: true };
     broadcastToSidePanels({ type: "sidepanel:recordingUpdated", recording: cappedSnapshot });
@@ -2895,7 +3036,10 @@ const rpcHandlers = {
     if (state) q.state = String(state);
     if (Array.isArray(query)) q.query = query.map(String);
     else if (typeof query === "string" && query.trim()) q.query = [query.trim()];
-    const items = await chrome.downloads.search(q);
+    const rawItems = await chrome.downloads.search(q);
+    const items = Array.isArray(rawItems)
+      ? rawItems.filter((d) => getSitePolicyForUrl(d?.finalUrl || d?.url || "") !== "block")
+      : [];
     return {
       downloads: items.map((d) => ({
         id: d.id,
@@ -2916,6 +3060,7 @@ const rpcHandlers = {
 
   async "downloads.download"({ url, filename, conflictAction = "uniquify", saveAs = false } = {}) {
     if (!url) throw new Error("downloads.download requires url");
+    assertHostNotBlocked(String(url), "Download");
     const opts = { url: String(url), conflictAction, saveAs: Boolean(saveAs) };
     if (filename) opts.filename = String(filename);
     const downloadId = await chrome.downloads.download(opts);
@@ -2924,13 +3069,22 @@ const rpcHandlers = {
 
   async "cookies.getAll"({ url, domain, name, path, secure, session } = {}) {
     const details = {};
-    if (url) details.url = String(url);
-    if (domain) details.domain = String(domain);
+    if (url) {
+      assertHostNotBlocked(String(url), "Cookie access");
+      details.url = String(url);
+    }
+    if (domain) {
+      assertHostNotBlocked(String(domain), "Cookie access");
+      details.domain = String(domain);
+    }
     if (name) details.name = String(name);
     if (path) details.path = String(path);
     if (typeof secure === "boolean") details.secure = secure;
     if (typeof session === "boolean") details.session = session;
-    const cookies = await chrome.cookies.getAll(details);
+    const rawCookies = await chrome.cookies.getAll(details);
+    const cookies = Array.isArray(rawCookies)
+      ? rawCookies.filter((c) => getSitePolicyForHost(c?.domain || "") !== "block")
+      : [];
     return { cookies };
   },
 
@@ -2938,12 +3092,15 @@ const rpcHandlers = {
     if (!cookie || !cookie.url || !cookie.name) {
       throw new Error("cookies.set requires url and name");
     }
+    assertHostNotBlocked(String(cookie.url), "Cookie access");
+    if (cookie.domain) assertHostNotBlocked(String(cookie.domain), "Cookie access");
     const setCookie = await chrome.cookies.set(cookie);
     return { ok: Boolean(setCookie), cookie: setCookie };
   },
 
   async "cookies.remove"({ url, name } = {}) {
     if (!url || !name) throw new Error("cookies.remove requires url and name");
+    assertHostNotBlocked(String(url), "Cookie access");
     const removed = await chrome.cookies.remove({ url: String(url), name: String(name) });
     return { ok: Boolean(removed), removed };
   },
@@ -2955,21 +3112,31 @@ const rpcHandlers = {
     };
     if (typeof startTime === "number") q.startTime = startTime;
     if (typeof endTime === "number") q.endTime = endTime;
-    const items = await chrome.history.search(q);
+    const rawItems = await chrome.history.search(q);
+    const items = Array.isArray(rawItems)
+      ? rawItems.filter((h) => getSitePolicyForUrl(h?.url || "") !== "block")
+      : [];
     return { items };
   },
 
   async "bookmarks.search"({ query = "" } = {}) {
-    const items = await chrome.bookmarks.search(String(query ?? ""));
+    const rawItems = await chrome.bookmarks.search(String(query ?? ""));
+    const items = Array.isArray(rawItems)
+      ? rawItems.filter((b) => !b?.url || getSitePolicyForUrl(b.url) !== "block")
+      : [];
     return { items };
   },
 
   async "bookmarks.getRecent"({ numberOfItems = 25 } = {}) {
-    const items = await chrome.bookmarks.getRecent(Math.max(1, Math.min(200, Number(numberOfItems) || 25)));
+    const rawItems = await chrome.bookmarks.getRecent(Math.max(1, Math.min(200, Number(numberOfItems) || 25)));
+    const items = Array.isArray(rawItems)
+      ? rawItems.filter((b) => !b?.url || getSitePolicyForUrl(b.url) !== "block")
+      : [];
     return { items };
   },
 
   async "bookmarks.create"({ parentId, title, url } = {}) {
+    if (url) assertHostNotBlocked(String(url), "Bookmark creation");
     const created = await chrome.bookmarks.create({
       ...(parentId ? { parentId: String(parentId) } : {}),
       ...(title ? { title: String(title) } : {}),
@@ -3031,6 +3198,7 @@ async function handleNativeIncoming(msg) {
     return;
   }
   try {
+    await ensureLocalStateLoaded();
     const result = await handler(params || {});
     if (id !== undefined) {
       sendNativeMessage({
@@ -3192,19 +3360,27 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     });
     broadcastToSidePanels({ type: "sidepanel:tabsChanged", tabId });
   }
+  const updatedUrl = changeInfo.url || tab?.url || "";
+  if (updatedUrl && attachedTabs.has(tabId) && getSitePolicyForUrl(updatedUrl) === "block") {
+    detachDebuggerSafe(tabId).catch(() => {});
+  }
   if (recordingState.active && Number(tabId) === Number(recordingState.tabId)) {
-    if (changeInfo.url) {
-      appendRecordedStep(
-        {
-          kind: "navigate",
-          label: `Navigate to ${changeInfo.url}`,
-          url: changeInfo.url,
-        },
-        tabId,
-      );
-    }
-    if (changeInfo.status === "complete") {
-      injectRecorderIntoTab(tabId).catch(() => {});
+    if (updatedUrl && getSitePolicyForUrl(updatedUrl) === "block") {
+      removeRecorderFromTab(tabId).catch(() => {});
+    } else {
+      if (changeInfo.url && isSafeInjectableUrl(changeInfo.url)) {
+        appendRecordedStep(
+          {
+            kind: "navigate",
+            label: `Navigate to ${changeInfo.url}`,
+            url: changeInfo.url,
+          },
+          tabId,
+        );
+      }
+      if (changeInfo.status === "complete") {
+        injectRecorderIntoTab(tabId).catch(() => {});
+      }
     }
   }
   if (pickerState.active && Number(tabId) === Number(pickerState.tabId)) {
@@ -3249,7 +3425,11 @@ if (chrome.contextMenus?.onClicked?.addListener) {
           chrome.sidePanel.open({ windowId: tab.windowId }).catch?.(() => {});
         }
       }
-      if (info?.menuItemId === "ag-ask-selection" && info.selectionText) {
+      if (
+        info?.menuItemId === "ag-ask-selection" &&
+        info.selectionText &&
+        getSitePolicyForUrl(tab?.url || info.pageUrl || "") !== "block"
+      ) {
         setTimeout(() => {
           broadcastToSidePanels({
             type: "sidepanel:quoteSelection",

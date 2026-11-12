@@ -5,7 +5,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { AXDiffTracker } from "../src/diff.mjs";
 import { MacBridge } from "../src/mac-bridge.mjs";
@@ -85,20 +84,10 @@ function findFirstIndexedElementWithBounds(treeText) {
   return null;
 }
 
-const __testDirname = path.dirname(fileURLToPath(import.meta.url));
-const CURSOR_FIXTURE_SRC_BIN = path.join(
-  __testDirname,
-  "fixtures",
-  "TestCocoaApp.app",
-  "Contents",
-  "MacOS",
-  "TestCocoaApp",
-);
-
 test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-order isolation, unconstrained y=10 menu-bar cursor, 1:1 JPEG dimensions, includeCursor screenshots, diff isolation, and error paths", async (t) => {
   const diffTracker = new AXDiffTracker();
   const bridge = new MacBridge({ diffTracker });
-  let fixtureTmpDir = null;
+  const fixtureSwiftPath = path.join(os.tmpdir(), `ag_cursor_fix_${process.pid}_${Date.now()}.swift`);
   let fixtureProc = null;
 
   t.after(async () => {
@@ -111,49 +100,124 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
         fixtureProc.kill("SIGTERM");
       } catch {}
     }
-    if (fixtureTmpDir) {
-      try {
-        fs.rmSync(fixtureTmpDir, { recursive: true, force: true });
-      } catch {}
-    }
+    try {
+      fs.unlinkSync(fixtureSwiftPath);
+    } catch {}
     bridge.close();
   });
 
   const perms = await bridge.checkPermissions();
   assert.equal(perms.axTrusted, true, "Accessibility permission must be granted");
 
-  // Spawn an isolated static 2-window Cocoa fixture (non-activating, distinct binary & window prefix)
-  // so neither active user apps nor concurrent native-mac.test.mjs mutate winA during AX diff checks.
+  // Spawn an isolated static 2-window .accessory AppKit fixture with [.canJoinAllSpaces, .fullScreenAuxiliary]
+  // so winA/winB are on-screen and AX-backed on BOTH Desktop and Full-Screen Spaces, with zero Dock icon,
+  // zero focus theft, and zero fallback to mutating user windows during AX diff checks.
   const cursorPrefix = `AGCursorFixture_${process.pid}`;
-  if (fs.existsSync(CURSOR_FIXTURE_SRC_BIN)) {
-    fixtureTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-cursor-fix-"));
-    const isolatedBin = path.join(fixtureTmpDir, "AGCursorFixture");
-    fs.copyFileSync(CURSOR_FIXTURE_SRC_BIN, isolatedBin);
-    fs.chmodSync(isolatedBin, 0o755);
-    fixtureProc = spawn(isolatedBin, [], {
-      env: { ...process.env, AG_WINDOW_PREFIX: cursorPrefix },
-      stdio: "ignore",
-    });
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      await new Promise((r) => setTimeout(r, 125));
-      const probeWins = await bridge.listWindows({ includeMinimized: false });
-      const readyAlpha = probeWins.find((w) => w.title === `${cursorPrefix} Alpha`);
-      const readyBeta = probeWins.find((w) => w.title === `${cursorPrefix} Beta`);
-      if (readyAlpha && readyBeta && readyAlpha.axBacked !== false) break;
+  const swiftSource = `
+import Cocoa
+
+final class StaticCursorFixtureDelegate: NSObject, NSApplicationDelegate {
+    var winAlpha: NSWindow!
+    var winBeta: NSWindow!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        winAlpha = NSWindow(
+            contentRect: NSRect(x: 96, y: 140, width: 380, height: 240),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        winAlpha.title = "${cursorPrefix} Alpha"
+        winAlpha.isReleasedWhenClosed = false
+        winAlpha.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let rootA = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 240))
+        let labelA = NSTextField(labelWithString: "Static Fixture Alpha")
+        labelA.frame = NSRect(x: 20, y: 180, width: 220, height: 24)
+        rootA.addSubview(labelA)
+        let btnA = NSButton(title: "Static Target Button", target: nil, action: nil)
+        btnA.frame = NSRect(x: 24, y: 110, width: 180, height: 32)
+        rootA.addSubview(btnA)
+        winAlpha.contentView = rootA
+        winAlpha.orderFrontRegardless()
+
+        winBeta = NSWindow(
+            contentRect: NSRect(x: 504, y: 140, width: 380, height: 240),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        winBeta.title = "${cursorPrefix} Beta"
+        winBeta.isReleasedWhenClosed = false
+        winBeta.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let rootB = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 240))
+        let btnB = NSButton(title: "Secondary Target", target: nil, action: nil)
+        btnB.frame = NSRect(x: 24, y: 110, width: 160, height: 32)
+        rootB.addSubview(btnB)
+        winBeta.contentView = rootB
+        winBeta.orderFrontRegardless()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            print("READY w1=\\(self.winAlpha.windowNumber) w2=\\(self.winBeta.windowNumber)")
+            fflush(stdout)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25.0) { exit(0) }
     }
-  }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let delegate = StaticCursorFixtureDelegate()
+app.delegate = delegate
+withExtendedLifetime(delegate) { app.run() }
+`;
+
+  fs.writeFileSync(fixtureSwiftPath, swiftSource, "utf8");
+  fixtureProc = spawn("/usr/bin/swift", [fixtureSwiftPath], { stdio: ["ignore", "pipe", "pipe"] });
+  let fixtureOut = "";
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for static cursor fixture: ${fixtureOut}`)),
+      8000,
+    );
+    fixtureProc.stdout.on("data", (chunk) => {
+      fixtureOut += chunk.toString("utf8");
+      if (fixtureOut.includes("READY")) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    fixtureProc.stderr.on("data", (chunk) => {
+      fixtureOut += chunk.toString("utf8");
+    });
+    fixtureProc.on("exit", (code) => {
+      if (!fixtureOut.includes("READY")) {
+        clearTimeout(timer);
+        reject(new Error(`Static cursor fixture exited early (${code}): ${fixtureOut}`));
+      }
+    });
+  });
+
+  const readyMatch = /READY w1=(\d+) w2=(\d+)/.exec(fixtureOut);
+  assert.ok(readyMatch, `Expected READY window IDs from cursor fixture, got: ${fixtureOut}`);
+  const fixtureAlphaId = Number(readyMatch[1]);
+  const fixtureBetaId = Number(readyMatch[2]);
 
   const openWins = (await bridge.listWindows({ includeMinimized: false })).filter(
     (w) => w.bounds && w.bounds.width >= 160 && w.bounds.height >= 120,
   );
-  assert.ok(openWins.length >= 1, "Expected at least one open desktop window for non-intrusive overlay testing");
-
-  const onScreenWins = openWins.filter((w) => w.onScreen !== false);
   const offSpaceWin = openWins.find((w) => w.onScreen === false) ?? null;
-  const fixtureAlpha = onScreenWins.find((w) => w.title === `${cursorPrefix} Alpha`);
-  const fixtureBeta = onScreenWins.find((w) => w.title === `${cursorPrefix} Beta`);
-  const winA = fixtureAlpha ?? onScreenWins[0] ?? openWins[0];
-  const winB = fixtureBeta ?? openWins.find((w) => w.id !== winA.id) ?? null;
+  const winA = openWins.find((w) => w.id === fixtureAlphaId);
+  const winB = openWins.find((w) => w.id === fixtureBetaId);
+  assert.ok(winA, `Expected isolated fixture Alpha (wid=${fixtureAlphaId}) in listWindows`);
+  assert.ok(winB, `Expected isolated fixture Beta (wid=${fixtureBetaId}) in listWindows`);
+  if (!winA.axBacked || !winB.axBacked) {
+    t.skip("macOS session screen is locked (kAXWindowsAttribute suppressed by WindowServer)");
+    return;
+  }
+  assert.equal(winA.onScreen, true, "Fixture Alpha must be onScreen on active Space (including Full-Screen Spaces)");
+  assert.equal(winB.onScreen, true, "Fixture Beta must be onScreen on active Space (including Full-Screen Spaces)");
 
   // 1. Verify unified 1:1 window-relative AX header & element coordinate space
   const stA = await bridge.getWindowState({ windowId: winA.id, disableDiff: true });
@@ -1751,6 +1815,7 @@ final class CoordFixtureDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         win = NSWindow(contentRect: NSRect(x: 120, y: 140, width: 520, height: 340), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "CodexCoordPrecisionTarget"
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let root = TrackView(frame: NSRect(x: 0, y: 0, width: 520, height: 340))
         let btnA = NSButton(title: "CoordBtnA", target: self, action: #selector(tapA))
         btnA.frame = NSRect(x: 30, y: 40, width: 120, height: 32)
@@ -1769,7 +1834,7 @@ final class CoordFixtureDelegate: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 let delegate = CoordFixtureDelegate()
 app.delegate = delegate
 withExtendedLifetime(delegate) { app.run() }

@@ -68,6 +68,7 @@ function launchNativeHostWithRealExtension({
   sockDir,
   brand = "brave",
   initialTabs = [],
+  initialLocalStorage = {},
   onDebuggerCommand = null,
   extraHostEnv = {},
 }) {
@@ -109,7 +110,7 @@ function launchNativeHostWithRealExtension({
     { id: "h-1", title: "Release Notes", url: "https://antigravity.example.test/releases", lastVisitTime: Date.now() },
   ];
   const sessionStorageMap = {};
-  const localStorageMap = {};
+  const localStorageMap = { ...initialLocalStorage };
   const createdAlarms = new Map();
   let sidePanelBehavior = null;
 
@@ -3281,21 +3282,33 @@ test("Hierarchical Subdomain Site Governance, Standalone-Safe Popup Runtime, and
     assert.match(elements["group-summary"].textContent, /browser toolbar/i);
   }
 
-  // 2b. Runtime `sendMessage` rejection with raw TypeError or invalidated extension context
-  const { elements: errElements } = runPopupVm({
-    chromeMock: {
-      runtime: {
-        async sendMessage() {
-          throw new TypeError("Cannot read properties of undefined (reading 'sendMessage')");
+  // 2b. Runtime `sendMessage` rejection with raw TypeError, Chrome webpage invocation error, or Firefox-style TypeError
+  for (const thrownErr of [
+    new TypeError("Cannot read properties of undefined (reading 'sendMessage')"),
+    new Error(
+      "Error in invocation of runtime.sendMessage(optional string extensionId, any message, optional object options, optional function callback): chrome.runtime.sendMessage() called from a webpage must specify an Extension ID (string) for its first argument.",
+    ),
+    new TypeError("chrome.runtime is undefined"),
+  ]) {
+    const { elements: errElements } = runPopupVm({
+      chromeMock: {
+        runtime: {
+          async sendMessage() {
+            throw thrownErr;
+          },
         },
       },
-    },
-  });
-  await new Promise((r) => setTimeout(r, 15));
-  assert.doesNotMatch(errElements["group-summary"].textContent, /Cannot read propert|TypeError/i);
-  assert.match(errElements["group-summary"].textContent, /waking up|Reconnect/i);
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.doesNotMatch(
+      errElements["group-summary"].textContent,
+      /Cannot read propert|TypeError|Error in invocation|must specify an Extension ID|is undefined/i,
+      `popup.js leaked raw error for ${thrownErr.message}: ${errElements["group-summary"].textContent}`,
+    );
+    assert.match(errElements["group-summary"].textContent, /waking up|Reconnect|browser toolbar/i);
+  }
 
-  // 2c. Subdomain inheritance + subdomain override inside popup.js
+  // 2c. Subdomain inheritance + subdomain override + multi-part public suffix inside popup.js
   let mockPerms = { "example.com": "block" };
   let mockTabUrl = "https://sub.example.com/dashboard";
   const { elements: subElements, segBtns, ctx: subCtx } = runPopupVm({
@@ -3331,6 +3344,19 @@ test("Hierarchical Subdomain Site Governance, Standalone-Safe Popup Runtime, and
   await vm.runInContext("refresh()", subCtx);
   assert.equal(segBtns.find((b) => b.dataset.policy === "allow").classList.contains("active"), true);
   assert.equal(segBtns.find((b) => b.dataset.policy === "block").classList.contains("active"), false);
+
+  mockPerms = { "service.co.uk": "block", "co.uk": "block" };
+  mockTabUrl = "https://portal.service.co.uk/login";
+  await vm.runInContext("refresh()", subCtx);
+  assert.equal(segBtns.find((b) => b.dataset.policy === "block").classList.contains("active"), true);
+
+  mockTabUrl = "https://unrelated.co.uk/news";
+  await vm.runInContext("refresh()", subCtx);
+  assert.equal(
+    segBtns.find((b) => b.dataset.policy === "allow").classList.contains("active"),
+    true,
+    "Bare multi-part public suffix co.uk must never cross-match unrelated *.co.uk domains",
+  );
 
   // 3. End-to-End Subdomain Site Access Governance in background.js + Native Host + MCP Socket
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-subdomain-gov-"));
@@ -3378,6 +3404,10 @@ rl.on("line", (line) => {
       { id: 45, windowId: 1, active: false, title: "Portal Ask", url: "https://portal.corp.test/home" },
       { id: 46, windowId: 1, active: false, title: "Sibling Ask", url: "https://hr.corp.test/payroll" },
       { id: 47, windowId: 1, active: false, title: "Local IP", url: "http://192.168.1.10/status" },
+      { id: 48, windowId: 1, active: false, title: "Scratch Blank", url: "https://allowed.example.test/start" },
+      { id: 49, windowId: 1, active: false, title: "UK Portal", url: "https://portal.service.co.uk/home" },
+      { id: 50, windowId: 1, active: false, title: "UK Other", url: "https://unrelated.co.uk/news" },
+      { id: 51, windowId: 1, active: false, title: "WWW IO Root", url: "https://www.io/docs" },
     ],
   });
   t.after(async () => {
@@ -3516,4 +3546,195 @@ rl.on("line", (line) => {
     payload: { userText: "Check router status", includeActiveTab: true, activeTabId: 47 },
   });
   assert.equal(ipPrompt.ok, true, "IPv4 addresses must only match exact IPv4 host, never suffix octets");
+
+  // 3f. Zombie `"allow"` child override pruning when ancestor rule returns to `"allow"` and is later re-blocked
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "docs.example.com",
+    policy: "allow",
+  });
+  const unblockParentRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "example.com",
+    policy: "allow",
+  });
+  assert.equal("example.com" in unblockParentRes.permissions, false);
+  assert.equal(
+    "docs.example.com" in unblockParentRes.permissions,
+    false,
+    "Redundant child allow override must be pruned when parent domain returns to default allow",
+  );
+  const reblockParentRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "example.com",
+    policy: "block",
+  });
+  assert.equal(reblockParentRes.permissions["example.com"], "block");
+  const docsAfterReblock = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Try docs after parent re-block", includeActiveTab: true, activeTabId: 43 },
+  });
+  assert.equal(
+    docsAfterReblock.ok,
+    false,
+    "Re-blocking parent domain must not be bypassed by stale orphan child allow rules",
+  );
+  assert.equal(docsAfterReblock.code, -32021);
+
+  // 3g. Multi-part public suffixes (`co.uk`) and `www.<tld>` (`www.io`) normalization
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "service.co.uk",
+    policy: "block",
+  });
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "co.uk",
+    policy: "block",
+  });
+  const ukBlockedPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Check UK portal", includeActiveTab: true, activeTabId: 49 },
+  });
+  assert.equal(ukBlockedPrompt.ok, false);
+  assert.equal(ukBlockedPrompt.code, -32021);
+
+  const ukUnrelatedPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Check unrelated UK site", includeActiveTab: true, activeTabId: 50 },
+  });
+  assert.equal(
+    ukUnrelatedPrompt.ok,
+    true,
+    "Multi-part public suffix co.uk must never cross-match unrelated *.co.uk registrable domains",
+  );
+
+  const wwwIoBlockRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "https://www.io/docs",
+    policy: "block",
+  });
+  assert.equal(
+    wwwIoBlockRes.host,
+    "www.io",
+    "normalizeSiteHost must preserve www.<tld> when stripping www. would leave a bare TLD",
+  );
+  const wwwIoPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Check www.io", includeActiveTab: true, activeTabId: 51 },
+  });
+  assert.equal(wwwIoPrompt.ok, false);
+  assert.equal(wwwIoPrompt.code, -32021);
+
+  // 3h. Enforcement across `attachDebugger`, `sendCdp` (`Page.navigate` onto blocked subdomain), `downloads.download`, `cookies.*`, `bookmarks.create`, and Workflow Recorder navigation
+  await assert.rejects(
+    () => mcpSock.request("attachDebugger", { tabId: 41 }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () =>
+      mcpSock.request("sendCdp", {
+        tabId: 48,
+        method: "Page.navigate",
+        params: { url: "https://sub.example.com/exfil" },
+      }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () => mcpSock.request("downloads.download", { url: "https://sub.example.com/secret.pdf" }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () => mcpSock.request("bookmarks.create", { title: "Blocked", url: "https://sub.example.com/vault" }),
+    (err) => err.code === -32021,
+  );
+  env.cookies.push({
+    name: "vault_token",
+    value: "topsecret",
+    domain: ".sub.example.com",
+    path: "/",
+    secure: true,
+    httpOnly: true,
+  });
+  await assert.rejects(
+    () => mcpSock.request("cookies.getAll", { domain: "sub.example.com" }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () => mcpSock.request("cookies.set", { url: "https://sub.example.com/", name: "k", value: "v" }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () => mcpSock.request("cookies.remove", { url: "https://sub.example.com/", name: "vault_token" }),
+    (err) => err.code === -32021,
+  );
+  const unfilteredCookies = await mcpSock.request("cookies.getAll", {});
+  assert.equal(
+    unfilteredCookies.cookies.some((c) => c.name === "vault_token"),
+    false,
+    "Unfiltered cookies.getAll({}) must redact cookies belonging to blocked domains/subdomains",
+  );
+  assert.equal(unfilteredCookies.cookies.some((c) => c.name === "sid"), true);
+
+  // Workflow recorder started on allowed tab #48 must NOT record steps if tab #48 navigates onto blocked `sub.example.com`
+  const recStart = await env.sendRuntimeMessage({
+    type: "sidepanel:startRecording",
+    payload: { tabId: 48 },
+  });
+  assert.equal(recStart.ok, true);
+  env.tabs.get(48).url = "https://sub.example.com/private-token";
+  env.tabs.get(48).title = "Private Token";
+  env.tabsOnUpdated.emit(48, { status: "complete" }, env.tabs.get(48));
+  await new Promise((r) => setTimeout(r, 25));
+  const recStepOnBlocked = await env.sendRuntimeMessage(
+    {
+      type: "recorder:step",
+      step: {
+        kind: "click",
+        selector: "button#copy-secret",
+        label: "Copy secret",
+        url: "https://sub.example.com/private-token",
+        title: "Private Token",
+      },
+    },
+    { tab: { id: 48 } },
+  );
+  assert.equal(recStepOnBlocked.ok, false);
+  const recStop = await env.sendRuntimeMessage({ type: "sidepanel:stopRecording" });
+  assert.equal(
+    recStop.recording.steps.some((s) => String(s.url || "").includes("sub.example.com")),
+    false,
+    "Workflow recorder must never record navigations or clicks on blocked domains/subdomains",
+  );
+
+  // 3i. Cold MV3 Service-Worker Wakeup: `agSitePermissions` persisted in `chrome.storage.local` must enforce before any Side Panel message arrives
+  const coldEnv = launchNativeHostWithRealExtension({
+    sockDir: path.join(tmpDir, "cold-socks"),
+    brand: "brave",
+    initialLocalStorage: {
+      agSitePermissions: { "example.com": "block" },
+    },
+    extraHostEnv: {
+      AGY_BIN: mockAgyPath,
+      AG_ACP_APP_DATA_DIR: "antigravity",
+      AG_ACP_DEFAULT_CWD: tmpDir,
+      AG_CHROME_SESSIONS_FILE: path.join(tmpDir, "cold-sessions.json"),
+    },
+    initialTabs: [
+      { id: 91, windowId: 1, active: true, title: "Cold Sub Tab", url: "https://cold.sub.example.com/secret" },
+    ],
+  });
+  t.after(async () => {
+    await coldEnv.close();
+  });
+  const coldSockPath = await coldEnv.waitForSocket();
+  const coldMcpSock = new ExtensionSocketClient(coldSockPath);
+  await coldMcpSock.connect();
+  t.after(() => coldMcpSock.close());
+
+  await assert.rejects(
+    () => coldMcpSock.request("claimTab", { tabId: 91 }),
+    (err) => err.code === -32021,
+    "Cold MV3 service worker must load agSitePermissions before handling MCP RPCs",
+  );
 });

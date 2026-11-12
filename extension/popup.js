@@ -14,6 +14,83 @@ let currentActiveTab = null;
 let currentWindowId = null;
 let currentHost = "";
 
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  "co.uk",
+  "org.uk",
+  "gov.uk",
+  "ac.uk",
+  "me.uk",
+  "net.uk",
+  "com.au",
+  "net.au",
+  "org.au",
+  "edu.au",
+  "gov.au",
+  "co.jp",
+  "or.jp",
+  "ne.jp",
+  "ac.jp",
+  "go.jp",
+  "co.nz",
+  "org.nz",
+  "govt.nz",
+  "ac.nz",
+  "com.br",
+  "org.br",
+  "gov.br",
+  "edu.br",
+  "co.in",
+  "net.in",
+  "org.in",
+  "gov.in",
+  "ac.in",
+  "com.sg",
+  "edu.sg",
+  "gov.sg",
+  "com.hk",
+  "edu.hk",
+  "gov.hk",
+  "co.kr",
+  "or.kr",
+  "go.kr",
+  "com.tw",
+  "org.tw",
+  "gov.tw",
+  "co.za",
+  "org.za",
+  "gov.za",
+  "com.mx",
+  "org.mx",
+  "gob.mx",
+  "com.tr",
+  "gov.tr",
+  "edu.tr",
+  "co.il",
+  "org.il",
+  "gov.il",
+  "com.ar",
+  "org.ar",
+  "gob.ar",
+]);
+
+function getMinRegistrableLabels(parts) {
+  if (parts.length >= 2) {
+    const tail2 = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (MULTI_PART_PUBLIC_SUFFIXES.has(tail2)) {
+      return 3;
+    }
+  }
+  return 2;
+}
+
+function stripLeadingWwwIfRegistrable(hostname) {
+  if (!hostname.startsWith("www.")) return hostname;
+  const rest = hostname.slice(4);
+  if (!rest) return hostname;
+  const restParts = rest.split(".").filter(Boolean);
+  return restParts.length >= getMinRegistrableLabels(restParts) ? rest : hostname;
+}
+
 function normalizeSiteHost(rawHostOrUrl) {
   const raw = String(rawHostOrUrl || "").trim();
   if (!raw) return "";
@@ -21,7 +98,7 @@ function normalizeSiteHost(rawHostOrUrl) {
     try {
       const parsed = new URL(raw);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
-      return parsed.hostname.toLowerCase().replace(/^www\./, "").replace(/\.+$/, "");
+      return stripLeadingWwwIfRegistrable(parsed.hostname.toLowerCase().replace(/\.+$/, ""));
     } catch {
       return "";
     }
@@ -29,6 +106,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const stripped = raw
     .toLowerCase()
     .replace(/\/.*$/, "")
+    .replace(/^\.+/, "")
     .replace(/\.+$/, "");
   if (!stripped) return "";
   if (stripped.startsWith("[")) {
@@ -38,7 +116,7 @@ function normalizeSiteHost(rawHostOrUrl) {
   const hostOnly = stripped.includes(":") && stripped.indexOf(":") === stripped.lastIndexOf(":")
     ? stripped.replace(/:\d+$/, "")
     : stripped;
-  return hostOnly.replace(/^www\./, "").replace(/\.+$/, "");
+  return stripLeadingWwwIfRegistrable(hostOnly.replace(/\.+$/, ""));
 }
 
 function getHostCandidateChain(rawHost) {
@@ -48,9 +126,10 @@ function getHostCandidateChain(rawHost) {
     return [host];
   }
   const parts = host.split(".").filter(Boolean);
-  if (parts.length <= 1) return parts;
+  const minLabels = getMinRegistrableLabels(parts);
+  if (parts.length < minLabels) return [host];
   const chain = [];
-  for (let i = 0; i <= parts.length - 2; i += 1) {
+  for (let i = 0; i <= parts.length - minLabels; i += 1) {
     chain.push(parts.slice(i).join("."));
   }
   return chain;
@@ -82,10 +161,16 @@ function hasRuntimeMessenger() {
 }
 
 function formatBridgeStatusNotice(rawError) {
-  const msg = String(rawError || "").trim();
+  if (rawError instanceof TypeError || rawError instanceof ReferenceError) {
+    return "Extension service worker is waking up. Click Reconnect if offline.";
+  }
+  const msg = String(rawError?.message ?? rawError ?? "").trim();
   if (!msg) return "";
+  if (/must specify an extension id|error in invocation of runtime/i.test(msg)) {
+    return "Open Antigravity from the browser toolbar icon to connect to the live companion bridge.";
+  }
   if (
-    /cannot read propert|undefined is not an object|not a function|extension context invalidated|receiving end does not exist|message port closed/i.test(
+    /typeerror|referenceerror|cannot read|cannot destructure|is undefined|is null|not an object|not a function|extension context invalidated|receiving end does not exist|message port closed/i.test(
       msg,
     )
   ) {
@@ -183,7 +268,7 @@ async function refresh() {
     renderStatus({
       nativeConnected: false,
       browserName: "Browser",
-      lastNativeError: err?.message || "Service worker waking up",
+      lastNativeError: err || "Service worker waking up",
     });
   }
 }
@@ -214,7 +299,7 @@ reconnectBtn.addEventListener("click", async () => {
     renderStatus({
       nativeConnected: false,
       browserName: "Browser",
-      lastNativeError: err?.message || "Reconnect failed",
+      lastNativeError: err || "Reconnect failed",
     });
   } finally {
     reconnectBtn.disabled = false;
