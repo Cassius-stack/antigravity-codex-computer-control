@@ -4688,6 +4688,27 @@ export class BrowserManager {
     return ctrl;
   }
 
+  parseExtensionTabRef(rawRef) {
+    const ref = String(rawRef ?? "").trim();
+    if (/^\d+$/.test(ref)) {
+      return { numericTabId: ref, browserHint: null };
+    }
+    let m = /^ext-tab-(\d+)$/i.exec(ref);
+    if (m) {
+      return { numericTabId: m[1], browserHint: null };
+    }
+    m = /^ext:(?:([a-z0-9_-]+):)?(\d+)$/i.exec(ref);
+    if (m) {
+      const hint = m[1] ? m[1].toLowerCase().replace(/^ext-/, "") : null;
+      return { numericTabId: m[2], browserHint: hint };
+    }
+    m = /^ext-([a-z0-9_-]+):(?:ext-tab-)?(\d+)$/i.exec(ref);
+    if (m) {
+      return { numericTabId: m[2], browserHint: m[1].toLowerCase() };
+    }
+    return null;
+  }
+
   /**
    * Bind an existing controllable tab by tabId ("tab-1", "safari:w1:t1"), providerTabId, chromeTabId, `{ url }`, or `{ mention }`.
    */
@@ -4697,6 +4718,7 @@ export class BrowserManager {
       reference != null &&
       typeof reference === "object" &&
       (typeof reference.url === "string" || typeof reference.mention === "string");
+
     if (!isStringRef && !isObjectRef) {
       throw new TypeError("getTab reference must be a tabId string, { url }, or { mention }");
     }
@@ -4704,29 +4726,52 @@ export class BrowserManager {
     const browserFilter = options.browser ? String(options.browser).toLowerCase() : null;
     const forceRefresh = Boolean(options.forceRefresh);
     const sessionId = options.sessionId || "default";
+    const extRef = isStringRef ? this.parseExtensionTabRef(reference) : null;
+    const effectiveFilter = browserFilter || extRef?.browserHint || null;
 
     // 1. O(1) in-memory fast path for known tabId or CDP targetId (0ms, zero HTTP/JXA)
     if (isStringRef && !forceRefresh) {
       const ref = String(reference).trim();
       const direct = this.resolveControllerById(ref);
-      if (direct && this.controllerMatchesBrowserFilter(direct, browserFilter)) {
+      if (direct && this.controllerMatchesBrowserFilter(direct, effectiveFilter)) {
         return await this._autoClaimIfUserExtensionTab(direct, sessionId);
       }
-      const mappedTabId = this.targetToTabId.get(ref) ?? (/^\d+$/.test(ref) ? this.targetToTabId.get(`ext-tab-${ref}`) : null);
-      if (mappedTabId) {
+      const mappedCandidates = [this.targetToTabId.get(ref)];
+      if (extRef) {
+        if (extRef.browserHint) {
+          mappedCandidates.push(this.targetToTabId.get(`ext-${extRef.browserHint}:ext-tab-${extRef.numericTabId}`));
+        }
+        mappedCandidates.push(this.targetToTabId.get(`ext-tab-${extRef.numericTabId}`));
+      }
+      for (const mappedTabId of mappedCandidates) {
+        if (!mappedTabId) continue;
         const byTarget = this.resolveControllerById(mappedTabId);
-        if (byTarget && this.controllerMatchesBrowserFilter(byTarget, browserFilter)) {
+        if (byTarget && this.controllerMatchesBrowserFilter(byTarget, effectiveFilter)) {
           return await this._autoClaimIfUserExtensionTab(byTarget, sessionId);
         }
       }
+      if (extRef) {
+        for (const ctrl of this.tabs.values()) {
+          if (
+            ctrl.chromeTabId != null &&
+            String(ctrl.chromeTabId) === extRef.numericTabId &&
+            this.controllerMatchesBrowserFilter(ctrl, effectiveFilter)
+          ) {
+            return await this._autoClaimIfUserExtensionTab(ctrl, sessionId);
+          }
+        }
+      }
       // 2. If not an AppleEvents ":wN:tM" ID, check live Extension + CDP endpoints (~8ms, zero osascript)
-      if (!ref.includes(":w") && browserFilter !== "safari") {
+      if (!ref.includes(":w") && effectiveFilter !== "safari") {
         const cdpBrowsers = await this.refreshCDPTabsOnly();
         const candidateCdp = cdpBrowsers
-          .filter((b) => this.matchesBrowserFilter(b, browserFilter))
+          .filter((b) => this.matchesBrowserFilter(b, effectiveFilter))
           .flatMap((b) => b.tabs);
         const foundCdp = candidateCdp.find(
-          (t) => t.id === ref || t.providerTabId === ref || (t.chromeTabId != null && String(t.chromeTabId) === ref),
+          (t) =>
+            t.id === ref ||
+            t.providerTabId === ref ||
+            (extRef && t.chromeTabId != null && String(t.chromeTabId) === extRef.numericTabId),
         );
         if (foundCdp) {
           const resolved = this.resolveControllerById(foundCdp.id);
@@ -4776,8 +4821,8 @@ export class BrowserManager {
 
     // 4. Full inventory fallback (Extension + CDP + macOS AppleEvent tabs)
     const browsers = await this.listBrowsersWithTabs({ forceRefresh });
-    const candidateBrowsers = browserFilter
-      ? browsers.filter((b) => this.matchesBrowserFilter(b, browserFilter))
+    const candidateBrowsers = effectiveFilter
+      ? browsers.filter((b) => this.matchesBrowserFilter(b, effectiveFilter))
       : browsers;
 
     // Order Extension/CDP tabs ahead of AppleEvents fallback tabs when resolving URLs
@@ -4788,11 +4833,14 @@ export class BrowserManager {
     if (isStringRef) {
       const ref = String(reference).trim();
       const direct = this.resolveControllerById(ref);
-      if (direct && this.controllerMatchesBrowserFilter(direct, browserFilter)) {
+      if (direct && this.controllerMatchesBrowserFilter(direct, effectiveFilter)) {
         return await this._autoClaimIfUserExtensionTab(direct, sessionId);
       }
       const byProvider = allTabs.find(
-        (t) => t.providerTabId === ref || t.id === ref || (t.chromeTabId != null && String(t.chromeTabId) === ref),
+        (t) =>
+          t.providerTabId === ref ||
+          t.id === ref ||
+          (extRef && t.chromeTabId != null && String(t.chromeTabId) === extRef.numericTabId),
       );
       if (byProvider) {
         const resolved = this.resolveControllerById(byProvider.id);

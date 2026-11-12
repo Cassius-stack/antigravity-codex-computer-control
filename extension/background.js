@@ -1236,14 +1236,14 @@ async function captureVisibleTabPng(windowId = null) {
   };
 }
 
-function formatTabContextSection(label, ctx, browserFamily) {
+function formatTabContextSection(label, ctx, _browserFamily) {
   if (!ctx) return "";
-  const mcpTabId = `ext:${browserFamily}:${ctx.tabId}`;
+  const mcpTabId = `ext-tab-${ctx.tabId}`;
   const lines = [
     `### ${sanitizeForContextEnvelope(label)}`,
     `- Title: ${sanitizeForContextEnvelope(ctx.title || "(Untitled)")}`,
     `- URL: ${sanitizeForContextEnvelope(ctx.url || "(empty)")}`,
-    `- Browser Tab ID (for computer-use MCP): \`${mcpTabId}\` (numeric tabId: ${ctx.tabId}, windowId: ${ctx.windowId})`,
+    `- Browser Tab ID (pass as \`tab_id\` to computer-use MCP): \`${mcpTabId}\` (numeric tabId: ${ctx.tabId}, windowId: ${ctx.windowId})`,
   ];
   if (ctx.metaDescription) {
     lines.push(`- Meta Description: ${sanitizeForContextEnvelope(ctx.metaDescription)}`);
@@ -1600,7 +1600,7 @@ async function runSidePanelPrompt({
 
   const modeBanner =
     interactionMode === "agent"
-      ? `[Interaction Mode: Agent / Browser Control — Use computer-use MCP tools (browser_tab_state, browser_tab_action, browser_open_tab, browser_manage) to inspect and act on the live ${ident.browserName} browser.]`
+      ? `[Interaction Mode: Agent / Browser Control — Call call_mcp_tool(ServerName: "computer-use", ToolName: "browser_tab_state" | "browser_tab_action" | "browser_open_tab" | "browser_manage", Arguments: { tab_id: "ext-tab-...", ... }) directly to inspect and act on the live ${ident.browserName} browser without reading JSON schema files first.]`
       : `[Interaction Mode: Chat / Read-Only — Answer directly using the live page/tab context below without mutating browser tabs unless asked to switch to Agent Mode.]`;
 
   const contextEnvelope = `<browser_sidepanel_context>\n${modeBanner}${
@@ -1689,6 +1689,7 @@ async function runSidePanelPrompt({
       sessionId,
       promptBlocks,
       modeId: effectiveModeId,
+      permissionMode: normPerm,
       modelId: modelId || null,
       thoughtLevel: thoughtLevel || null,
       autoApprovePermissions: effectiveAutoApprove,
@@ -3839,7 +3840,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "sidepanel:setConfig") {
-    callNativeAgentRpc("agent.setConfig", msg.payload || {}, 8_000)
+    const cfgPayload = msg.payload || {};
+    if (cfgPayload.sessionId && cfgPayload.permissionMode && chromeSessions.has(cfgPayload.sessionId)) {
+      chromeSessions.get(cfgPayload.sessionId).permissionMode = cfgPayload.permissionMode;
+      schedulePersistChromeSessions();
+    }
+    callNativeAgentRpc("agent.setConfig", cfgPayload, 8_000)
       .then((res) => sendResponse(res))
       .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;

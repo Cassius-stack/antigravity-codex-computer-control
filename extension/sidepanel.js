@@ -1637,19 +1637,46 @@ function finalizeAssistantTurnDOM(refs) {
   refs.footer.classList.remove("hidden");
 }
 
+function applyPermissionModeChange(nextMode) {
+  state.permissionMode = nextMode;
+  updateApprovalUI();
+  sendRuntimeMessage({
+    type: "sidepanel:saveSettings",
+    settings: { defaultApprovalMode: state.permissionMode },
+  });
+  sendRuntimeMessage({
+    type: "sidepanel:setConfig",
+    payload: {
+      sessionId: state.currentSessionId || null,
+      requestId: state.activeRequestId || null,
+      permissionMode: state.permissionMode,
+      autoApprovePermissions: state.permissionMode === "full",
+    },
+  });
+}
+
 function renderPermissionRequestCard(refs, payload) {
   if (!refs) return;
   const { permRequestId, toolCall, options } = payload;
   const card = document.createElement("div");
   card.className = "permission-card";
-  const toolTitle = toolCall?.title || toolCall?.name || "Action";
+  if (permRequestId) {
+    card.dataset.permRequestId = String(permRequestId);
+  }
+  const mcpInnerTool =
+    toolCall?.name === "call_mcp_tool"
+      ? toolCall?.args?.ToolName || toolCall?.args?.toolName || null
+      : null;
+  const displayName = mcpInnerTool || toolCall?.name || "action";
+  const toolTitle = toolCall?.title || displayName || "Action";
   const detailText =
     toolCall?.args?.CommandLine ||
+    (mcpInnerTool && toolCall?.args?.Arguments ? JSON.stringify(toolCall.args.Arguments) : "") ||
     (toolCall?.args ? JSON.stringify(toolCall.args) : "") ||
     toolTitle;
 
   card.innerHTML = `
-    <div class="perm-header">Approve ${escapeHtml(toolCall?.name || "action")}?</div>
+    <div class="perm-header">Approve ${escapeHtml(displayName)}?</div>
     <div class="perm-detail">${escapeHtml(detailText)}</div>
     <div class="perm-actions"></div>
   `;
@@ -1661,6 +1688,8 @@ function renderPermissionRequestCard(refs, payload) {
           { optionId: "deny", name: "Decline", kind: "reject_once" },
           { optionId: "allow", name: "Allow", kind: "allow_once" },
         ];
+
+  const allowOpt = opts.find((o) => /allow/i.test(o.kind || o.optionId || "")) || opts[0];
 
   for (const opt of opts) {
     const btn = document.createElement("button");
@@ -1677,6 +1706,27 @@ function renderPermissionRequestCard(refs, payload) {
       });
     });
     actionsRow.appendChild(btn);
+  }
+
+  if (
+    state.permissionMode !== "full" &&
+    allowOpt &&
+    !opts.some((o) => /always/i.test(o.name || ""))
+  ) {
+    const alwaysBtn = document.createElement("button");
+    alwaysBtn.type = "button";
+    alwaysBtn.className = "tonal-btn compact";
+    alwaysBtn.textContent = "Always allow (Full)";
+    alwaysBtn.addEventListener("click", async () => {
+      card.remove();
+      applyPermissionModeChange("full");
+      await sendRuntimeMessage({
+        type: "sidepanel:respondPermission",
+        permRequestId,
+        optionId: allowOpt.optionId,
+      });
+    });
+    actionsRow.appendChild(alwaysBtn);
   }
 
   refs.permissionsStack.appendChild(card);
@@ -1747,6 +1797,18 @@ function handleIncomingAgentEvent(payload = {}) {
 
   if (event === "permission_request") {
     renderPermissionRequestCard(liveAssistantRefs, payload);
+    return;
+  }
+
+  if (event === "permission_resolved") {
+    if (payload.permRequestId) {
+      const cards = document.querySelectorAll(".permission-card[data-perm-request-id]");
+      for (const c of cards) {
+        if (c.dataset.permRequestId === String(payload.permRequestId)) {
+          c.remove();
+        }
+      }
+    }
     return;
   }
 
@@ -2606,23 +2668,13 @@ if (thoughtLevelSegmentedEl) {
 permissionSegmentedEl.addEventListener("click", (e) => {
   const btn = e.target.closest(".seg-btn");
   if (!btn || !btn.dataset.perm) return;
-  state.permissionMode = btn.dataset.perm;
-  updateApprovalUI();
-  sendRuntimeMessage({
-    type: "sidepanel:saveSettings",
-    settings: { defaultApprovalMode: state.permissionMode },
-  });
+  applyPermissionModeChange(btn.dataset.perm);
 });
 
 approvalCycleBtn.addEventListener("click", () => {
   const order = ["auto", "ask", "full"];
   const idx = order.indexOf(state.permissionMode);
-  state.permissionMode = order[(idx + 1) % order.length];
-  updateApprovalUI();
-  sendRuntimeMessage({
-    type: "sidepanel:saveSettings",
-    settings: { defaultApprovalMode: state.permissionMode },
-  });
+  applyPermissionModeChange(order[(idx + 1) % order.length]);
 });
 
 bridgeStatusPill.addEventListener("click", () => {

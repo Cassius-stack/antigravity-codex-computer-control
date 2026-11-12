@@ -13,6 +13,7 @@ import {
   buildPrepareBrowserCursorForScreenshotExpr,
   buildSetActiveTabIndicatorExpr,
 } from "../src/browser-ax.mjs";
+import { BrowserManager } from "../src/cdp-client.mjs";
 import { ExtensionSocketClient } from "../src/extension-bridge.mjs";
 import {
   CAPTCHA_HANDOFF_BANNER,
@@ -3737,4 +3738,291 @@ rl.on("line", (line) => {
     (err) => err.code === -32021,
     "Cold MV3 service worker must load agSitePermissions before handling MCP RPCs",
   );
+});
+
+test("Smart Auto-Approval, Live Mid-Turn Full Upgrade, and Extension Tab ID Resolution", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-smart-auto-perm-"));
+  const sockDir = path.join(tmpDir, "socks");
+  const chromeSessionsFile = path.join(tmpDir, "chrome-sessions.json");
+  const mockAgyPath = path.join(tmpDir, "mock-agy");
+
+  // Mock `agy acp` that exercises real `call_mcp_tool` permission payloads:
+  // - Turn 1 ("auto" mode): emits `call_mcp_tool` for `browser_list`, `browser_tab_state`, `browser_tab_action`, and browser `batch_execute` -> ALL must auto-approve with 0 UI prompts!
+  // - Turn 2 ("auto" mode): emits `run_command` -> MUST pause and emit `permission_request` until upgraded mid-turn to `Full` via `sidepanel:setConfig`!
+  const mockAgyScript = `#!/usr/bin/env node
+import readline from "node:readline";
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const pendingPerms = new Map();
+let permSeq = 1;
+let sessionSeq = 1;
+const sessions = new Map();
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\\n");
+}
+
+function requestPerm(sessionId, toolCall) {
+  const id = "acp-perm-" + (permSeq++);
+  const p = new Promise((resolve) => pendingPerms.set(id, resolve));
+  send({
+    jsonrpc: "2.0",
+    id,
+    method: "session/request_permission",
+    params: {
+      sessionId,
+      toolCall,
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow_once" },
+        { optionId: "deny", name: "Deny", kind: "reject_once" },
+      ],
+    },
+  });
+  return p;
+}
+
+rl.on("line", async (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.id !== undefined && !msg.method) {
+    const waiter = pendingPerms.get(String(msg.id));
+    if (waiter) {
+      pendingPerms.delete(String(msg.id));
+      waiter(msg.result);
+    }
+    return;
+  }
+
+  const { id, method, params } = msg;
+  if (method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: 1,
+        agentInfo: { name: "Mock Antigravity ACP", version: "3.0.0" },
+        agentCapabilities: { loadSession: true, promptCapabilities: { image: true, embeddedContext: true } },
+      },
+    });
+    return;
+  }
+
+  if (method === "session/new") {
+    const sid = "chrome-auto-sess-" + (sessionSeq++);
+    sessions.set(sid, { modeId: "auto", systemAppend: params?._meta?.antigravity?.systemPrompt?.append || "" });
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        sessionId: sid,
+        models: { currentModelId: "gemini-4-carbon-medium", availableModels: [{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" }] },
+        modes: { currentModeId: "auto", availableModes: [{ id: "auto", name: "Auto" }, { id: "default", name: "Ask" }] },
+      },
+    });
+    return;
+  }
+
+  if (method === "session/resume" || method === "session/set_mode" || method === "session/set_model" || method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+
+  if (method === "session/prompt") {
+    const sid = params.sessionId;
+    const text = (params.prompt || []).map((b) => b.text || "").join("\\n");
+    if (text.includes("Click on the first short")) {
+      const r1 = await requestPerm(sid, {
+        toolCallId: "tc-mcp-1",
+        name: "call_mcp_tool",
+        args: { Arguments: {}, ServerName: "computer-use", ToolName: "browser_list" },
+      });
+      const r2 = await requestPerm(sid, {
+        toolCallId: "tc-mcp-2",
+        name: "call_mcp_tool",
+        args: { Arguments: { tab_id: "ext-tab-77" }, ServerName: "computer-use", ToolName: "browser_tab_state" },
+      });
+      const r3 = await requestPerm(sid, {
+        toolCallId: "tc-mcp-3",
+        name: "call_mcp_tool",
+        args: { Arguments: { tab_id: "ext-tab-77", action: "click", element_index: 1 }, ServerName: "computer-use", ToolName: "browser_tab_action" },
+      });
+      const r4 = await requestPerm(sid, {
+        toolCallId: "tc-mcp-4",
+        name: "call_mcp_tool",
+        args: { Arguments: { steps: [{ kind: "browser_action", tab_id: "ext-tab-77", action: "scroll", direction: "down" }] }, ServerName: "computer-use", ToolName: "batch_execute" },
+      });
+      const outcomes = [r1, r2, r3, r4].map((r) => r?.outcome?.optionId).join(",");
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sid,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "BrowserOutcomes=" + outcomes + " | ContextHasExtTab=" + text.includes("ext-tab-77") } },
+        },
+      });
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+      return;
+    }
+
+    if (text.includes("Run host shell command")) {
+      const rShell = await requestPerm(sid, {
+        toolCallId: "tc-shell-1",
+        name: "run_command",
+        args: { CommandLine: "uname -a" },
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sid,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ShellOutcome=" + (rShell?.outcome?.optionId || "none") } },
+        },
+      });
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+      return;
+    }
+  }
+});
+`;
+  fs.writeFileSync(mockAgyPath, mockAgyScript, { mode: 0o755 });
+  fs.chmodSync(mockAgyPath, 0o755);
+
+  const env = launchNativeHostWithRealExtension({
+    sockDir,
+    brand: "brave",
+    extraHostEnv: {
+      AGY_BIN: mockAgyPath,
+      AG_ACP_APP_DATA_DIR: "antigravity",
+      AG_ACP_DEFAULT_CWD: tmpDir,
+      AG_CHROME_SESSIONS_FILE: chromeSessionsFile,
+    },
+    initialTabs: [
+      { id: 77, windowId: 1, active: true, title: "(84) YouTube", url: "https://www.youtube.com/" },
+    ],
+  });
+
+  t.after(async () => {
+    await env.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  await env.waitForSocket();
+  const spEvents = [];
+  const spPort = env.connectSidePanelPort();
+  spPort.onMessage((m) => spEvents.push(m));
+
+  // 1. In default `Auto` mode, `call_mcp_tool` for `computer-use` browser tools auto-approves with ZERO `permission_request` events!
+  const turn1 = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      requestId: "req-smart-auto-1",
+      sessionId: null,
+      userText: "Click on the first short",
+      interactionMode: "agent",
+      permissionMode: "auto",
+      includeActiveTab: true,
+      activeTabId: 77,
+    },
+  });
+  assert.equal(turn1.ok, true);
+  const permRequestsTurn1 = spEvents.filter(
+    (e) => e.type === "sidepanel:agentEvent" && e.payload?.event === "permission_request",
+  );
+  assert.equal(
+    permRequestsTurn1.length,
+    0,
+    "Auto mode must auto-approve computer-use browser MCP tools without nagging the user",
+  );
+  const turn1Reply = spEvents
+    .filter((e) => e.type === "sidepanel:agentEvent" && e.payload?.update?.sessionUpdate === "agent_message_chunk")
+    .map((e) => e.payload.update.content.text)
+    .join("");
+  assert.match(turn1Reply, /BrowserOutcomes=allow,allow,allow,allow/);
+  assert.match(turn1Reply, /ContextHasExtTab=true/);
+
+  // 2. In `Auto` mode, `run_command` MUST still prompt `permission_request`, AND switching to `Full` mid-turn via `sidepanel:setConfig`
+  //    must immediately auto-resolve the waiting permission and emit `permission_resolved`!
+  let resolvedViaLiveFullUpgrade = null;
+  spPort.onMessage(async (m) => {
+    if (
+      m.type === "sidepanel:agentEvent" &&
+      m.payload?.event === "permission_request" &&
+      m.payload?.toolCall?.name === "run_command"
+    ) {
+      resolvedViaLiveFullUpgrade = await env.sendRuntimeMessage({
+        type: "sidepanel:setConfig",
+        payload: {
+          sessionId: turn1.sessionId,
+          requestId: "req-smart-auto-2",
+          permissionMode: "full",
+          autoApprovePermissions: true,
+        },
+      });
+    }
+  });
+
+  const turn2 = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      requestId: "req-smart-auto-2",
+      sessionId: turn1.sessionId,
+      userText: "Run host shell command",
+      interactionMode: "agent",
+      permissionMode: "auto",
+      includeActiveTab: false,
+    },
+  });
+  assert.equal(turn2.ok, true);
+  assert.equal(resolvedViaLiveFullUpgrade?.ok, true);
+  assert.equal(
+    resolvedViaLiveFullUpgrade?.resolvedPermissions?.length,
+    1,
+    "Mid-turn Full switch must immediately resolve waiting permission prompts",
+  );
+  assert.ok(
+    spEvents.some(
+      (e) =>
+        e.type === "sidepanel:agentEvent" &&
+        e.payload?.event === "permission_resolved" &&
+        e.payload?.permRequestId === resolvedViaLiveFullUpgrade.resolvedPermissions[0],
+    ),
+    "Mid-turn Full switch must emit permission_resolved so sidepanel removes the waiting permission card",
+  );
+  const turn2Reply = spEvents
+    .filter(
+      (e) =>
+        e.type === "sidepanel:agentEvent" &&
+        e.payload?.requestId === "req-smart-auto-2" &&
+        e.payload?.update?.sessionUpdate === "agent_message_chunk",
+    )
+    .map((e) => e.payload.update.content.text)
+    .join("");
+  assert.match(turn2Reply, /ShellOutcome=allow/);
+
+  // 3. Cold-start & warm-path `BrowserManager.getTab` + `manage` must resolve `ext-tab-77`, `ext:brave:77`, `ext-brave:ext-tab-77`, and `77`!
+  for (const candidateRef of ["ext-tab-77", "ext:brave:77", "ext-brave:ext-tab-77", "77"]) {
+    const coldMgr = new BrowserManager({
+      diffTracker: null,
+      extensionSockDir: sockDir,
+      jxaRunner: async () => "[]",
+    });
+    try {
+      const resolvedCtrl = await coldMgr.getTab(candidateRef);
+      assert.equal(resolvedCtrl.chromeTabId, 77, `Cold getTab("${candidateRef}") must resolve Chrome tab #77`);
+      const warmCtrl = await coldMgr.getTab(candidateRef);
+      assert.equal(warmCtrl.id, resolvedCtrl.id, `Warm getTab("${candidateRef}") must resolve same controller`);
+    } finally {
+      coldMgr.closeAll();
+    }
+  }
+
+  const manageMgr = new BrowserManager({
+    diffTracker: null,
+    extensionSockDir: sockDir,
+    jxaRunner: async () => "[]",
+  });
+  t.after(() => manageMgr.closeAll());
+  const claimViaColonRef = await manageMgr.manage("claim_tab", { tab_id: "ext:brave:77" });
+  assert.equal(claimViaColonRef.ok, true);
+  assert.equal(claimViaColonRef.tabId, 77);
 });

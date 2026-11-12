@@ -345,7 +345,9 @@ export class ExtensionCDPConnection extends EventEmitter {
   }
 
   static parseChromeTabId(targetIdOrSessionId) {
-    const m = /^(?:[a-z0-9_.-]+:)?ext-(?:tab|session)-(\d+)$/i.exec(String(targetIdOrSessionId || ""));
+    const s = String(targetIdOrSessionId || "").trim();
+    const m =
+      /^(?:[a-z0-9_.-]+:)?ext-(?:tab|session)-(\d+)$/i.exec(s) || /^ext:(?:[a-z0-9_.-]+:)?(\d+)$/i.exec(s);
     return m ? Number(m[1]) : null;
   }
 

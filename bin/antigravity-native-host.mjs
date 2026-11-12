@@ -20,7 +20,13 @@ const CHROME_SESSIONS_FILE =
 
 const DEFAULT_CHROME_SYSTEM_PROMPT = `You are Antigravity in Chrome, running inside the user's docked browser Side Panel alongside their live tabs.
 - When the prompt specifies [Interaction Mode: Chat / Read-Only], answer directly using the provided live page/tab context and screenshots without mutating browser tabs or clicking page elements unless explicitly asked to switch to Agent Mode.
-- When the prompt specifies [Interaction Mode: Agent / Browser Control], you have full access to the computer-use MCP server (browser_list, browser_tab_state, browser_tab_action, browser_open_tab, browser_manage). Prefer acting on the provided tabId in-place (claim_tab) or opening new research tabs inside a clean color-coded Tab Group.
+- When the prompt specifies [Interaction Mode: Agent / Browser Control], invoke the "computer-use" MCP server directly via call_mcp_tool(ServerName: "computer-use", ToolName: "<tool>", Arguments: { ... }) using the exact Browser Tab ID provided in context (e.g. "ext-tab-<id>" or "<id>") — no need to read JSON schema files or call browser_list first when tab_id is already given:
+  • browser_tab_state: { tab_id: string, include_screenshot?: boolean, disable_diff?: boolean } -> returns indexed interactive elements [1], [2], ...
+  • browser_tab_action: { tab_id: string, action: "click"|"hover"|"set_value"|"type_text"|"press_key"|"paste"|"scroll"|"drag"|"goto"|"back"|"forward"|"reload"|"evaluate"|"wait_for", element_index?: number, selector?: string, x?: number, y?: number, value?: string, text?: string, key?: string, direction?: "up"|"down"|"left"|"right", pages?: number, url?: string, expression?: string, include_screenshot?: boolean }
+  • browser_open_tab: { url?: string, urls?: string[], active?: boolean, group_title?: string, group_color?: "cyan"|"blue"|"purple"|"green"|"yellow"|"orange"|"pink"|"red"|"grey" }
+  • browser_manage: { action: "status"|"claim_tab"|"mark_tab"|"finalize_session"|"group_tabs"|"name_session", tab_id?: string, status?: "deliverable"|"handoff"|"scratch", name?: string }
+  • browser_list: {} (use only when discovering unattached tabs not already listed in context)
+- Prefer acting on the provided tab_id in-place (auto-claimed) or opening new research tabs inside a clean color-coded Tab Group, and call browser_manage({ action: "finalize_session" }) when done with multi-tab research.
 - Never attempt to solve or bypass CAPTCHAs or login/2FA walls; if encountered, mark the tab for handoff and ask the user.`;
 
 const FALLBACK_MODELS = [
@@ -309,6 +315,119 @@ function broadcastNotification(msg) {
   }
 }
 
+const AUTO_READ_ONLY_TOOLS = new Set([
+  "read_file",
+  "view_file",
+  "view_file_outline",
+  "view_code_item",
+  "find_by_name",
+  "grep_search",
+  "list_dir",
+  "list_resources",
+  "read_resource",
+  "search_web",
+  "read_url_content",
+]);
+
+const AUTO_SAFE_COMPUTER_USE_TOOLS = new Set([
+  "browser_list",
+  "browser_open_tab",
+  "browser_tab_state",
+  "browser_tab_action",
+  "browser_manage",
+  "cursor_control",
+  "get_state",
+  "list_apps",
+  "list_windows",
+  "get_window_state",
+  "permissions",
+]);
+
+function parseMaybeJsonObject(val) {
+  if (!val) return null;
+  if (typeof val === "object") return val;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function normalizePermissionMode(permissionMode, autoApprovePermissions = false) {
+  const raw = String(permissionMode || "").trim().toLowerCase();
+  if (raw === "full") return "full";
+  if (raw === "ask" || raw === "default") return "ask";
+  if (raw === "auto") return "auto";
+  return autoApprovePermissions ? "full" : "auto";
+}
+
+function pickAllowOption(options) {
+  const opts = Array.isArray(options) ? options : [];
+  return opts.find((o) => /allow/i.test(o.kind || o.optionId || "")) || opts[0] || { optionId: "allow" };
+}
+
+function shouldAutoApprovePermission({ permissionMode, autoApprovePermissions = false, toolCall = null } = {}) {
+  const normMode = normalizePermissionMode(permissionMode, autoApprovePermissions);
+  if (autoApprovePermissions === true || normMode === "full") {
+    return true;
+  }
+  if (normMode === "ask") {
+    return false;
+  }
+
+  // "auto" mode: auto-approve read-only tools + `computer-use` browser/inspection MCP tools
+  // (per-domain Site Access Governance `Allow` / `Ask` / `Block` & CAPTCHA guards protect web access),
+  // while still requiring explicit approval for shell execution, filesystem writes, and macOS desktop mutations.
+  const rawName = String(toolCall?.name || "").trim();
+  if (!rawName) return false;
+  if (AUTO_READ_ONLY_TOOLS.has(rawName)) {
+    return true;
+  }
+
+  const rawArgs =
+    parseMaybeJsonObject(toolCall?.args) ||
+    parseMaybeJsonObject(toolCall?.rawInput) ||
+    parseMaybeJsonObject(toolCall?.input) ||
+    parseMaybeJsonObject(toolCall?.arguments);
+
+  if (rawName === "call_mcp_tool" || /^call_mcp_tool$/i.test(rawName)) {
+    const serverName = String(rawArgs?.ServerName ?? rawArgs?.serverName ?? rawArgs?.server_name ?? "")
+      .trim()
+      .toLowerCase();
+    const mcpToolName = String(rawArgs?.ToolName ?? rawArgs?.toolName ?? rawArgs?.tool_name ?? "").trim();
+    if (serverName !== "computer-use" && serverName !== "computer_use") {
+      return false;
+    }
+    if (AUTO_SAFE_COMPUTER_USE_TOOLS.has(mcpToolName)) {
+      return true;
+    }
+    if (mcpToolName === "batch_execute") {
+      const innerArgs = parseMaybeJsonObject(rawArgs?.Arguments ?? rawArgs?.arguments) || {};
+      const steps = Array.isArray(innerArgs.steps) ? innerArgs.steps : [];
+      return steps.length > 0 && steps.every((s) => s && typeof s === "object" && s.kind !== "mac_action");
+    }
+    return false;
+  }
+
+  const directMcpMatch = /^(?:mcp_computer[-_]use_)?([a-z0-9_]+)$/i.exec(rawName);
+  if (directMcpMatch) {
+    const directTool = directMcpMatch[1];
+    if (AUTO_SAFE_COMPUTER_USE_TOOLS.has(directTool)) {
+      return true;
+    }
+    if (directTool === "batch_execute") {
+      const steps = Array.isArray(rawArgs?.steps) ? rawArgs.steps : [];
+      return steps.length > 0 && steps.every((s) => s && typeof s === "object" && s.kind !== "mac_action");
+    }
+  }
+
+  return false;
+}
+
 /**
  * Persistent Agent Client Protocol (ACP) Bridge for the "Antigravity in Chrome" Side Panel.
  * Runs `agy acp --app-data-dir antigravity` so chats started in the Chrome Side Panel are saved
@@ -323,9 +442,10 @@ class AcpSidePanelBridge {
     this.nextRpcId = 1;
     this.pendingRpc = new Map(); // id -> { resolve, reject, timer }
     this.loadedSessions = new Set();
-    this.sessionPromptContext = new Map(); // sessionId -> { requestId, autoApprovePermissions, title, replayCollector }
+    this.sessionPromptContext = new Map(); // sessionId -> { requestId, permissionMode, autoApprovePermissions, title, replayCollector }
+    this.requestConfigOverrides = new Map(); // requestId -> { permissionMode, autoApprovePermissions }
     this.canceledRequests = new Set(); // requestIds canceled while cold-starting
-    this.pendingPermissions = new Map(); // permRequestId -> { acpId, sessionId }
+    this.pendingPermissions = new Map(); // permRequestId -> { acpId, sessionId, requestId, toolCall, options }
     this.nextPermId = 1;
     this.chromeSessionIds = loadChromeSessionRegistry();
 
@@ -336,6 +456,7 @@ class AcpSidePanelBridge {
     this.currentThoughtLevel = "medium";
     this.cachedModes = FALLBACK_MODES;
     this.currentModeId = "auto";
+    this.currentPermissionMode = "auto";
     this.cachedConfigOptions = [];
     this.cachedCommands = [];
     this.cachedTier = null;
@@ -571,9 +692,17 @@ class AcpSidePanelBridge {
       const sessionId = msg.params?.sessionId || "";
       const ctx = this.sessionPromptContext.get(sessionId);
       const options = Array.isArray(msg.params?.options) ? msg.params.options : [];
-      if (ctx?.autoApprovePermissions) {
-        const allowOpt =
-          options.find((o) => /allow/i.test(o.kind || o.optionId || "")) || options[0] || { optionId: "allow" };
+      const toolCall = msg.params?.toolCall || null;
+      const effectivePermMode = ctx?.permissionMode || this.currentPermissionMode || "auto";
+      const effectiveAutoApprove = Boolean(ctx?.autoApprovePermissions);
+      if (
+        shouldAutoApprovePermission({
+          permissionMode: effectivePermMode,
+          autoApprovePermissions: effectiveAutoApprove,
+          toolCall,
+        })
+      ) {
+        const allowOpt = pickAllowOption(options);
         this.sendAcpResponse(msg.id, {
           outcome: { outcome: "selected", optionId: allowOpt.optionId },
         });
@@ -584,13 +713,16 @@ class AcpSidePanelBridge {
       this.pendingPermissions.set(permRequestId, {
         acpId: msg.id,
         sessionId,
+        requestId: ctx?.requestId || null,
+        toolCall,
+        options,
       });
       emitExtensionNotification("agentEvent", {
         event: "permission_request",
         requestId: ctx?.requestId || null,
         permRequestId,
         sessionId,
-        toolCall: msg.params?.toolCall || null,
+        toolCall,
         options,
       });
       return;
@@ -861,12 +993,45 @@ class AcpSidePanelBridge {
     return sid;
   }
 
+  resolveNewlyAllowedPendingPermissions(filterSessionId = null) {
+    const resolvedIds = [];
+    for (const [permRequestId, perm] of Array.from(this.pendingPermissions.entries())) {
+      if (filterSessionId && perm.sessionId && perm.sessionId !== filterSessionId) continue;
+      const ctx = this.sessionPromptContext.get(perm.sessionId);
+      const effectivePermMode = ctx?.permissionMode || this.currentPermissionMode || "auto";
+      const effectiveAutoApprove = Boolean(ctx?.autoApprovePermissions);
+      if (
+        shouldAutoApprovePermission({
+          permissionMode: effectivePermMode,
+          autoApprovePermissions: effectiveAutoApprove,
+          toolCall: perm.toolCall,
+        })
+      ) {
+        this.pendingPermissions.delete(permRequestId);
+        const allowOpt = pickAllowOption(perm.options);
+        this.sendAcpResponse(perm.acpId, {
+          outcome: { outcome: "selected", optionId: allowOpt.optionId },
+        });
+        resolvedIds.push(permRequestId);
+        emitExtensionNotification("agentEvent", {
+          event: "permission_resolved",
+          requestId: perm.requestId || ctx?.requestId || null,
+          permRequestId,
+          sessionId: perm.sessionId,
+          optionId: allowOpt.optionId,
+        });
+      }
+    }
+    return resolvedIds;
+  }
+
   async prompt({
     requestId = null,
     sessionId = null,
     promptBlocks = [],
     text = "",
     modeId = null,
+    permissionMode = null,
     modelId = null,
     thoughtLevel = null,
     autoApprovePermissions = false,
@@ -876,6 +1041,7 @@ class AcpSidePanelBridge {
     const reqKey = requestId ? String(requestId) : "";
     if (reqKey && this.canceledRequests.has(reqKey)) {
       this.canceledRequests.delete(reqKey);
+      this.requestConfigOverrides.delete(reqKey);
       return {
         ok: true,
         sessionId: sessionId ? String(sessionId).trim() : null,
@@ -884,6 +1050,12 @@ class AcpSidePanelBridge {
         usage: null,
       };
     }
+
+    const initialPermMode = normalizePermissionMode(
+      permissionMode ?? (modeId === "default" ? "ask" : null),
+      autoApprovePermissions,
+    );
+    this.currentPermissionMode = initialPermMode;
 
     let sid = sessionId ? String(sessionId).trim() : "";
     if (!sid) {
@@ -924,6 +1096,7 @@ class AcpSidePanelBridge {
 
     if (reqKey && this.canceledRequests.has(reqKey)) {
       this.canceledRequests.delete(reqKey);
+      this.requestConfigOverrides.delete(reqKey);
       return {
         ok: true,
         sessionId: sid,
@@ -938,9 +1111,22 @@ class AcpSidePanelBridge {
         ? promptBlocks
         : [{ type: "text", text: String(text || "") }];
 
+    const override = reqKey ? this.requestConfigOverrides.get(reqKey) : null;
+    if (reqKey) this.requestConfigOverrides.delete(reqKey);
+    const resolvedAutoApprove =
+      override?.autoApprovePermissions !== undefined
+        ? Boolean(override.autoApprovePermissions)
+        : Boolean(autoApprovePermissions);
+    const resolvedPermMode = normalizePermissionMode(
+      override?.permissionMode ?? initialPermMode,
+      resolvedAutoApprove,
+    );
+    this.currentPermissionMode = resolvedPermMode;
+
     const ctx = {
       requestId,
-      autoApprovePermissions: Boolean(autoApprovePermissions),
+      permissionMode: resolvedPermMode,
+      autoApprovePermissions: resolvedAutoApprove || resolvedPermMode === "full",
       title: null,
       replayCollector: null,
     };
@@ -965,6 +1151,7 @@ class AcpSidePanelBridge {
     } finally {
       if (reqKey) {
         this.canceledRequests.delete(reqKey);
+        this.requestConfigOverrides.delete(reqKey);
       }
       this.sessionPromptContext.delete(sid);
       for (const [permId, permInfo] of Array.from(this.pendingPermissions.entries())) {
@@ -983,6 +1170,7 @@ class AcpSidePanelBridge {
         if (oldest) this.canceledRequests.delete(oldest);
       }
       this.canceledRequests.add(reqKey);
+      this.requestConfigOverrides.delete(reqKey);
     }
 
     let rawSid = sessionId ? String(sessionId).trim() : "";
@@ -1033,20 +1221,88 @@ class AcpSidePanelBridge {
     return { ok: true, sessionId: pending.sessionId };
   }
 
-  async setConfig({ sessionId, modeId, modelId, thoughtLevel, configId, value } = {}) {
+  async setConfig({
+    sessionId,
+    requestId,
+    modeId,
+    modelId,
+    thoughtLevel,
+    permissionMode,
+    autoApprovePermissions,
+    configId,
+    value,
+  } = {}) {
     const normThought = ["low", "medium", "high"].includes(String(thoughtLevel || "").toLowerCase())
       ? String(thoughtLevel).toLowerCase()
       : null;
-    if (!sessionId) {
-      if (modeId) this.currentModeId = modeId;
+
+    const hasPermUpdate = permissionMode !== undefined || autoApprovePermissions !== undefined;
+    let resolvedPermissions = [];
+    let derivedModeId = modeId || null;
+
+    if (hasPermUpdate) {
+      const nextPermMode = normalizePermissionMode(permissionMode ?? this.currentPermissionMode, autoApprovePermissions);
+      const nextAutoApprove =
+        autoApprovePermissions !== undefined ? Boolean(autoApprovePermissions) : nextPermMode === "full";
+      this.currentPermissionMode = nextPermMode;
+      if (!derivedModeId) {
+        derivedModeId = nextPermMode === "ask" ? "default" : "auto";
+      }
+
+      const targetSid = sessionId ? String(sessionId).trim() : "";
+      const reqKey = requestId ? String(requestId).trim() : "";
+      let matchedActiveCtx = false;
+
+      for (const [activeSid, ctx] of this.sessionPromptContext.entries()) {
+        if (!ctx || ctx.replayCollector) continue;
+        if (
+          (targetSid && activeSid === targetSid) ||
+          (reqKey && String(ctx.requestId || "") === reqKey) ||
+          (!targetSid && !reqKey)
+        ) {
+          ctx.permissionMode = nextPermMode;
+          ctx.autoApprovePermissions = nextAutoApprove;
+          matchedActiveCtx = true;
+        }
+      }
+
+      if (reqKey && !matchedActiveCtx) {
+        if (this.requestConfigOverrides.size >= 200) {
+          const oldest = this.requestConfigOverrides.values().next().value;
+          if (oldest) this.requestConfigOverrides.delete(oldest);
+        }
+        this.requestConfigOverrides.set(reqKey, {
+          permissionMode: nextPermMode,
+          autoApprovePermissions: nextAutoApprove,
+        });
+      }
+
+      // Immediately resolve any waiting permission prompts that are now permitted!
+      resolvedPermissions = this.resolveNewlyAllowedPendingPermissions(targetSid || null);
+    }
+
+    const rawSid = sessionId ? String(sessionId).trim() : "";
+    if (!rawSid) {
+      if (derivedModeId) this.currentModeId = derivedModeId;
       if (modelId) this.currentModelId = modelId;
       if (normThought) this.currentThoughtLevel = normThought;
-      return { ok: true, deferred: true };
+      return { ok: true, deferred: true, resolvedPermissions };
     }
-    const sid = await this.ensureSessionResumed(sessionId);
-    if (modeId) {
-      await this.sendAcpRpc("session/set_mode", { sessionId: sid, modeId }, 10_000);
-      this.currentModeId = modeId;
+
+    // If a turn is actively running on this session and only permissionMode changed,
+    // do not block on ensureSessionResumed / session/set_mode while session/prompt is in flight.
+    if (this.sessionPromptContext.has(rawSid) && hasPermUpdate && !modeId && !modelId && !normThought && !configId) {
+      if (derivedModeId) {
+        this.currentModeId = derivedModeId;
+        this.sendAcpRpc("session/set_mode", { sessionId: rawSid, modeId: derivedModeId }, 5_000).catch(() => {});
+      }
+      return { ok: true, sessionId: rawSid, permissionMode: this.currentPermissionMode, resolvedPermissions };
+    }
+
+    const sid = await this.ensureSessionResumed(rawSid);
+    if (derivedModeId) {
+      await this.sendAcpRpc("session/set_mode", { sessionId: sid, modeId: derivedModeId }, 10_000).catch(() => {});
+      this.currentModeId = derivedModeId;
     }
     if (modelId) {
       await this.sendAcpRpc("session/set_model", { sessionId: sid, modelId }, 10_000);
@@ -1063,7 +1319,7 @@ class AcpSidePanelBridge {
     if (configId && value !== undefined) {
       await this.sendAcpRpc("session/set_config_option", { sessionId: sid, configId, value }, 10_000);
     }
-    return { ok: true, sessionId: sid };
+    return { ok: true, sessionId: sid, resolvedPermissions };
   }
 
   async openInDesktopApp({ sessionId } = {}) {
