@@ -6,27 +6,51 @@ const attachedCountEl = document.getElementById("attached-count");
 const groupSummaryEl = document.getElementById("group-summary");
 const reconnectBtn = document.getElementById("reconnect-btn");
 const finishBtn = document.getElementById("finish-btn");
+const openSidepanelBtn = document.getElementById("open-sidepanel-btn");
+const popupHostLabel = document.getElementById("popup-host-label");
+const popupSitePolicy = document.getElementById("popup-site-policy");
+
+let currentActiveTab = null;
+let currentHost = "";
+
+function extractHost(url) {
+  try {
+    const parsed = new URL(url || "");
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
 
 function renderStatus(state) {
   if (!state) return;
   const connected = Boolean(state.nativeConnected);
   bridgePill.classList.toggle("connected", connected);
   bridgePill.classList.toggle("disconnected", !connected);
-  bridgeStatusText.textContent = connected ? "Bridge Live" : "Disconnected";
+  bridgeStatusText.textContent = connected ? "Live" : "Offline";
 
   const bName = state.browserName || "Chromium";
-  browserLabel.textContent = `${bName} · Native Messaging`;
+  browserLabel.textContent = `${bName} · Companion Bridge`;
 
   const groups = Array.isArray(state.sessionGroups) ? state.sessionGroups : [];
   const attachedCount = Number(state.attachedTabCount || 0);
   groupCountEl.textContent = String(groups.length);
   attachedCountEl.textContent = String(attachedCount);
 
+  const perms = state.sitePermissions || {};
+  const policy = currentHost ? perms[currentHost] || "allow" : "allow";
+  popupHostLabel.textContent = currentHost || "Internal tab";
+  for (const btn of popupSitePolicy.querySelectorAll(".seg-opt")) {
+    btn.classList.toggle("active", btn.dataset.policy === policy);
+    btn.disabled = !currentHost;
+  }
+
   if (groups.length > 0) {
     const names = groups.map((g) => `"${g.title || "Antigravity"}" (${g.color || "cyan"})`).join(", ");
     groupSummaryEl.textContent = `Active group${groups.length > 1 ? "s" : ""}: ${names}`;
   } else if (attachedCount > 0) {
-    groupSummaryEl.textContent = `${attachedCount} claimed tab${attachedCount > 1 ? "s" : ""} attached in-place.`;
+    groupSummaryEl.textContent = `${attachedCount} claimed tab${attachedCount > 1 ? "s" : ""} controlled in-place.`;
   } else if (!connected && state.lastNativeError) {
     groupSummaryEl.textContent = `Native bridge status: ${state.lastNativeError}`;
   } else {
@@ -37,7 +61,21 @@ function renderStatus(state) {
 
 async function refresh() {
   try {
-    const resp = await chrome.runtime.sendMessage({ type: "popup:getStatus" });
+    if (chrome.tabs?.query) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      currentActiveTab = tab || null;
+      currentHost = extractHost(tab?.url || "");
+    }
+    const [resp, settingsRes] = await Promise.all([
+      chrome.runtime.sendMessage({ type: "popup:getStatus" }),
+      chrome.runtime.sendMessage({ type: "sidepanel:getSettings" }).catch(() => null),
+    ]);
+    const prefTheme = settingsRes?.settings?.theme;
+    if (prefTheme === "dark" || prefTheme === "light") {
+      document.documentElement.dataset.theme = prefTheme;
+    } else {
+      delete document.documentElement.dataset.theme;
+    }
     renderStatus(resp);
   } catch (err) {
     renderStatus({
@@ -47,6 +85,17 @@ async function refresh() {
     });
   }
 }
+
+popupSitePolicy.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".seg-opt");
+  if (!btn || !btn.dataset.policy || !currentHost) return;
+  await chrome.runtime.sendMessage({
+    type: "sidepanel:setSitePermission",
+    host: currentHost,
+    policy: btn.dataset.policy,
+  });
+  await refresh();
+});
 
 reconnectBtn.addEventListener("click", async () => {
   reconnectBtn.disabled = true;
@@ -66,6 +115,15 @@ finishBtn.addEventListener("click", async () => {
   } finally {
     finishBtn.disabled = false;
   }
+});
+
+openSidepanelBtn.addEventListener("click", async () => {
+  try {
+    if (currentActiveTab?.id && chrome.sidePanel?.open) {
+      await chrome.sidePanel.open({ tabId: currentActiveTab.id });
+      window.close();
+    }
+  } catch {}
 });
 
 refresh();

@@ -3,6 +3,8 @@ const NATIVE_HOST_NAME = "com.antigravity.browser_bridge";
 const KEEPALIVE_ALARM = "ag-native-bridge-watchdog";
 const SCHEDULE_ALARM_PREFIX = "ag-sched:";
 const MAX_STORED_CHROME_SESSIONS = 50;
+const MAX_BROWSER_ACTIVITY = 60;
+const MAX_RECORDED_ACTIONS = 120;
 
 const VALID_GROUP_COLORS = new Set([
   "grey",
@@ -127,6 +129,167 @@ const sessionMeta = new Map();
 // Expression cache for large repetitive Runtime.evaluate / callFunctionOn scripts
 const expressionCache = new Map();
 
+// Codex in Chrome parity: per-host Site Access Governance ("allow" | "ask" | "block")
+const sitePermissions = new Map();
+
+// Codex in Chrome parity: persisted workspace, system instructions, & theme settings
+let extensionSettings = {
+  cwd: "",
+  customInstructions: "",
+  theme: "system", // "system" | "dark" | "light"
+  defaultApprovalMode: "auto", // "auto" | "ask" | "full"
+};
+
+// Codex in Chrome parity: chronological Browser Activity Stream (ring buffer)
+let nextActivityId = 1;
+const browserActivityLog = [];
+const lastCdpActivityByKey = new Map();
+
+// Codex in Chrome parity: "Record a browser demonstration" -> reusable /shortcut skill (up to 120 actions)
+let recordingState = {
+  active: false,
+  tabId: null,
+  startedAt: 0,
+  originUrl: "",
+  originTitle: "",
+  steps: [],
+};
+
+// Codex in Chrome parity: Interactive Webpage Element Picker state
+let pickerState = {
+  active: false,
+  tabId: null,
+  startedAt: 0,
+};
+
+function normalizeHostFromUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function getSitePolicyForHost(rawHost) {
+  const host = String(rawHost || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
+  if (!host) return "allow";
+  return sitePermissions.get(host) || "allow";
+}
+
+function getSitePolicyForUrl(rawUrl) {
+  return getSitePolicyForHost(normalizeHostFromUrl(rawUrl));
+}
+
+function getSitePermissionsSnapshot() {
+  const out = {};
+  for (const [host, policy] of sitePermissions.entries()) {
+    out[host] = policy;
+  }
+  return out;
+}
+
+async function setSitePermissionForHost(rawHost, rawPolicy) {
+  await ensureLocalStateLoaded();
+  const host = String(rawHost || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "")
+    .replace(/^www\./, "");
+  if (!host) throw new Error("Valid hostname is required for site access permission.");
+  const policy = ["allow", "ask", "block"].includes(String(rawPolicy || "").toLowerCase())
+    ? String(rawPolicy).toLowerCase()
+    : "allow";
+  if (policy === "allow") {
+    sitePermissions.set(host, "allow");
+  } else {
+    sitePermissions.set(host, policy);
+  }
+  const snapshot = getSitePermissionsSnapshot();
+  try {
+    if (chrome.storage?.local?.set) {
+      await chrome.storage.local.set({ agSitePermissions: snapshot });
+    }
+  } catch {}
+  broadcastToSidePanels({
+    type: "sidepanel:sitePermissionsUpdated",
+    permissions: snapshot,
+  });
+  return { ok: true, host, policy, permissions: snapshot };
+}
+
+async function saveExtensionSettings(patch = {}) {
+  await ensureLocalStateLoaded();
+  const next = { ...extensionSettings };
+  if (typeof patch.cwd === "string") next.cwd = patch.cwd.trim();
+  if (typeof patch.customInstructions === "string") next.customInstructions = patch.customInstructions.slice(0, 8000);
+  if (["system", "dark", "light"].includes(patch.theme)) next.theme = patch.theme;
+  if (["auto", "ask", "full"].includes(patch.defaultApprovalMode)) {
+    next.defaultApprovalMode = patch.defaultApprovalMode;
+  }
+  extensionSettings = next;
+  try {
+    if (chrome.storage?.local?.set) {
+      await chrome.storage.local.set({ agExtensionSettings: extensionSettings });
+    }
+  } catch {}
+  broadcastToSidePanels({
+    type: "sidepanel:settingsUpdated",
+    settings: { ...extensionSettings },
+  });
+  return { ok: true, settings: { ...extensionSettings } };
+}
+
+function recordBrowserActivity({ kind = "action", title, detail = "", tabId = null, source = "mcp" } = {}) {
+  if (!title) return null;
+  const entry = {
+    id: `act-${nextActivityId++}`,
+    ts: Date.now(),
+    kind,
+    title: String(title),
+    detail: String(detail || ""),
+    tabId: typeof tabId === "number" ? tabId : null,
+    source,
+  };
+  browserActivityLog.push(entry);
+  while (browserActivityLog.length > MAX_BROWSER_ACTIVITY) {
+    browserActivityLog.shift();
+  }
+  broadcastToSidePanels({
+    type: "sidepanel:browserActivity",
+    entry,
+    activityLog: browserActivityLog.slice(),
+  });
+  return entry;
+}
+
+function getRecordingSnapshot() {
+  return {
+    active: Boolean(recordingState.active),
+    tabId: recordingState.tabId,
+    startedAt: recordingState.startedAt,
+    originUrl: recordingState.originUrl,
+    originTitle: recordingState.originTitle,
+    stepCount: recordingState.steps.length,
+    maxActions: MAX_RECORDED_ACTIONS,
+    steps: recordingState.steps.slice(-20),
+  };
+}
+
+function getPickerSnapshot() {
+  return {
+    active: Boolean(pickerState.active),
+    tabId: pickerState.tabId,
+    startedAt: pickerState.startedAt,
+  };
+}
+
 function normalizeGroupColor(color) {
   const c = String(color || "cyan").trim().toLowerCase();
   if (VALID_GROUP_COLORS.has(c)) return c;
@@ -135,6 +298,15 @@ function normalizeGroupColor(color) {
   if (c === "violet" || c === "indigo") return "purple";
   if (c === "amber") return "orange";
   return "cyan";
+}
+
+function sanitizeForContextEnvelope(rawText) {
+  if (rawText == null) return "";
+  return String(rawText)
+    .replace(/<\/browser_sidepanel_context>/gi, "<\\/browser_sidepanel_context>")
+    .replace(/<browser_sidepanel_context>/gi, "<\\browser_sidepanel_context>")
+    .replace(/<\/attached_file>/gi, "<\\/attached_file>")
+    .replace(/<attached_file\b/gi, "<\\attached_file");
 }
 
 function stripInjectedBrowserContext(rawText) {
@@ -167,6 +339,26 @@ async function configureSidePanelBehavior() {
   } catch {}
 }
 
+function setupContextMenus() {
+  try {
+    if (!chrome.contextMenus?.create) return;
+    chrome.contextMenus.removeAll?.(() => {
+      try {
+        chrome.contextMenus.create({
+          id: "ag-ask-selection",
+          title: "Ask Antigravity about selection",
+          contexts: ["selection"],
+        });
+        chrome.contextMenus.create({
+          id: "ag-open-sidepanel",
+          title: "Open Antigravity in Chrome",
+          contexts: ["page"],
+        });
+      } catch {}
+    });
+  } catch {}
+}
+
 function broadcastToSidePanels(msg) {
   for (const port of Array.from(sidepanelPorts)) {
     try {
@@ -182,13 +374,30 @@ async function ensureLocalStateLoaded() {
   localStateLoaded = true;
   try {
     if (!chrome.storage?.local?.get) return;
-    const data = await chrome.storage.local.get(["agChromeSessions"]);
+    const data = await chrome.storage.local.get([
+      "agChromeSessions",
+      "agSitePermissions",
+      "agExtensionSettings",
+    ]);
     if (Array.isArray(data?.agChromeSessions)) {
       for (const item of data.agChromeSessions) {
         if (item && typeof item.sessionId === "string" && item.sessionId) {
           chromeSessions.set(item.sessionId, item);
         }
       }
+    }
+    if (data?.agSitePermissions && typeof data.agSitePermissions === "object") {
+      for (const [host, policy] of Object.entries(data.agSitePermissions)) {
+        if (host && ["allow", "ask", "block"].includes(policy)) {
+          sitePermissions.set(host, policy);
+        }
+      }
+    }
+    if (data?.agExtensionSettings && typeof data.agExtensionSettings === "object") {
+      extensionSettings = {
+        ...extensionSettings,
+        ...data.agExtensionSettings,
+      };
     }
   } catch {}
 }
@@ -572,8 +781,69 @@ async function sendCdpCommand({ tabId, targetId, sessionId, method, params = {},
   if (!Number.isInteger(tid) || tid <= 0) {
     throw new Error("sendCdp requires tabId or targetId");
   }
+  try {
+    const tabInfo = await chrome.tabs.get(tid);
+    const tabHost = normalizeHostFromUrl(tabInfo?.url || tabInfo?.pendingUrl || "");
+    if (tabHost && getSitePolicyForHost(tabHost) === "block") {
+      const err = new Error(
+        `Browser control is blocked on ${tabHost} by Antigravity in Chrome site permissions.`,
+      );
+      err.code = -32021;
+      throw err;
+    }
+  } catch (err) {
+    if (err?.code === -32021) throw err;
+  }
   await ensureDebuggerAttached(tid);
-  return await chrome.debugger.sendCommand({ tabId: tid }, method, finalParams);
+  const cdpResult = await chrome.debugger.sendCommand({ tabId: tid }, method, finalParams);
+  recordThrottledCdpActivity(tid, method, finalParams);
+  return cdpResult;
+}
+
+function recordThrottledCdpActivity(tabId, method, params = {}) {
+  const now = Date.now();
+  const key = `${tabId}:${method}`;
+  const prev = lastCdpActivityByKey.get(key) || 0;
+  if (method === "Page.navigate") {
+    lastCdpActivityByKey.set(key, now);
+    recordBrowserActivity({
+      kind: "navigate",
+      title: "Navigated tab",
+      detail: String(params.url || ""),
+      tabId,
+      source: "mcp",
+    });
+  } else if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+    if (now - prev < 400) return;
+    lastCdpActivityByKey.set(key, now);
+    recordBrowserActivity({
+      kind: "click",
+      title: `Clicked at (${Math.round(params.x || 0)}, ${Math.round(params.y || 0)})`,
+      detail: `Tab #${tabId}`,
+      tabId,
+      source: "mcp",
+    });
+  } else if (method === "Input.insertText" && params.text) {
+    if (now - prev < 400) return;
+    lastCdpActivityByKey.set(key, now);
+    recordBrowserActivity({
+      kind: "type",
+      title: "Typed into page",
+      detail: `${String(params.text).length} chars · Tab #${tabId}`,
+      tabId,
+      source: "mcp",
+    });
+  } else if (method === "Page.captureScreenshot") {
+    if (now - prev < 1200) return;
+    lastCdpActivityByKey.set(key, now);
+    recordBrowserActivity({
+      kind: "screenshot",
+      title: "Captured page screenshot",
+      detail: `Tab #${tabId}`,
+      tabId,
+      source: "mcp",
+    });
+  }
 }
 
 async function buildAllTabsSnapshot() {
@@ -657,7 +927,7 @@ async function addTabToSessionGroup(tab, session, { groupTitle, groupColor } = {
 /**
  * Extract clean readable page context via `chrome.scripting.executeScript` (ZERO debugger banner!).
  */
-async function extractReadableTabContext(tabId, { maxChars = 14000 } = {}) {
+async function extractReadableTabContext(tabId, { maxChars = 14000, ignoreSitePolicy = false } = {}) {
   const tid = Number(tabId);
   if (!Number.isInteger(tid) || tid <= 0) return null;
   let tab;
@@ -667,17 +937,29 @@ async function extractReadableTabContext(tabId, { maxChars = 14000 } = {}) {
     return null;
   }
   const rawUrl = tab.url || tab.pendingUrl || "";
+  const host = normalizeHostFromUrl(rawUrl);
+  const sitePolicy = getSitePolicyForHost(host);
   const baseMeta = {
     tabId: tab.id,
     windowId: tab.windowId,
     title: tab.title || "",
     url: rawUrl,
+    host,
+    sitePolicy,
+    blockedBySitePolicy: false,
     readable: false,
     selection: "",
     metaDescription: "",
     headings: [],
+    linksCount: 0,
+    buttonsCount: 0,
+    inputsCount: 0,
     text: "",
+    truncated: false,
   };
+  if (!ignoreSitePolicy && sitePolicy === "block") {
+    return { ...baseMeta, blockedBySitePolicy: true };
+  }
   if (!isSafeInjectableUrl(rawUrl) || !chrome.scripting?.executeScript) {
     return baseMeta;
   }
@@ -720,6 +1002,8 @@ async function extractReadableTabContext(tabId, { maxChars = 14000 } = {}) {
       return {
         ...baseMeta,
         ...extracted,
+        host: normalizeHostFromUrl(extracted.url || rawUrl) || host,
+        sitePolicy: getSitePolicyForHost(normalizeHostFromUrl(extracted.url || rawUrl) || host),
         readable: true,
       };
     }
@@ -748,23 +1032,60 @@ function formatTabContextSection(label, ctx, browserFamily) {
   if (!ctx) return "";
   const mcpTabId = `ext:${browserFamily}:${ctx.tabId}`;
   const lines = [
-    `### ${label}`,
-    `- Title: ${ctx.title || "(Untitled)"}`,
-    `- URL: ${ctx.url || "(empty)"}`,
+    `### ${sanitizeForContextEnvelope(label)}`,
+    `- Title: ${sanitizeForContextEnvelope(ctx.title || "(Untitled)")}`,
+    `- URL: ${sanitizeForContextEnvelope(ctx.url || "(empty)")}`,
     `- Browser Tab ID (for computer-use MCP): \`${mcpTabId}\` (numeric tabId: ${ctx.tabId}, windowId: ${ctx.windowId})`,
   ];
   if (ctx.metaDescription) {
-    lines.push(`- Meta Description: ${ctx.metaDescription}`);
+    lines.push(`- Meta Description: ${sanitizeForContextEnvelope(ctx.metaDescription)}`);
   }
   if (ctx.selection) {
-    lines.push(`- Highlighted Selection on Page:\n"""\n${ctx.selection}\n"""`);
+    lines.push(`- Highlighted Selection on Page:\n"""\n${sanitizeForContextEnvelope(ctx.selection)}\n"""`);
   }
   if (Array.isArray(ctx.headings) && ctx.headings.length > 0) {
-    lines.push(`- Key Headings: ${ctx.headings.slice(0, 12).join(" | ")}`);
+    lines.push(`- Key Headings: ${sanitizeForContextEnvelope(ctx.headings.slice(0, 12).join(" | "))}`);
   }
   if (ctx.readable && ctx.text) {
     lines.push(
-      `- Visible Page Content${ctx.truncated ? " (excerpt)" : ""}:\n\`\`\`text\n${ctx.text}\n\`\`\``,
+      `- Visible Page Content${ctx.truncated ? " (excerpt)" : ""}:\n\`\`\`text\n${sanitizeForContextEnvelope(ctx.text)}\n\`\`\``,
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatPickedElementSection(el, idx = 1) {
+  if (!el || typeof el !== "object") return "";
+  const selector = sanitizeForContextEnvelope(el.selector || el.tagName || "element");
+  const lines = [
+    `### Picked Webpage Element #${idx}: \`${selector}\``,
+    `- Tag: \`<${sanitizeForContextEnvelope(el.tagName || "div")}>\`` +
+      (el.role ? ` · Role: \`${sanitizeForContextEnvelope(el.role)}\`` : "") +
+      (el.label ? ` · Label: "${sanitizeForContextEnvelope(el.label)}"` : ""),
+  ];
+  if (el.url) {
+    lines.push(`- Page URL: ${sanitizeForContextEnvelope(el.url)}`);
+  }
+  if (el.rect && typeof el.rect === "object") {
+    lines.push(
+      `- Bounding Box: x=${Number(el.rect.x || 0)}, y=${Number(el.rect.y || 0)}, width=${Number(el.rect.width || 0)}px, height=${Number(el.rect.height || 0)}px`,
+    );
+  }
+  if (el.styles && typeof el.styles === "object") {
+    const stylePairs = Object.entries(el.styles)
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join("; ");
+    if (stylePairs) {
+      lines.push(`- Computed Styles: \`${sanitizeForContextEnvelope(stylePairs)}\``);
+    }
+  }
+  if (el.text) {
+    lines.push(`- Element Text:\n"""\n${sanitizeForContextEnvelope(String(el.text).slice(0, 400))}\n"""`);
+  }
+  if (el.htmlSnippet) {
+    lines.push(
+      `- DOM OuterHTML Snippet:\n\`\`\`html\n${sanitizeForContextEnvelope(String(el.htmlSnippet).slice(0, 800))}\n\`\`\``,
     );
   }
   return lines.join("\n");
@@ -786,6 +1107,7 @@ function handleAgentStreamEvent(params = {}) {
         interactionMode: turn.interactionMode || "chat",
         permissionMode: turn.permissionMode || "auto",
         modelId: turn.modelId || "",
+        cwd: turn.cwd || "",
         originUrl: turn.originUrl || "",
         originTitle: turn.originTitle || "",
         scheduledTaskName: turn.scheduledTaskName || null,
@@ -823,12 +1145,19 @@ function handleAgentStreamEvent(params = {}) {
             if (update.status) existing.status = update.status;
             if (update.title) existing.title = update.title;
           } else {
+            const toolTitle = update.title || update.name || "Tool";
             targetMsg.toolCalls.push({
               toolCallId: update.toolCallId,
               name: update.name || "tool",
-              title: update.title || update.name || "Tool",
+              title: toolTitle,
               status: update.status || "in_progress",
               kind: update.kind || "other",
+            });
+            recordBrowserActivity({
+              kind: "tool",
+              title: toolTitle,
+              detail: update.name || "agent tool",
+              source: "sidepanel",
             });
           }
         }
@@ -843,6 +1172,39 @@ function handleAgentStreamEvent(params = {}) {
   });
 }
 
+async function checkTabSiteAccessOrPrompt(tabId, confirmedHostsSet) {
+  if (!tabId) return null;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(Number(tabId));
+  } catch {
+    return null;
+  }
+  const rawUrl = tab.url || tab.pendingUrl || "";
+  const host = normalizeHostFromUrl(rawUrl);
+  if (!host) return null;
+  const policy = getSitePolicyForHost(host);
+  if (policy === "block") {
+    const err = new Error(
+      `Site access is blocked for ${host}. Change Site Access to Allow or Ask every time to let Antigravity read or act on this site.`,
+    );
+    err.code = -32021;
+    throw err;
+  }
+  if (policy === "ask" && !confirmedHostsSet.has(host)) {
+    return {
+      ok: false,
+      code: -32020,
+      requiresSiteConfirmation: true,
+      host,
+      url: rawUrl,
+      title: tab.title || host,
+      error: `Antigravity needs your permission to access ${host}.`,
+    };
+  }
+  return null;
+}
+
 async function runSidePanelPrompt({
   requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
   sessionId = null,
@@ -853,8 +1215,15 @@ async function runSidePanelPrompt({
   modelId = null,
   includeActiveTab = true,
   activeTabId = null,
+  includeSelection = true,
+  selectionOverride = null,
   mentionedTabIds = [],
+  pickedElements = [],
   screenshotBase64 = null,
+  attachedFiles = [],
+  cwd = null,
+  customInstructions = null,
+  siteAccessConfirmedHosts = [],
   scheduledTaskName = null,
 } = {}) {
   await ensureLocalStateLoaded();
@@ -863,17 +1232,38 @@ async function runSidePanelPrompt({
 
   // Verify existing Chrome session if resuming
   if (sessionId && !chromeSessions.has(sessionId)) {
-    throw new Error(
+    const err = new Error(
       "Conversations created in the Antigravity Desktop App cannot be opened in Antigravity in Chrome. Start a new chat here to view it in both Chrome and the Desktop App.",
     );
+    err.code = -32010;
+    throw err;
   }
 
+  const confirmedHostsSet = new Set(
+    (Array.isArray(siteAccessConfirmedHosts) ? siteAccessConfirmedHosts : [])
+      .map((h) => String(h || "").trim().toLowerCase().replace(/^www\./, ""))
+      .filter(Boolean),
+  );
+
   let resolvedActiveTabId = activeTabId;
-  if (includeActiveTab && !resolvedActiveTabId) {
+  if ((includeActiveTab || interactionMode === "agent") && !resolvedActiveTabId) {
     try {
       const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (active?.id) resolvedActiveTabId = active.id;
     } catch {}
+  }
+
+  if ((includeActiveTab || interactionMode === "agent") && resolvedActiveTabId) {
+    const gate = await checkTabSiteAccessOrPrompt(resolvedActiveTabId, confirmedHostsSet);
+    if (gate) return gate;
+  }
+
+  const uniqueMentions = Array.from(
+    new Set((mentionedTabIds || []).map(Number).filter((n) => n > 0 && n !== resolvedActiveTabId)),
+  );
+  for (const mTabId of uniqueMentions.slice(0, 6)) {
+    const gate = await checkTabSiteAccessOrPrompt(mTabId, confirmedHostsSet);
+    if (gate) return gate;
   }
 
   const contextSections = [];
@@ -886,17 +1276,36 @@ async function runSidePanelPrompt({
     if (activeCtx) {
       originUrl = activeCtx.url || "";
       originTitle = activeCtx.title || "";
+      if (includeSelection === false) {
+        activeCtx.selection = "";
+      } else if (typeof selectionOverride === "string" && selectionOverride.trim()) {
+        activeCtx.selection = selectionOverride.trim().slice(0, 4000);
+      }
       attachments.push({
         kind: "active-tab",
         tabId: activeCtx.tabId,
         title: activeCtx.title || activeCtx.url || `Tab #${activeCtx.tabId}`,
         url: activeCtx.url || "",
       });
+      if (activeCtx.selection) {
+        attachments.push({
+          kind: "selection",
+          label: "Selection",
+          preview: activeCtx.selection.slice(0, 140),
+        });
+      }
       contextSections.push(formatTabContextSection("Active Webpage Tab", activeCtx, browserFamily));
     }
+  } else if (includeSelection !== false && typeof selectionOverride === "string" && selectionOverride.trim()) {
+    const trimmedSel = selectionOverride.trim().slice(0, 4000);
+    attachments.push({
+      kind: "selection",
+      label: "Selection",
+      preview: trimmedSel.slice(0, 140),
+    });
+    contextSections.push(`### Highlighted Webpage Selection\n"""\n${sanitizeForContextEnvelope(trimmedSel)}\n"""`);
   }
 
-  const uniqueMentions = Array.from(new Set((mentionedTabIds || []).map(Number).filter((n) => n > 0 && n !== resolvedActiveTabId)));
   for (const mTabId of uniqueMentions.slice(0, 6)) {
     const mCtx = await extractReadableTabContext(mTabId, { maxChars: 8_000 });
     if (mCtx) {
@@ -910,8 +1319,67 @@ async function runSidePanelPrompt({
     }
   }
 
+  if (Array.isArray(pickedElements) && pickedElements.length > 0) {
+    let pickIdx = 1;
+    for (const el of pickedElements.slice(0, 8)) {
+      if (!el || typeof el !== "object") continue;
+      const selector = String(el.selector || el.tagName || "element").slice(0, 140);
+      attachments.push({
+        kind: "element",
+        selector,
+        label: String(el.label || selector).slice(0, 96),
+        tagName: String(el.tagName || "div").toLowerCase(),
+      });
+      const section = formatPickedElementSection(el, pickIdx++);
+      if (section) contextSections.push(section);
+    }
+  }
+
   if (screenshotBase64) {
     attachments.push({ kind: "screenshot", label: "Tab Screenshot" });
+  }
+
+  const promptBlocks = [];
+  if (screenshotBase64) {
+    promptBlocks.push({
+      type: "image",
+      data: screenshotBase64,
+      mimeType: "image/png",
+    });
+  }
+
+  if (Array.isArray(attachedFiles)) {
+    for (const fileItem of attachedFiles.slice(0, 8)) {
+      if (!fileItem || typeof fileItem !== "object") continue;
+      const fileName = String(fileItem.name || "attachment").slice(0, 180);
+      const mimeType = String(fileItem.mimeType || "application/octet-stream");
+      const isImage = fileItem.kind === "image" || mimeType.startsWith("image/");
+      if (isImage && typeof fileItem.base64 === "string" && fileItem.base64.length > 0) {
+        promptBlocks.push({
+          type: "image",
+          data: fileItem.base64,
+          mimeType: mimeType.startsWith("image/") ? mimeType : "image/png",
+        });
+        attachments.push({
+          kind: "image",
+          label: fileName,
+          mimeType,
+        });
+      } else if (typeof fileItem.textContent === "string" && fileItem.textContent.length > 0) {
+        const clipped = sanitizeForContextEnvelope(fileItem.textContent.slice(0, 32_000));
+        const truncatedSuffix = fileItem.textContent.length > 32_000 ? "\n...[truncated]..." : "";
+        const safeName = sanitizeForContextEnvelope(fileName);
+        contextSections.push(
+          `### Attached Local File: ${safeName} (${sanitizeForContextEnvelope(mimeType)})\n<attached_file name="${safeName.replace(/"/g, "'")}">\n${clipped}${truncatedSuffix}\n</attached_file>`,
+        );
+        attachments.push({
+          kind: "file",
+          label: fileName,
+          mimeType,
+          size: Number(fileItem.size || fileItem.textContent.length),
+        });
+      }
+    }
   }
 
   const modeBanner =
@@ -926,14 +1394,6 @@ async function runSidePanelPrompt({
   const cleanText = String(userText || "").trim();
   const fullPromptText = `${contextEnvelope}${cleanText}`;
 
-  const promptBlocks = [];
-  if (screenshotBase64) {
-    promptBlocks.push({
-      type: "image",
-      data: screenshotBase64,
-      mimeType: "image/png",
-    });
-  }
   promptBlocks.push({
     type: "text",
     text: fullPromptText,
@@ -952,6 +1412,9 @@ async function runSidePanelPrompt({
       ? `🕒 ${scheduledTaskName}`
       : cleanText.replace(/\s+/g, " ").slice(0, 64) || originTitle || "Browser Chat";
 
+  const effectiveCwd = String(cwd ?? extensionSettings.cwd ?? "").trim() || null;
+  const effectiveInstructions = String(customInstructions ?? extensionSettings.customInstructions ?? "").trim() || null;
+
   const now = Date.now();
   if (sessionId && chromeSessions.has(sessionId)) {
     const rec = chromeSessions.get(sessionId);
@@ -959,6 +1422,7 @@ async function runSidePanelPrompt({
     rec.interactionMode = interactionMode;
     rec.permissionMode = permissionMode;
     if (modelId) rec.modelId = modelId;
+    if (effectiveCwd) rec.cwd = effectiveCwd;
     if (!Array.isArray(rec.messages)) rec.messages = [];
     rec.messages.push(
       {
@@ -981,20 +1445,38 @@ async function runSidePanelPrompt({
     interactionMode,
     permissionMode,
     modelId: modelId || "",
+    cwd: effectiveCwd || "",
     originUrl,
     originTitle,
     scheduledTaskName,
     assistantMsg,
   });
 
+  if (interactionMode === "agent") {
+    recordBrowserActivity({
+      kind: "agent",
+      title: "Started Agent turn",
+      detail: cleanText.slice(0, 96) || originTitle || "Browser task",
+      tabId: resolvedActiveTabId || null,
+      source: "sidepanel",
+    });
+  }
+
+  const normPerm = String(permissionMode || extensionSettings.defaultApprovalMode || "auto").toLowerCase();
+  const effectiveModeId = normPerm === "ask" || normPerm === "default" ? "default" : "auto";
+  const effectiveAutoApprove =
+    normPerm === "full" ? true : normPerm === "ask" || normPerm === "default" ? false : Boolean(autoApprovePermissions);
+
   try {
     const res = await callNativeAgentRpc("agent.prompt", {
       requestId,
       sessionId,
       promptBlocks,
-      modeId: permissionMode || "auto",
+      modeId: effectiveModeId,
       modelId: modelId || null,
-      autoApprovePermissions: Boolean(autoApprovePermissions),
+      autoApprovePermissions: effectiveAutoApprove,
+      cwd: effectiveCwd,
+      systemPromptAppend: effectiveInstructions,
     });
     const finalSessionId = res?.sessionId || sessionId;
     if (finalSessionId && chromeSessions.has(finalSessionId)) {
@@ -1018,6 +1500,630 @@ async function runSidePanelPrompt({
   } finally {
     activeTurnByRequest.delete(requestId);
   }
+}
+
+// Codex in Chrome parity: "Record a browser demonstration" -> reusable /shortcut skill
+async function injectRecorderIntoTab(tabId) {
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid) || tid <= 0 || !chrome.scripting?.executeScript) return false;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tid);
+  } catch {
+    return false;
+  }
+  const url = tab.url || tab.pendingUrl || "";
+  if (!isSafeInjectableUrl(url) || getSitePolicyForUrl(url) === "block") return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tid },
+      func: () => {
+        if (typeof window.__agDemoRecorderCleanup === "function") {
+          window.__agDemoRecorderCleanup();
+        }
+        const describeEl = (el) => {
+          if (!el || !el.tagName) return { selector: "page", label: "page" };
+          const tag = el.tagName.toLowerCase();
+          const aria = (el.getAttribute?.("aria-label") || "").trim();
+          const placeholder = (el.getAttribute?.("placeholder") || "").trim();
+          const name = (el.getAttribute?.("name") || "").trim();
+          const id = (el.id || "").trim();
+          const role = (el.getAttribute?.("role") || "").trim();
+          const text = ((el.innerText || el.value || "").replace(/\s+/g, " ").trim() || "").slice(0, 60);
+          const label = aria || text || placeholder || name || (id ? `#${id}` : tag);
+          let selector = tag;
+          if (id) selector = `${tag}#${id}`;
+          else if (aria) selector = `${tag}[aria-label="${aria.replace(/"/g, "'").slice(0, 48)}"]`;
+          else if (name) selector = `${tag}[name="${name.replace(/"/g, "'").slice(0, 48)}"]`;
+          else if (role) selector = `${tag}[role="${role}"]`;
+          return { selector, label: label.slice(0, 72) };
+        };
+        const isSensitiveInput = (el) => {
+          if (!el) return false;
+          const type = String(el.type || "").toLowerCase();
+          const ac = String(el.autocomplete || "").toLowerCase();
+          const nm = String(el.name || el.id || "").toLowerCase();
+          if (type === "password") return true;
+          if (/password|passwd|secret|token|cvv|cvc|cc-number|cc-csc/.test(`${ac} ${nm}`)) return true;
+          return false;
+        };
+        const badge = document.createElement("div");
+        badge.id = "__ag-demo-recorder-pill";
+        badge.style.cssText =
+          "position:fixed;top:12px;right:12px;z-index:2147483647;display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:rgba(19,19,20,0.92);backdrop-filter:blur(12px);border:1px solid rgba(242,139,130,0.45);color:#E3E3E3;font:600 12px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;box-shadow:0 8px 24px rgba(0,0,0,0.36);pointer-events:none;";
+        const dotEl = document.createElement("span");
+        dotEl.style.cssText = "width:8px;height:8px;border-radius:50%;background:#EA4335;box-shadow:0 0 8px #EA4335;";
+        const labelEl = document.createElement("span");
+        labelEl.textContent = "Recording workflow · Antigravity";
+        badge.appendChild(dotEl);
+        badge.appendChild(labelEl);
+        document.documentElement.appendChild(badge);
+
+        const onClick = (ev) => {
+          const target = ev.target?.closest?.("button, a, input, select, textarea, [role='button'], [role='tab'], [role='menuitem'], label") || ev.target;
+          const info = describeEl(target);
+          try {
+            chrome.runtime.sendMessage({
+              type: "recorder:step",
+              step: {
+                kind: "click",
+                selector: info.selector,
+                label: info.label,
+                url: location.href,
+                title: document.title,
+              },
+            });
+          } catch {}
+        };
+        const onChange = (ev) => {
+          const target = ev.target;
+          if (!target || !/^(INPUT|TEXTAREA|SELECT)$/i.test(target.tagName || "")) return;
+          const info = describeEl(target);
+          const redacted = isSensitiveInput(target);
+          const rawVal = target.type === "checkbox" || target.type === "radio" ? String(Boolean(target.checked)) : String(target.value || "");
+          try {
+            chrome.runtime.sendMessage({
+              type: "recorder:step",
+              step: {
+                kind: "input",
+                inputType: String(target.type || "text").toLowerCase(),
+                selector: info.selector,
+                label: info.label,
+                value: redacted ? "[REDACTED]" : rawVal.slice(0, 160),
+                redacted,
+                url: location.href,
+                title: document.title,
+              },
+            });
+          } catch {}
+        };
+        const onKeyDown = (ev) => {
+          if (ev.key !== "Enter") return;
+          const info = describeEl(ev.target);
+          try {
+            chrome.runtime.sendMessage({
+              type: "recorder:step",
+              step: {
+                kind: "keypress",
+                key: "Enter",
+                selector: info.selector,
+                label: info.label,
+                url: location.href,
+                title: document.title,
+              },
+            });
+          } catch {}
+        };
+
+        document.addEventListener("click", onClick, true);
+        document.addEventListener("change", onChange, true);
+        document.addEventListener("keydown", onKeyDown, true);
+        window.__agDemoRecorderCleanup = () => {
+          document.removeEventListener("click", onClick, true);
+          document.removeEventListener("change", onChange, true);
+          document.removeEventListener("keydown", onKeyDown, true);
+          badge.remove();
+          delete window.__agDemoRecorderCleanup;
+        };
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeRecorderFromTab(tabId) {
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid) || tid <= 0 || !chrome.scripting?.executeScript) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tid },
+      func: () => {
+        if (typeof window.__agDemoRecorderCleanup === "function") {
+          window.__agDemoRecorderCleanup();
+        } else {
+          document.getElementById("__ag-demo-recorder-pill")?.remove();
+        }
+      },
+    });
+  } catch {}
+}
+
+// Codex in Chrome parity: Interactive Webpage Element Picker (Trusted-Types-safe, zero debugger banner)
+async function injectElementPickerIntoTab(tabId) {
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid) || tid <= 0 || !chrome.scripting?.executeScript) return false;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tid);
+  } catch {
+    return false;
+  }
+  const url = tab.url || tab.pendingUrl || "";
+  if (!isSafeInjectableUrl(url) || getSitePolicyForUrl(url) === "block") return false;
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tid },
+      func: () => {
+        if (typeof window.__agElementPickerCleanup === "function") {
+          window.__agElementPickerCleanup();
+        }
+
+        const cssIdent = (s) => String(s || "").replace(/[^a-zA-Z0-9_-]/g, "");
+        const buildSelector = (el) => {
+          if (!el || !el.tagName) return "body";
+          const parts = [];
+          let cur = el;
+          let depth = 0;
+          while (cur && cur.nodeType === 1 && depth < 3) {
+            const tag = cur.tagName.toLowerCase();
+            if (tag === "html" || tag === "body") break;
+            if (cur.id) {
+              const safeId = cssIdent(cur.id);
+              parts.unshift(safeId ? `${tag}#${safeId}` : tag);
+              break;
+            }
+            const testId = cur.getAttribute?.("data-testid") || cur.getAttribute?.("data-test");
+            if (testId) {
+              parts.unshift(`${tag}[data-testid="${String(testId).replace(/"/g, "'").slice(0, 48)}"]`);
+              break;
+            }
+            const aria = (cur.getAttribute?.("aria-label") || "").trim();
+            if (aria && depth === 0) {
+              parts.unshift(`${tag}[aria-label="${aria.replace(/"/g, "'").slice(0, 40)}"]`);
+              break;
+            }
+            const cls = Array.from(cur.classList || [])
+              .map(cssIdent)
+              .filter((c) => c && c.length < 36)
+              .slice(0, 2);
+            parts.unshift(cls.length > 0 ? `${tag}.${cls.join(".")}` : tag);
+            cur = cur.parentElement;
+            depth++;
+          }
+          return parts.join(" > ") || el.tagName.toLowerCase();
+        };
+
+        const isSensitive = (el) => {
+          if (!el) return false;
+          const type = String(el.type || "").toLowerCase();
+          const ac = String(el.autocomplete || "").toLowerCase();
+          const nm = String(el.name || el.id || "").toLowerCase();
+          if (type === "password") return true;
+          return /password|passwd|secret|token|cvv|cvc|cc-number|cc-csc/.test(`${ac} ${nm}`);
+        };
+
+        const root = document.createElement("div");
+        root.id = "__ag-element-picker-root";
+        root.style.cssText =
+          "position:fixed;inset:0;z-index:2147483646;pointer-events:none;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
+
+        const banner = document.createElement("div");
+        banner.style.cssText =
+          "position:fixed;top:14px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;background:rgba(19,19,20,0.94);border:1px solid rgba(168,199,250,0.38);color:#E3E3E3;font-size:12px;font-weight:500;box-shadow:0 8px 28px rgba(0,0,0,0.38);backdrop-filter:blur(12px);pointer-events:none;";
+        const spark = document.createElement("span");
+        spark.style.cssText =
+          "width:8px;height:8px;border-radius:50%;background:#4285F4;box-shadow:0 0 8px rgba(66,133,244,0.8);";
+        const bannerText = document.createElement("span");
+        bannerText.textContent = "Click any element to attach to Antigravity · Esc to cancel";
+        banner.appendChild(spark);
+        banner.appendChild(bannerText);
+
+        const box = document.createElement("div");
+        box.style.cssText =
+          "position:fixed;display:none;border:2px solid #4285F4;background:rgba(66,133,244,0.12);border-radius:6px;box-sizing:border-box;transition:all 45ms ease-out;pointer-events:none;";
+
+        const tagPill = document.createElement("div");
+        tagPill.style.cssText =
+          "position:fixed;display:none;padding:3px 8px;border-radius:6px;background:#131314;border:1px solid rgba(168,199,250,0.35);color:#A8C7FA;font:600 11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;max-width:340px;overflow:hidden;text-overflow:ellipsis;box-shadow:0 4px 14px rgba(0,0,0,0.35);pointer-events:none;";
+
+        root.appendChild(box);
+        root.appendChild(tagPill);
+        root.appendChild(banner);
+        document.documentElement.appendChild(root);
+
+        const prevCursor = document.documentElement.style.cursor;
+        document.documentElement.style.cursor = "crosshair";
+
+        let hoveredEl = null;
+
+        const onMouseMove = (ev) => {
+          const target = ev.target;
+          if (!target || target.nodeType !== 1 || root.contains(target)) return;
+          hoveredEl = target;
+          const r = target.getBoundingClientRect();
+          box.style.display = "block";
+          box.style.left = `${Math.round(r.left)}px`;
+          box.style.top = `${Math.round(r.top)}px`;
+          box.style.width = `${Math.max(2, Math.round(r.width))}px`;
+          box.style.height = `${Math.max(2, Math.round(r.height))}px`;
+
+          const sel = buildSelector(target);
+          tagPill.textContent = `${sel} · ${Math.round(r.width)}×${Math.round(r.height)}`;
+          tagPill.style.display = "block";
+          const pillTop = r.top > 30 ? r.top - 26 : Math.min(window.innerHeight - 28, r.bottom + 6);
+          const pillLeft = Math.max(8, Math.min(window.innerWidth - 260, r.left));
+          tagPill.style.top = `${Math.round(pillTop)}px`;
+          tagPill.style.left = `${Math.round(pillLeft)}px`;
+        };
+
+        const cleanup = () => {
+          document.removeEventListener("mousemove", onMouseMove, true);
+          document.removeEventListener("click", onClick, true);
+          document.removeEventListener("mousedown", swallowPointer, true);
+          document.removeEventListener("mouseup", swallowPointer, true);
+          document.removeEventListener("keydown", onKeyDown, true);
+          document.documentElement.style.cursor = prevCursor;
+          root.remove();
+          delete window.__agElementPickerCleanup;
+        };
+
+        const swallowPointer = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+        };
+
+        const onClick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          ev.stopImmediatePropagation?.();
+          const el = hoveredEl || ev.target;
+          if (!el || el.nodeType !== 1) {
+            cleanup();
+            return;
+          }
+          const r = el.getBoundingClientRect();
+          const selector = buildSelector(el);
+          const aria = (el.getAttribute?.("aria-label") || "").trim();
+          const placeholder = (el.getAttribute?.("placeholder") || "").trim();
+          const alt = (el.getAttribute?.("alt") || "").trim();
+          const sensitive = isSensitive(el);
+          const rawText = sensitive
+            ? "[REDACTED]"
+            : ((el.innerText || el.value || "").replace(/\s+/g, " ").trim() || "").slice(0, 320);
+          const label = (aria || alt || placeholder || rawText || selector).slice(0, 96);
+          let htmlSnippet = "";
+          try {
+            const clone = el.cloneNode(true);
+            if (clone.querySelectorAll) {
+              for (const inp of clone.querySelectorAll("input[type='password'], input[name*='secret'], input[name*='token']")) {
+                inp.setAttribute("value", "[REDACTED]");
+              }
+            }
+            if (sensitive && clone.setAttribute) {
+              clone.setAttribute("value", "[REDACTED]");
+            }
+            htmlSnippet = String(clone.outerHTML || "").replace(/\s+/g, " ").trim().slice(0, 700);
+          } catch {}
+
+          let styles = {};
+          try {
+            const cs = window.getComputedStyle(el);
+            styles = {
+              display: cs.display || "",
+              position: cs.position || "",
+              color: cs.color || "",
+              backgroundColor: cs.backgroundColor || "",
+              fontSize: cs.fontSize || "",
+              borderRadius: cs.borderRadius || "",
+            };
+          } catch {}
+
+          const payload = {
+            tagName: el.tagName.toLowerCase(),
+            selector,
+            label,
+            role: (el.getAttribute?.("role") || "").trim(),
+            id: el.id || "",
+            classes: Array.from(el.classList || []).slice(0, 8),
+            rect: {
+              x: Math.round(r.left),
+              y: Math.round(r.top),
+              width: Math.round(r.width),
+              height: Math.round(r.height),
+            },
+            text: rawText,
+            htmlSnippet,
+            styles,
+            url: location.href,
+            title: document.title,
+          };
+
+          cleanup();
+          try {
+            chrome.runtime.sendMessage({
+              type: "picker:elementSelected",
+              element: payload,
+            });
+          } catch {}
+        };
+
+        const onKeyDown = (ev) => {
+          if (ev.key === "Escape") {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cleanup();
+            try {
+              chrome.runtime.sendMessage({ type: "picker:canceled" });
+            } catch {}
+          }
+        };
+
+        document.addEventListener("mousemove", onMouseMove, true);
+        document.addEventListener("mousedown", swallowPointer, true);
+        document.addEventListener("mouseup", swallowPointer, true);
+        document.addEventListener("click", onClick, true);
+        document.addEventListener("keydown", onKeyDown, true);
+        window.__agElementPickerCleanup = cleanup;
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeElementPickerFromTab(tabId) {
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid) || tid <= 0 || !chrome.scripting?.executeScript) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tid },
+      func: () => {
+        if (typeof window.__agElementPickerCleanup === "function") {
+          window.__agElementPickerCleanup();
+        } else {
+          document.getElementById("__ag-element-picker-root")?.remove();
+        }
+      },
+    });
+  } catch {}
+}
+
+async function startElementPicker({ tabId = null } = {}) {
+  await ensureLocalStateLoaded();
+  let resolvedTabId = tabId ? Number(tabId) : null;
+  if (!resolvedTabId) {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (active?.id) resolvedTabId = active.id;
+    } catch {}
+  }
+  if (!resolvedTabId) {
+    throw new Error("Open an http/https webpage tab to pick an element.");
+  }
+  const tab = await chrome.tabs.get(resolvedTabId);
+  const url = tab.url || tab.pendingUrl || "";
+  const host = normalizeHostFromUrl(url);
+  if (host && getSitePolicyForHost(host) === "block") {
+    const err = new Error(`Site access is blocked for ${host}. Allow site access before picking elements.`);
+    err.code = -32021;
+    throw err;
+  }
+  if (!isSafeInjectableUrl(url)) {
+    throw new Error("Element picker is only available on standard http/https webpages.");
+  }
+  if (pickerState.active && pickerState.tabId) {
+    await removeElementPickerFromTab(pickerState.tabId).catch(() => {});
+  }
+  const injected = await injectElementPickerIntoTab(resolvedTabId);
+  if (!injected) {
+    throw new Error("Could not activate the element picker on this tab.");
+  }
+  pickerState = {
+    active: true,
+    tabId: resolvedTabId,
+    startedAt: Date.now(),
+  };
+  const snapshot = getPickerSnapshot();
+  broadcastToSidePanels({
+    type: "sidepanel:pickerState",
+    picker: snapshot,
+  });
+  return { ok: true, picker: snapshot };
+}
+
+async function cancelElementPicker() {
+  if (pickerState.active && pickerState.tabId) {
+    await removeElementPickerFromTab(pickerState.tabId).catch(() => {});
+  }
+  pickerState = {
+    active: false,
+    tabId: null,
+    startedAt: 0,
+  };
+  const snapshot = getPickerSnapshot();
+  broadcastToSidePanels({
+    type: "sidepanel:pickerState",
+    picker: snapshot,
+  });
+  return { ok: true, picker: snapshot };
+}
+
+async function startDemonstrationRecording({ tabId = null } = {}) {
+  await ensureLocalStateLoaded();
+  let resolvedTabId = tabId ? Number(tabId) : null;
+  if (!resolvedTabId) {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (active?.id) resolvedTabId = active.id;
+    } catch {}
+  }
+  if (!resolvedTabId) {
+    throw new Error("Open an http/https browser tab to record a workflow demonstration.");
+  }
+  const tab = await chrome.tabs.get(resolvedTabId);
+  const url = tab.url || tab.pendingUrl || "";
+  const host = normalizeHostFromUrl(url);
+  if (host && getSitePolicyForHost(host) === "block") {
+    const err = new Error(`Site access is blocked for ${host}. Allow site access before recording.`);
+    err.code = -32021;
+    throw err;
+  }
+  if (recordingState.active && recordingState.tabId) {
+    await removeRecorderFromTab(recordingState.tabId).catch(() => {});
+  }
+  recordingState = {
+    active: true,
+    tabId: resolvedTabId,
+    startedAt: Date.now(),
+    originUrl: url,
+    originTitle: tab.title || host || "Webpage",
+    steps: [
+      {
+        index: 1,
+        kind: "navigate",
+        label: `Open ${tab.title || host || url}`,
+        url,
+        ts: Date.now(),
+      },
+    ],
+  };
+  await injectRecorderIntoTab(resolvedTabId);
+  recordBrowserActivity({
+    kind: "record",
+    title: "Started workflow recording",
+    detail: tab.title || url,
+    tabId: resolvedTabId,
+    source: "sidepanel",
+  });
+  const snapshot = getRecordingSnapshot();
+  broadcastToSidePanels({ type: "sidepanel:recordingUpdated", recording: snapshot });
+  return { ok: true, recording: snapshot };
+}
+
+function appendRecordedStep(rawStep = {}, senderTabId = null) {
+  if (!recordingState.active) {
+    return { ok: false, active: false, recording: getRecordingSnapshot() };
+  }
+  if (senderTabId && recordingState.tabId && Number(senderTabId) !== Number(recordingState.tabId)) {
+    return { ok: false, ignored: true, recording: getRecordingSnapshot() };
+  }
+  if (recordingState.steps.length >= MAX_RECORDED_ACTIONS) {
+    const cappedSnapshot = { ...getRecordingSnapshot(), capped: true };
+    broadcastToSidePanels({ type: "sidepanel:recordingUpdated", recording: cappedSnapshot });
+    return { ok: false, capped: true, recording: cappedSnapshot };
+  }
+  const isSensitive =
+    Boolean(rawStep.redacted) ||
+    String(rawStep.inputType || "").toLowerCase() === "password" ||
+    /password|secret|cvv|cc-number/i.test(String(rawStep.selector || ""));
+  const kind = String(rawStep.kind || "click");
+  const label = String(rawStep.label || rawStep.selector || kind).trim().slice(0, 100);
+  const selector = String(rawStep.selector || "").trim().slice(0, 120);
+  const value =
+    rawStep.value !== undefined
+      ? isSensitive
+        ? "[REDACTED]"
+        : String(rawStep.value).slice(0, 160)
+      : undefined;
+
+  const step = {
+    index: recordingState.steps.length + 1,
+    kind,
+    label,
+    selector,
+    ...(value !== undefined ? { value } : {}),
+    ...(rawStep.key ? { key: String(rawStep.key) } : {}),
+    redacted: isSensitive,
+    url: String(rawStep.url || recordingState.originUrl || ""),
+    ts: Date.now(),
+  };
+  recordingState.steps.push(step);
+  const snapshot = getRecordingSnapshot();
+  broadcastToSidePanels({ type: "sidepanel:recordingUpdated", recording: snapshot });
+  return { ok: true, step, recording: snapshot };
+}
+
+function buildShortcutDraftFromRecording(steps = [], originTitle = "", originUrl = "") {
+  const host = normalizeHostFromUrl(originUrl) || "site";
+  const slugHost = host.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20) || "workflow";
+  const stepLines = steps.map((s, idx) => {
+    if (s.kind === "navigate") {
+      return `${idx + 1}. Navigate to ${s.url || originUrl}`;
+    }
+    if (s.kind === "input") {
+      const valText = s.redacted ? "<ask user or use existing session credentials — password redacted>" : JSON.stringify(s.value ?? "");
+      return `${idx + 1}. Fill "${s.label}" (${s.selector || "input"}) with ${valText}`;
+    }
+    if (s.kind === "keypress") {
+      return `${idx + 1}. Press ${s.key || "Enter"} on "${s.label}" (${s.selector || "focused field"})`;
+    }
+    return `${idx + 1}. Click "${s.label}" (${s.selector || "element"})`;
+  });
+  const prompt = [
+    `Reproduce this recorded browser workflow on ${originTitle || host} (${originUrl || "active tab"}) using computer-use browser tools:`,
+    ...stepLines,
+    `Verify each step visually or via accessibility snapshot before proceeding, and pause for human handoff if a login/2FA or CAPTCHA wall appears.`,
+  ].join("\n");
+  return {
+    command: `${slugHost}-flow`,
+    title: `${originTitle ? originTitle.slice(0, 38) : host} workflow`,
+    description: `Recorded ${steps.length}-step browser workflow on ${host}`,
+    interactionMode: "agent",
+    prompt,
+  };
+}
+
+async function stopDemonstrationRecording({ cancel = false } = {}) {
+  const prevTabId = recordingState.tabId;
+  const steps = recordingState.steps.slice();
+  const originTitle = recordingState.originTitle;
+  const originUrl = recordingState.originUrl;
+  recordingState.active = false;
+  if (prevTabId) {
+    await removeRecorderFromTab(prevTabId).catch(() => {});
+  }
+  const snapshot = getRecordingSnapshot();
+  broadcastToSidePanels({ type: "sidepanel:recordingUpdated", recording: snapshot });
+  if (cancel) {
+    recordBrowserActivity({
+      kind: "record",
+      title: "Canceled workflow recording",
+      detail: `${steps.length} steps discarded`,
+      tabId: prevTabId,
+      source: "sidepanel",
+    });
+    return { ok: true, canceled: true, recording: snapshot };
+  }
+  const shortcutDraft = buildShortcutDraftFromRecording(steps, originTitle, originUrl);
+  recordBrowserActivity({
+    kind: "record",
+    title: "Completed workflow recording",
+    detail: `${steps.length} steps captured`,
+    tabId: prevTabId,
+    source: "sidepanel",
+  });
+  return {
+    ok: true,
+    canceled: false,
+    stepCount: steps.length,
+    steps,
+    shortcutDraft,
+    recording: snapshot,
+  };
 }
 
 // Scheduled Browser Tasks Management (`chrome.alarms` + `chrome.storage.local`)
@@ -1208,6 +2314,11 @@ async function executeScheduledTask(taskId) {
       activeTabId: targetTabId,
       scheduledTaskName: task.name,
     });
+    if (res?.ok === false) {
+      const gateErr = new Error(res.error || "Scheduled task blocked by site access permissions.");
+      gateErr.code = res.code;
+      throw gateErr;
+    }
     task.lastSessionId = res.sessionId || null;
     task.lastStatus = "completed";
     if (createdScratchTabId && task.interactionMode === "chat") {
@@ -1245,6 +2356,9 @@ const rpcHandlers = {
         "sidePanel",
         "acpChat",
         "scheduledTasks",
+        "sitePermissions",
+        "activityStream",
+        "demonstrationRecorder",
         "cdp",
         "tabGroups",
         "claimTab",
@@ -1282,11 +2396,30 @@ const rpcHandlers = {
   async updateTab({ tabId, url, active, pinned, muted } = {}) {
     const tid = Number(tabId);
     const patch = {};
-    if (url !== undefined) patch.url = String(url);
+    if (url !== undefined) {
+      const destHost = normalizeHostFromUrl(String(url));
+      if (destHost && getSitePolicyForHost(destHost) === "block") {
+        const err = new Error(
+          `Browser control is blocked on ${destHost} by Antigravity in Chrome site permissions.`,
+        );
+        err.code = -32021;
+        throw err;
+      }
+      patch.url = String(url);
+    }
     if (typeof active === "boolean") patch.active = active;
     if (typeof pinned === "boolean") patch.pinned = pinned;
     if (typeof muted === "boolean") patch.muted = muted;
     const t = await chrome.tabs.update(tid, patch);
+    if (url !== undefined) {
+      recordBrowserActivity({
+        kind: "navigate",
+        title: "Navigated tab",
+        detail: String(url),
+        tabId: t.id,
+        source: "mcp",
+      });
+    }
     return {
       ok: true,
       tabId: t.id,
@@ -1302,12 +2435,27 @@ const rpcHandlers = {
     tabOwnership.delete(tid);
     await chrome.tabs.remove(tid);
     await persistSessionState();
+    recordBrowserActivity({
+      kind: "close",
+      title: `Closed scratch tab #${tid}`,
+      detail: "",
+      tabId: tid,
+      source: "mcp",
+    });
     return { ok: true, tabId: tid };
   },
 
   async claimTab({ sessionId = "default", tabId } = {}) {
     const tid = Number(tabId);
     const tab = await chrome.tabs.get(tid);
+    const tabHost = normalizeHostFromUrl(tab.url || tab.pendingUrl || "");
+    if (tabHost && getSitePolicyForHost(tabHost) === "block") {
+      const err = new Error(
+        `Browser control is blocked on ${tabHost} by Antigravity in Chrome site permissions.`,
+      );
+      err.code = -32021;
+      throw err;
+    }
     getOrCreateSession(sessionId);
     const existing = tabOwnership.get(tid);
     // Claim in-place: NEVER move a user's personal tab into the agent Tab Group and NEVER close on finalizeSession!
@@ -1317,6 +2465,13 @@ const rpcHandlers = {
       createdByAgent: existing?.createdByAgent ?? false,
     });
     await persistSessionState();
+    recordBrowserActivity({
+      kind: "claim",
+      title: "Claimed existing tab",
+      detail: tab.title || tab.url || `Tab #${tab.id}`,
+      tabId: tab.id,
+      source: "mcp",
+    });
     return {
       ok: true,
       tabId: tab.id,
@@ -1337,6 +2492,14 @@ const rpcHandlers = {
     groupColor,
     ungroup = false,
   } = {}) {
+    const destHost = normalizeHostFromUrl(String(url || ""));
+    if (destHost && getSitePolicyForHost(destHost) === "block") {
+      const err = new Error(
+        `Browser control is blocked on ${destHost} by Antigravity in Chrome site permissions.`,
+      );
+      err.code = -32021;
+      throw err;
+    }
     const session = getOrCreateSession(sessionId, {
       title: groupTitle,
       color: groupColor,
@@ -1362,6 +2525,13 @@ const rpcHandlers = {
       } catch {}
     }
     await persistSessionState();
+    recordBrowserActivity({
+      kind: "tab",
+      title: "Opened agent tab",
+      detail: createProps.url,
+      tabId: created.id,
+      source: "mcp",
+    });
     buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return {
       ok: true,
@@ -1429,6 +2599,13 @@ const rpcHandlers = {
     if (color !== undefined) patch.color = normalizeGroupColor(color);
     if (typeof collapsed === "boolean") patch.collapsed = collapsed;
     const g = Object.keys(patch).length > 0 ? await chrome.tabGroups.update(gid, patch) : await chrome.tabGroups.get(gid);
+    recordBrowserActivity({
+      kind: "group",
+      title: `Grouped ${ids.length} tab${ids.length === 1 ? "" : "s"}`,
+      detail: g.title || "",
+      tabId: ids[0] || null,
+      source: "mcp",
+    });
     return {
       ok: true,
       groupId: gid,
@@ -1529,6 +2706,16 @@ const rpcHandlers = {
       await detachDebuggerSafe(tid);
     }
     await persistSessionState();
+    recordBrowserActivity({
+      kind: normStatus === "handoff" ? "handoff" : "mark",
+      title:
+        normStatus === "handoff"
+          ? "Handed tab back for human input"
+          : `Marked tab #${tid} as ${normStatus}`,
+      detail: `Tab #${tid}`,
+      tabId: tid,
+      source: "mcp",
+    });
     return { ok: true, tabId: tid, status: normStatus };
   },
 
@@ -1571,6 +2758,14 @@ const rpcHandlers = {
       sessionMeta.delete(sessionId);
     }
     await persistSessionState();
+    if (closedTabIds.length > 0 || detachedTabIds.length > 0) {
+      recordBrowserActivity({
+        kind: "finalize",
+        title: "Released browser control",
+        detail: `Detached ${detachedTabIds.length} · Closed ${closedTabIds.length} scratch`,
+        source: "mcp",
+      });
+    }
     buildPopupStatus().then((status) => broadcastToSidePanels({ type: "sidepanel:bridgeStatus", status }));
     return {
       ok: true,
@@ -1870,6 +3065,20 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (tabOwnership.delete(tabId)) {
     persistSessionState();
   }
+  if (recordingState.active && Number(tabId) === Number(recordingState.tabId)) {
+    recordingState.active = false;
+    broadcastToSidePanels({
+      type: "sidepanel:recordingUpdated",
+      recording: getRecordingSnapshot(),
+    });
+  }
+  if (pickerState.active && Number(tabId) === Number(pickerState.tabId)) {
+    pickerState = { active: false, tabId: null, startedAt: 0 };
+    broadcastToSidePanels({
+      type: "sidepanel:pickerState",
+      picker: getPickerSnapshot(),
+    });
+  }
   emitNotification("tabRemoved", {
     tabId,
     windowId: removeInfo.windowId,
@@ -1895,11 +3104,45 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     });
     broadcastToSidePanels({ type: "sidepanel:tabsChanged", tabId });
   }
+  if (recordingState.active && Number(tabId) === Number(recordingState.tabId)) {
+    if (changeInfo.url) {
+      appendRecordedStep(
+        {
+          kind: "navigate",
+          label: `Navigate to ${changeInfo.url}`,
+          url: changeInfo.url,
+        },
+        tabId,
+      );
+    }
+    if (changeInfo.status === "complete") {
+      injectRecorderIntoTab(tabId).catch(() => {});
+    }
+  }
 });
 
 if (chrome.tabs?.onActivated?.addListener) {
   chrome.tabs.onActivated.addListener((activeInfo) => {
     broadcastToSidePanels({ type: "sidepanel:tabsChanged", tabId: activeInfo.tabId });
+  });
+}
+
+if (chrome.contextMenus?.onClicked?.addListener) {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
+    try {
+      if (tab?.id && chrome.sidePanel?.open) {
+        chrome.sidePanel.open({ tabId: tab.id }).catch?.(() => {});
+      }
+      if (info?.menuItemId === "ag-ask-selection" && info.selectionText) {
+        setTimeout(() => {
+          broadcastToSidePanels({
+            type: "sidepanel:quoteSelection",
+            selectionText: String(info.selectionText || "").trim().slice(0, 4000),
+            tabId: tab?.id || null,
+          });
+        }, 160);
+      }
+    } catch {}
   });
 }
 
@@ -1923,6 +3166,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // Bridge & Side Panel Status Snapshot
 async function buildPopupStatus() {
+  await ensureLocalStateLoaded();
   const ident = await detectBrowserIdentity();
   const activeGroupIds = new Set();
   for (const m of sessionMeta.values()) {
@@ -1949,6 +3193,10 @@ async function buildPopupStatus() {
     attachedTabIds: Array.from(attachedTabs),
     sessionGroups,
     desktopBridgeInfo,
+    sitePermissions: getSitePermissionsSnapshot(),
+    recording: getRecordingSnapshot(),
+    picker: getPickerSnapshot(),
+    activityCount: browserActivityLog.length,
   };
 }
 
@@ -2004,8 +3252,163 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         shortcuts,
         schedules,
         agentStatus,
+        sitePermissions: getSitePermissionsSnapshot(),
+        settings: { ...extensionSettings },
+        activityLog: browserActivityLog.slice(),
+        recording: getRecordingSnapshot(),
+        picker: getPickerSnapshot(),
       });
     })();
+    return true;
+  }
+
+  if (msg.type === "sidepanel:previewPageContext") {
+    (async () => {
+      await ensureLocalStateLoaded();
+      let tid = msg.tabId ? Number(msg.tabId) : null;
+      if (!tid) {
+        try {
+          const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          if (active?.id) tid = active.id;
+        } catch {}
+      }
+      if (!tid) {
+        sendResponse({ ok: false, error: "No active browser tab found." });
+        return;
+      }
+      const context = await extractReadableTabContext(tid, {
+        maxChars: Math.max(500, Math.min(12_000, Number(msg.maxChars) || 4000)),
+      });
+      if (!context) {
+        sendResponse({ ok: false, error: "Unable to inspect this tab." });
+        return;
+      }
+      sendResponse({ ok: true, context });
+    })().catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:getSitePermissions") {
+    ensureLocalStateLoaded()
+      .then(() => sendResponse({ ok: true, permissions: getSitePermissionsSnapshot() }))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:setSitePermission") {
+    setSitePermissionForHost(msg.host, msg.policy)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:getSettings") {
+    ensureLocalStateLoaded()
+      .then(() => sendResponse({ ok: true, settings: { ...extensionSettings } }))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:saveSettings") {
+    saveExtensionSettings(msg.settings || msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:clearActivity") {
+    browserActivityLog.length = 0;
+    broadcastToSidePanels({ type: "sidepanel:browserActivityCleared", activityLog: [] });
+    sendResponse({ ok: true, activityLog: [] });
+    return true;
+  }
+
+  if (msg.type === "sidepanel:startRecording") {
+    startDemonstrationRecording(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err), code: err?.code }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:stopRecording") {
+    stopDemonstrationRecording(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:getRecordingState") {
+    sendResponse({ ok: true, recording: getRecordingSnapshot() });
+    return true;
+  }
+
+  if (msg.type === "recorder:step") {
+    const res = appendRecordedStep(msg.step || {}, _sender?.tab?.id || null);
+    sendResponse(res);
+    return true;
+  }
+
+  if (msg.type === "sidepanel:startElementPicker") {
+    startElementPicker(msg.payload || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err), code: err?.code }));
+    return true;
+  }
+
+  if (msg.type === "sidepanel:cancelElementPicker") {
+    cancelElementPicker()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === "picker:elementSelected") {
+    const senderTabId = _sender?.tab?.id ?? null;
+    if (!pickerState.active || (senderTabId != null && Number(senderTabId) !== Number(pickerState.tabId))) {
+      sendResponse({ ok: false, ignored: true });
+      return true;
+    }
+    const targetTabId = senderTabId ?? pickerState.tabId ?? null;
+    pickerState = { active: false, tabId: null, startedAt: 0 };
+    const picker = getPickerSnapshot();
+    const element = msg.element && typeof msg.element === "object" ? { ...msg.element, tabId: targetTabId } : null;
+    if (element) {
+      const selLabel = element.selector || element.tagName || "element";
+      recordBrowserActivity({
+        kind: "element",
+        title: `Picked element ${selLabel}`,
+        detail: element.pageTitle || element.pageUrl || selLabel,
+        tabId: targetTabId,
+        source: "sidepanel",
+      });
+      broadcastToSidePanels({
+        type: "sidepanel:elementPicked",
+        element,
+        picker,
+      });
+    } else {
+      broadcastToSidePanels({
+        type: "sidepanel:pickerState",
+        picker,
+      });
+    }
+    sendResponse({ ok: true, picker });
+    return true;
+  }
+
+  if (msg.type === "picker:canceled") {
+    const senderTabId = _sender?.tab?.id ?? null;
+    if (!pickerState.active || (senderTabId != null && Number(senderTabId) !== Number(pickerState.tabId))) {
+      sendResponse({ ok: false, ignored: true });
+      return true;
+    }
+    pickerState = { active: false, tabId: null, startedAt: 0 };
+    const picker = getPickerSnapshot();
+    broadcastToSidePanels({
+      type: "sidepanel:pickerState",
+      picker,
+    });
+    sendResponse({ ok: true, picker });
     return true;
   }
 
@@ -2031,7 +3434,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "sidepanel:cancelPrompt") {
-    callNativeAgentRpc("agent.cancel", { sessionId: msg.sessionId }, 8_000)
+    callNativeAgentRpc(
+      "agent.cancel",
+      {
+        sessionId: msg.sessionId || null,
+        requestId: msg.requestId || null,
+      },
+      8_000,
+    )
       .then((res) => sendResponse(res))
       .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;
@@ -2066,16 +3476,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       const localRec = chromeSessions.get(sid);
       try {
-        const live = await callNativeAgentRpc("agent.loadSession", { sessionId: sid }, 18_000);
+        const effectiveCwd = localRec?.cwd || extensionSettings.cwd || null;
+        const live = await callNativeAgentRpc(
+          "agent.loadSession",
+          { sessionId: sid, cwd: effectiveCwd },
+          18_000,
+        );
         if (live?.ok && Array.isArray(live.messages) && live.messages.length > 0) {
-          const cleanedMessages = live.messages.map((m, idx) => ({
-            ...m,
-            text: m.role === "user" ? stripInjectedBrowserContext(m.text) : m.text,
-            attachments:
-              m.role === "user" && localRec?.messages?.[idx]?.attachments
-                ? localRec.messages[idx].attachments
-                : [],
-          }));
+          const localUserMsgs = (localRec?.messages || []).filter((m) => m && m.role === "user");
+          let userTurnIdx = 0;
+          const cleanedMessages = live.messages.map((m) => {
+            if (m.role === "user") {
+              const matchedAttachments = localUserMsgs[userTurnIdx]?.attachments || [];
+              userTurnIdx++;
+              return {
+                ...m,
+                text: stripInjectedBrowserContext(m.text),
+                attachments: matchedAttachments,
+              };
+            }
+            return {
+              ...m,
+              attachments: [],
+            };
+          });
           localRec.messages = cleanedMessages;
           if (live.title) localRec.title = live.title;
           schedulePersistChromeSessions();
@@ -2175,6 +3599,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onInstalled.addListener(() => {
   configureSidePanelBehavior();
+  setupContextMenus();
   ensureOffscreenKeepalive();
   connectNativeBridge();
   syncScheduleAlarms().catch(() => {});
@@ -2182,6 +3607,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   configureSidePanelBehavior();
+  setupContextMenus();
   ensureOffscreenKeepalive();
   connectNativeBridge();
   syncScheduleAlarms().catch(() => {});
@@ -2190,6 +3616,7 @@ chrome.runtime.onStartup.addListener(() => {
 // Immediate boot initialization
 (async () => {
   await configureSidePanelBehavior();
+  setupContextMenus();
   await restoreSessionState();
   await ensureLocalStateLoaded();
   await ensureOffscreenKeepalive();

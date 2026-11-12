@@ -8,6 +8,8 @@
   </head>
   <body>
     <div class="card">
+      <div class="ambient-glow" aria-hidden="true"></div>
+
       <header class="header">
         <img class="logo" src="icons/icon48.png" width="34" height="34" alt="Antigravity" />
         <div class="title-wrap">
@@ -20,24 +22,37 @@
         </span>
       </header>
 
+      <section class="site-access-box" id="site-access-box">
+        <div class="site-access-top">
+          <span class="site-access-label">Site access</span>
+          <span class="site-host" id="popup-host-label">Current tab</span>
+        </div>
+        <div class="seg-row" id="popup-site-policy">
+          <button type="button" class="seg-opt active" data-policy="allow">Allow</button>
+          <button type="button" class="seg-opt" data-policy="ask">Ask</button>
+          <button type="button" class="seg-opt" data-policy="block">Block</button>
+        </div>
+      </section>
+
       <section class="metrics">
         <div class="metric-box">
-          <span class="metric-label">Active Tab Groups</span>
+          <span class="metric-label">Tab Groups</span>
           <span class="metric-value" id="group-count">0</span>
         </div>
         <div class="metric-box">
-          <span class="metric-label">Attached Tabs</span>
+          <span class="metric-label">Controlled Tabs</span>
           <span class="metric-value" id="attached-count">0</span>
         </div>
       </section>
 
       <section class="group-summary" id="group-summary">
-        No active agent Tab Group yet. Tabs opened by Antigravity are automatically grouped cleanly.
+        Ready. Open the Side Panel to chat with pages or run Agent browser workflows.
       </section>
 
       <footer class="actions">
         <button type="button" class="btn btn-secondary" id="reconnect-btn">Reconnect</button>
-        <button type="button" class="btn btn-primary" id="finish-btn">Finish &amp; Detach All</button>
+        <button type="button" class="btn btn-secondary" id="finish-btn">Take control</button>
+        <button type="button" class="btn btn-primary" id="open-sidepanel-btn">Side Panel</button>
       </footer>
     </div>
     <script src="popup.js"></script>

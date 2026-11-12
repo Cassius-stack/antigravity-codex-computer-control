@@ -1,10 +1,19 @@
-// Antigravity in Chrome — Crafted Google Gemini Side Panel & Live ACP Client
+// Antigravity in Chrome — 2026 Google Gemini Neural Expressive + Codex in Chrome Side Panel
+
+const hasExtensionRuntime = Boolean(globalThis.chrome?.runtime?.id);
+
+async function sendRuntimeMessage(msg) {
+  if (!hasExtensionRuntime || !chrome.runtime?.sendMessage) {
+    return { ok: false, error: "Extension runtime unavailable" };
+  }
+  return await chrome.runtime.sendMessage(msg);
+}
 
 const state = {
   currentSessionId: null,
-  sessionTitle: "Antigravity",
+  sessionTitle: "New thread",
   interactionMode: "chat", // "chat" | "agent"
-  permissionMode: "auto", // "auto" | "default" | "plan"
+  permissionMode: "auto", // "auto" | "ask" | "full"
   modelId: "gemini-4-carbon-medium",
   models: [{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon" }],
   running: false,
@@ -13,8 +22,33 @@ const state = {
   activeTab: null,
   allTabs: [],
   mentionedTabIds: new Set(),
+  pickedElements: [], // [{ id, tagName, selector, label, role, rect, text, htmlSnippet, styles, url, title }]
   screenshot: null, // { dataUrl, base64 }
+  attachedFiles: [], // [{ id, name, mimeType, kind: "image"|"file", dataUrl?, base64?, textContent?, size }]
+  liveSelection: "",
+  dismissedSelectionText: "",
+  sitePermissions: {},
+  confirmedHostsForSession: new Set(),
+  settings: {
+    cwd: "",
+    customInstructions: "",
+    theme: "system",
+    defaultApprovalMode: "auto",
+  },
+  activityLog: [],
+  recording: {
+    active: false,
+    stepCount: 0,
+    maxActions: 120,
+    steps: [],
+  },
+  picker: {
+    active: false,
+    tabId: null,
+  },
+  kbActiveIndex: 0,
   sessions: [],
+  historyFilter: "",
   shortcuts: { builtin: [], custom: [] },
   agySkills: [],
   schedules: [],
@@ -23,44 +57,76 @@ const state = {
   schedInterval: 60,
   schedMode: "chat",
   customScMode: "chat",
+  drawerScMode: "agent",
 };
 
-// SVG Snippets (Crisp Material Symbols & New 4-Color Rounded Gemini Spark)
 const SVG = {
   sparkle: `<svg viewBox="0 0 32 32" width="21" height="21" aria-hidden="true"><use href="#gemini-spark-4c"/></svg>`,
-  chevronDown: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M5.5 7.75L10 12.25l4.5-4.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-  check: `<svg class="model-option-check" viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4.2 10.5l3.8 3.8 7.8-8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  chevronDown: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M5.5 7.75L10 12.25l4.5-4.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  check: `<svg class="model-option-check" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4.2 10.5l3.8 3.8 7.8-8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
   spinner: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M10 3a7 7 0 1 1-4.95 2.05" stroke-linecap="round"/></svg>`,
   checkSmall: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" aria-hidden="true"><path d="M4.5 10.5l3.6 3.6 7.4-7.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
   alertSmall: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6.5v4M10 13.5h.01" stroke-linecap="round"/></svg>`,
-  closeXs: `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke-linecap="round"/></svg>`,
-  globeXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M3 10h14M10 2.8c2 2 3.1 4.5 3.1 7.2S12 15.2 10 17.2c-2-2-3.1-4.5-3.1-7.2S8 4.8 10 2.8Z"/></svg>`,
-  imageXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="2.8" y="4" width="14.4" height="12" rx="2.2"/><circle cx="7.4" cy="8.4" r="1.3"/><path d="M17.2 13l-3.6-3.6L7.8 15.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-  copySm: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="6.8" y="6.8" width="9.4" height="9.4" rx="2"/><path d="M4.2 12.8V5.2a1.8 1.8 0 0 1 1.8-1.8h7.6" stroke-linecap="round"/></svg>`,
-  openExtSm: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M11.5 4.5h4v4M15.5 4.5L8.5 11.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 5.5H5.8A1.8 1.8 0 0 0 4 7.3v6.9A1.8 1.8 0 0 0 5.8 16h6.9a1.8 1.8 0 0 0 1.8-1.8V11" stroke-linecap="round"/></svg>`,
-  slashSm: `<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12.5 4L7.5 16" stroke-linecap="round"/></svg>`,
+  closeXs: `<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.85" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke-linecap="round"/></svg>`,
+  globeXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M3 10h14M10 2.8c2 2 3.1 4.5 3.1 7.2S12 15.2 10 17.2c-2-2-3.1-4.5-3.1-7.2S8 4.8 10 2.8Z"/></svg>`,
+  imageXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="2.8" y="4" width="14.4" height="12" rx="2.2"/><circle cx="7.4" cy="8.4" r="1.3"/><path d="M17.2 13l-3.6-3.6L7.8 15.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  fileXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M6 3.5h5.5L15.5 7.5v9a1.5 1.5 0 0 1-1.5 1.5H6a1.5 1.5 0 0 1-1.5-1.5v-11A1.5 1.5 0 0 1 6 3.5Z"/><path d="M11.2 3.5v4.2h4.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  quoteXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 7.5h4v4H6.5L5 14M11 7.5h4v4h-2.5L11 14" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  targetXs: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10" cy="10" r="5.5"/><path d="M10 2.5v2.2M10 15.3v2.2M2.5 10h2.2M15.3 10h2.2" stroke-linecap="round"/></svg>`,
+  copySm: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="6.8" y="6.8" width="9.4" height="9.4" rx="2"/><path d="M4.2 12.8V5.2a1.8 1.8 0 0 1 1.8-1.8h7.6" stroke-linecap="round"/></svg>`,
+  retrySm: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M15.8 7.5A6 6 0 1 0 16 12.2M16 4v3.8h-3.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  openExtSm: `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M11.5 4.5h4v4M15.5 4.5L8.5 11.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 5.5H5.8A1.8 1.8 0 0 0 4 7.3v6.9A1.8 1.8 0 0 0 5.8 16h6.9a1.8 1.8 0 0 0 1.8-1.8V11" stroke-linecap="round"/></svg>`,
+  slashSm: `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.85" aria-hidden="true"><path d="M12.5 4L7.5 16" stroke-linecap="round"/></svg>`,
 };
 
 // DOM References
-const headerTitleEl = document.getElementById("header-title");
+const appShellEl = document.getElementById("app-shell");
+const dropzoneOverlay = document.getElementById("dropzone-overlay");
+
+const historyBtn = document.getElementById("history-btn");
 const modelMenuBtn = document.getElementById("model-menu-btn");
 const modelCurrentLabelEl = document.getElementById("model-current-label");
+const workspaceMiniTagEl = document.getElementById("workspace-mini-tag");
+const headerTitleEl = document.getElementById("header-title");
+
+const bridgeStatusPill = document.getElementById("bridge-status-pill");
+const bridgePillText = document.getElementById("bridge-pill-text");
+const headerOpenAppBtn = document.getElementById("header-open-app-btn");
+const settingsBtn = document.getElementById("settings-btn");
+const newChatBtn = document.getElementById("new-chat-btn");
+
 const modelPopover = document.getElementById("model-popover");
 const modelOptionsListEl = document.getElementById("model-options-list");
 const permissionSegmentedEl = document.getElementById("permission-segmented");
-const bridgeDotEl = document.getElementById("bridge-dot");
 const bridgeReconnectRow = document.getElementById("bridge-reconnect-row");
 const bridgeLabelEl = document.getElementById("bridge-label");
 const bridgeStatusBtn = document.getElementById("bridge-status-btn");
 
-const newChatBtn = document.getElementById("new-chat-btn");
-const historyBtn = document.getElementById("history-btn");
-const schedulesBtn = document.getElementById("schedules-btn");
-const openDesktopBtn = document.getElementById("open-desktop-btn");
+const settingsPopover = document.getElementById("settings-popover");
+const settingsCurrentHostEl = document.getElementById("settings-current-host");
+const sitePolicySegmentedEl = document.getElementById("site-policy-segmented");
+const configuredSitesListEl = document.getElementById("configured-sites-list");
+const settingsCwdInput = document.getElementById("settings-cwd-input");
+const settingsInstructionsInput = document.getElementById("settings-instructions-input");
+const themeSegmentedEl = document.getElementById("theme-segmented");
+const saveSettingsBtn = document.getElementById("save-settings-btn");
 
 const desktopActivityBar = document.getElementById("desktop-activity-bar");
 const desktopActivityText = document.getElementById("desktop-activity-text");
+const toggleActivityStreamBtn = document.getElementById("toggle-activity-stream-btn");
+const inlineActivityDrawer = document.getElementById("inline-activity-drawer");
+const inlineActivityList = document.getElementById("inline-activity-list");
+const clearInlineActivityBtn = document.getElementById("clear-inline-activity-btn");
 const detachAllBtn = document.getElementById("detach-all-btn");
+
+const recordingBar = document.getElementById("recording-bar");
+const recordingStatusText = document.getElementById("recording-status-text");
+const recordingStepPreview = document.getElementById("recording-step-preview");
+const stopRecordingBtn = document.getElementById("stop-recording-btn");
+const cancelRecordingBtn = document.getElementById("cancel-recording-btn");
+
+const elementPickerBar = document.getElementById("element-picker-bar");
+const cancelElementPickerBtn = document.getElementById("cancel-element-picker-btn");
 
 const setupBanner = document.getElementById("setup-banner");
 const setupBannerTitle = document.getElementById("setup-banner-title");
@@ -71,25 +137,64 @@ const historyDrawer = document.getElementById("history-drawer");
 const closeHistoryBtn = document.getElementById("close-history-btn");
 const drawerTabsGroup = document.getElementById("drawer-tabs-group");
 const drawerPanelChats = document.getElementById("drawer-panel-chats");
+const drawerPanelSkills = document.getElementById("drawer-panel-skills");
 const drawerPanelSchedules = document.getElementById("drawer-panel-schedules");
+const drawerPanelActivity = document.getElementById("drawer-panel-activity");
+
+const openDesktopBtn = document.getElementById("open-desktop-btn");
+const historySearchInput = document.getElementById("history-search-input");
 const historyListEl = document.getElementById("history-list");
+
+const drawerRecordBtn = document.getElementById("drawer-record-btn");
+const drawerScCmdInput = document.getElementById("drawer-sc-cmd");
+const drawerScTitleInput = document.getElementById("drawer-sc-title");
+const drawerScPromptInput = document.getElementById("drawer-sc-prompt");
+const drawerScModeGroup = document.getElementById("drawer-sc-mode-group");
+const drawerSaveScBtn = document.getElementById("drawer-save-sc-btn");
+const drawerSkillsListEl = document.getElementById("drawer-skills-list");
 
 const scheduleForm = document.getElementById("schedule-form");
 const schedIntervalGroup = document.getElementById("sched-interval-group");
 const schedModeGroup = document.getElementById("sched-mode-group");
 const schedulesListEl = document.getElementById("schedules-list");
 
+const drawerClearActivityBtn = document.getElementById("drawer-clear-activity-btn");
+const drawerActivityListEl = document.getElementById("drawer-activity-list");
+
 const chatViewport = document.getElementById("chat-viewport");
 const welcomeStateEl = document.getElementById("welcome-state");
 const greetingHeadlineEl = document.getElementById("greeting-headline");
+const welcomePageCard = document.getElementById("welcome-page-card");
+const welcomePageFavicon = document.getElementById("welcome-page-favicon");
+const welcomePageGlobe = document.getElementById("welcome-page-globe");
+const welcomePageTitle = document.getElementById("welcome-page-title");
+const welcomePageHost = document.getElementById("welcome-page-host");
+const welcomeSitePolicy = document.getElementById("welcome-site-policy");
+const welcomePreviewBtn = document.getElementById("welcome-preview-btn");
 const quickGridEl = document.getElementById("quick-grid");
 const messagesListEl = document.getElementById("messages-list");
 
+const fileInput = document.getElementById("file-input");
+const pagePreviewPopover = document.getElementById("page-preview-popover");
+const closePagePreviewBtn = document.getElementById("close-page-preview-btn");
+const previewPageTitle = document.getElementById("preview-page-title");
+const previewPageUrl = document.getElementById("preview-page-url");
+const previewStatsRow = document.getElementById("preview-stats-row");
+const previewSitePolicyGroup = document.getElementById("preview-site-policy-group");
+const previewSelectionBox = document.getElementById("preview-selection-box");
+const previewSelectionText = document.getElementById("preview-selection-text");
+const previewExcerptText = document.getElementById("preview-excerpt-text");
+
 const addMenuBtn = document.getElementById("add-menu-btn");
+const pickElementBtn = document.getElementById("pick-element-btn");
 const addMenuPopover = document.getElementById("add-menu-popover");
-const menuShareTabsBtn = document.getElementById("menu-share-tabs-btn");
+const menuAttachFileBtn = document.getElementById("menu-attach-file-btn");
 const screenshotBtn = document.getElementById("screenshot-btn");
+const menuPickElementBtn = document.getElementById("menu-pick-element-btn");
+const menuShareTabsBtn = document.getElementById("menu-share-tabs-btn");
+const menuRecordBtn = document.getElementById("menu-record-btn");
 const menuShortcutsBtn = document.getElementById("menu-shortcuts-btn");
+const schedulesBtn = document.getElementById("schedules-btn");
 
 const slashPopover = document.getElementById("slash-popover");
 const slashListEl = document.getElementById("slash-list");
@@ -102,35 +207,88 @@ const tabsPopover = document.getElementById("tabs-popover");
 const tabsPickerListEl = document.getElementById("tabs-picker-list");
 const groupMentionedBtn = document.getElementById("group-mentioned-btn");
 
+const composerCard = document.getElementById("composer-card");
+const thinkingWave = document.getElementById("thinking-wave");
 const activeTabChipEl = document.getElementById("active-tab-chip");
+const inspectActiveTabBtn = document.getElementById("inspect-active-tab-btn");
 const activeTabFaviconEl = document.getElementById("active-tab-favicon");
 const activeTabGlobeEl = document.getElementById("active-tab-globe");
 const activeTabTitleEl = document.getElementById("active-tab-title");
 const unshareActiveTabBtn = document.getElementById("unshare-active-tab-btn");
 const reshareActiveTabBtn = document.getElementById("reshare-active-tab-btn");
+
+const selectionChipEl = document.getElementById("selection-chip");
+const selectionChipTextEl = document.getElementById("selection-chip-text");
+const dismissSelectionBtn = document.getElementById("dismiss-selection-btn");
 const attachmentChipsEl = document.getElementById("attachment-chips");
 
 const promptInput = document.getElementById("prompt-input");
+const modeSwitchGroup = document.getElementById("mode-switch-group");
+const modeChatBtn = document.getElementById("mode-chat-btn");
 const agentModeToggle = document.getElementById("agent-mode-toggle");
+const approvalCycleBtn = document.getElementById("approval-cycle-btn");
+const approvalInlineLabel = document.getElementById("approval-inline-label");
+const voiceBtn = document.getElementById("voice-btn");
 const sendBtn = document.getElementById("send-btn");
 const sendIcon = document.getElementById("send-icon");
 const stopIcon = document.getElementById("stop-icon");
 
 let liveAssistantRefs = null;
+let dragDepth = 0;
+let speechRecognition = null;
+let isListeningVoice = false;
 
 activeTabFaviconEl.addEventListener("error", () => {
   activeTabFaviconEl.classList.add("hidden");
   activeTabGlobeEl.classList.remove("hidden");
 });
 
+welcomePageFavicon.addEventListener("error", () => {
+  welcomePageFavicon.classList.add("hidden");
+  welcomePageGlobe.classList.remove("hidden");
+});
+
+function parseHost(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+    return u.hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function getPolicyForHost(host) {
+  if (!host) return "allow";
+  return state.sitePermissions[host] || "allow";
+}
+
+function applyTheme(themeChoice = state.settings.theme) {
+  const pref = ["system", "dark", "light"].includes(themeChoice) ? themeChoice : "system";
+  let resolved = pref;
+  if (pref === "system") {
+    resolved = window.matchMedia?.("(prefers-color-scheme: light)")?.matches ? "light" : "dark";
+  }
+  document.documentElement.setAttribute("data-theme", resolved);
+  for (const btn of themeSegmentedEl.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.themeChoice === pref);
+  }
+}
+
+window.matchMedia?.("(prefers-color-scheme: light)")?.addEventListener?.("change", () => {
+  if (state.settings.theme === "system") applyTheme("system");
+});
+
 function updateGreetingByTime() {
   const hr = new Date().getHours();
+  const browserSuffix = state.bridgeStatus?.browserName ? ` · ${state.bridgeStatus.browserName}` : "";
   if (hr >= 5 && hr < 12) {
-    greetingHeadlineEl.textContent = "Good morning";
+    greetingHeadlineEl.textContent = `Good morning${browserSuffix}`;
   } else if (hr >= 12 && hr < 18) {
-    greetingHeadlineEl.textContent = "Good afternoon";
+    greetingHeadlineEl.textContent = `Good afternoon${browserSuffix}`;
   } else {
-    greetingHeadlineEl.textContent = "Hi there";
+    greetingHeadlineEl.textContent = `Good evening${browserSuffix}`;
   }
 }
 
@@ -144,14 +302,19 @@ function escapeHtml(str) {
 }
 
 function formatInlineMarkdown(escapedLine) {
-  let out = escapedLine;
-  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  const inlineCodeSpans = [];
+  let out = escapedLine.replace(/`([^`]+)`/g, (_m, codeInner) => {
+    const idx = inlineCodeSpans.length;
+    inlineCodeSpans.push(`<code>${codeInner}</code>`);
+    return `@@AG_INLINECODE_${idx}@@`;
+  });
   out = out.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
     '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
   );
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/(^|[\s(])\*([^*]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+  out = out.replace(/@@AG_INLINECODE_(\d+)@@/g, (_m, idxStr) => inlineCodeSpans[Number(idxStr)] || "");
   return out;
 }
 
@@ -160,7 +323,14 @@ function renderMarkdownSafe(rawMarkdown) {
   if (!src.trim()) return "";
 
   const codeBlocks = [];
-  const withPlaceholders = src.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+  let withPlaceholders = src.replace(/```([a-zA-Z0-9_+-]*)[ \t]*\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang: lang || "code", code: code.replace(/\n$/, "") });
+    return `\n@@AG_CODEBLOCK_${idx}@@\n`;
+  });
+
+  // Handle streaming unclosed fenced code block at the tail of the message
+  withPlaceholders = withPlaceholders.replace(/```([a-zA-Z0-9_+-]*)[ \t]*\n([\s\S]*)$/g, (_m, lang, code) => {
     const idx = codeBlocks.length;
     codeBlocks.push({ lang: lang || "code", code: code.replace(/\n$/, "") });
     return `\n@@AG_CODEBLOCK_${idx}@@\n`;
@@ -195,9 +365,11 @@ function renderMarkdownSafe(rawMarkdown) {
       const headers = parseRow(tableRows[0]);
       const bodyRows = tableRows.slice(2).map(parseRow);
       htmlParts.push(
-        `<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${bodyRows
+        `<div class="table-scroll-wrap"><table><thead><tr>${headers
+          .map((h) => `<th>${h}</th>`)
+          .join("")}</tr></thead><tbody>${bodyRows
           .map((cols) => `<tr>${cols.map((c) => `<td>${c}</td>`).join("")}</tr>`)
-          .join("")}</tbody></table>`,
+          .join("")}</tbody></table></div>`,
       );
     } else {
       for (const r of tableRows) {
@@ -241,11 +413,24 @@ function renderMarkdownSafe(rawMarkdown) {
       continue;
     }
 
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushLists();
+      htmlParts.push("<hr />");
+      continue;
+    }
+
     const headingMatch = /^(#{1,4})\s+(.+)$/.exec(trimmed);
     if (headingMatch) {
       flushLists();
       const level = headingMatch[1].length;
       htmlParts.push(`<h${level}>${formatInlineMarkdown(escapeHtml(headingMatch[2]))}</h${level}>`);
+      continue;
+    }
+
+    const quoteMatch = /^>\s?(.*)$/.exec(trimmed);
+    if (quoteMatch) {
+      flushLists();
+      htmlParts.push(`<blockquote>${formatInlineMarkdown(escapeHtml(quoteMatch[1]))}</blockquote>`);
       continue;
     }
 
@@ -299,6 +484,8 @@ function scrollToBottom(force = false) {
 function closeAllPopovers() {
   modelPopover.classList.add("hidden");
   modelMenuBtn.setAttribute("aria-expanded", "false");
+  settingsPopover.classList.add("hidden");
+  pagePreviewPopover.classList.add("hidden");
   addMenuPopover.classList.add("hidden");
   addMenuBtn.classList.remove("active");
   slashPopover.classList.add("hidden");
@@ -313,31 +500,63 @@ function syncSendButtonState() {
     stopIcon.classList.remove("hidden");
     sendBtn.title = "Stop response";
     sendBtn.setAttribute("aria-label", "Stop response");
+    thinkingWave.classList.remove("hidden");
   } else {
-    const hasText = promptInput.value.trim().length > 0;
-    sendBtn.disabled = !hasText;
+    const hasContent =
+      promptInput.value.trim().length > 0 ||
+      state.attachedFiles.length > 0 ||
+      state.pickedElements.length > 0 ||
+      Boolean(state.screenshot);
+    sendBtn.disabled = !hasContent;
     sendBtn.classList.remove("running");
     sendIcon.classList.remove("hidden");
     stopIcon.classList.add("hidden");
     sendBtn.title = "Send";
     sendBtn.setAttribute("aria-label", "Send");
+    thinkingWave.classList.add("hidden");
   }
 }
 
 function updateModeUI() {
   const isAgent = state.interactionMode === "agent";
+  modeChatBtn.classList.toggle("active", !isAgent);
   agentModeToggle.classList.toggle("active", isAgent);
-  agentModeToggle.setAttribute("aria-pressed", isAgent ? "true" : "false");
-  promptInput.placeholder = isAgent ? "Ask Antigravity to act on this page" : "Ask Antigravity";
+  composerCard.classList.toggle("agent-mode-active", isAgent);
+  promptInput.placeholder = isAgent
+    ? "Tell Antigravity what to do in this browser…"
+    : "Ask Antigravity or type @tab, /shortcut…";
+}
+
+function updateApprovalUI() {
+  const perm = ["auto", "ask", "full"].includes(state.permissionMode) ? state.permissionMode : "auto";
+  state.permissionMode = perm;
+  approvalCycleBtn.dataset.perm = perm;
+  approvalInlineLabel.textContent = perm === "full" ? "Full" : perm === "ask" ? "Ask" : "Auto";
+  for (const seg of permissionSegmentedEl.querySelectorAll(".seg-btn")) {
+    seg.classList.toggle("active", seg.dataset.perm === perm);
+  }
+}
+
+function updateWorkspaceBadgeUI() {
+  const cwd = String(state.settings.cwd || "").trim();
+  if (cwd) {
+    const base = cwd.split("/").filter(Boolean).pop() || cwd;
+    workspaceMiniTagEl.textContent = base;
+    workspaceMiniTagEl.title = `Workspace: ${cwd}`;
+    workspaceMiniTagEl.classList.remove("hidden");
+  } else {
+    workspaceMiniTagEl.classList.add("hidden");
+  }
 }
 
 function updateRunningUI(running) {
   state.running = Boolean(running);
+  appShellEl.classList.toggle("is-streaming", state.running);
   syncSendButtonState();
 }
 
-function formatShortModelName(rawName) {
-  const cleaned = String(rawName || "Pro")
+function formatModelDisplayName(rawName) {
+  const cleaned = String(rawName || "Gemini 4 Carbon")
     .replace(/\s*\(.*?\)\s*/g, "")
     .replace(/^Gemini\s+/i, "")
     .trim();
@@ -346,7 +565,8 @@ function formatShortModelName(rawName) {
 
 function renderModelMenu() {
   const activeModel = state.models.find((m) => m.modelId === state.modelId) || state.models[0];
-  modelCurrentLabelEl.textContent = formatShortModelName(activeModel?.name || state.modelId);
+  modelCurrentLabelEl.textContent = formatModelDisplayName(activeModel?.name || state.modelId);
+  headerTitleEl.textContent = state.sessionTitle || "New thread";
 
   modelOptionsListEl.innerHTML = "";
   for (const m of state.models) {
@@ -360,7 +580,7 @@ function renderModelMenu() {
       renderModelMenu();
       closeAllPopovers();
       if (state.currentSessionId) {
-        chrome.runtime.sendMessage({
+        sendRuntimeMessage({
           type: "sidepanel:setConfig",
           payload: { sessionId: state.currentSessionId, modelId: state.modelId },
         });
@@ -368,37 +588,143 @@ function renderModelMenu() {
     });
     modelOptionsListEl.appendChild(btn);
   }
+  updateApprovalUI();
+}
 
-  for (const seg of permissionSegmentedEl.querySelectorAll(".tonal-seg-btn")) {
-    seg.classList.toggle("active", seg.dataset.perm === state.permissionMode);
+function renderSettingsPopover() {
+  const host = parseHost(state.activeTab?.url || "");
+  settingsCurrentHostEl.textContent = host || "All sites";
+  const currentPolicy = getPolicyForHost(host);
+  for (const btn of sitePolicySegmentedEl.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.sitePolicy === currentPolicy);
+    btn.disabled = !host;
+  }
+
+  const customRules = Object.entries(state.sitePermissions || {}).filter(([, p]) => p && p !== "allow");
+  if (customRules.length === 0) {
+    configuredSitesListEl.classList.add("hidden");
+    configuredSitesListEl.innerHTML = "";
+  } else {
+    configuredSitesListEl.classList.remove("hidden");
+    configuredSitesListEl.innerHTML = "";
+    for (const [ruleHost, rulePolicy] of customRules) {
+      const chip = document.createElement("span");
+      chip.className = "site-rule-chip";
+      chip.innerHTML = `<strong>${escapeHtml(ruleHost)}</strong><span>${escapeHtml(rulePolicy)}</span><button type="button" class="chip-dismiss-btn" title="Reset to Allow">${SVG.closeXs}</button>`;
+      chip.querySelector("button").addEventListener("click", async () => {
+        const res = await sendRuntimeMessage({
+          type: "sidepanel:setSitePermission",
+          host: ruleHost,
+          policy: "allow",
+        });
+        if (res?.permissions) {
+          state.sitePermissions = res.permissions;
+          renderSettingsPopover();
+          syncSharedPageChipUI();
+        }
+      });
+      configuredSitesListEl.appendChild(chip);
+    }
+  }
+
+  settingsCwdInput.value = state.settings.cwd || "";
+  settingsInstructionsInput.value = state.settings.customInstructions || "";
+  applyTheme(state.settings.theme);
+}
+
+function renderRecordingUI(rec = state.recording) {
+  state.recording = rec || { active: false, stepCount: 0, maxActions: 120, steps: [] };
+  if (!state.recording.active) {
+    recordingBar.classList.add("hidden");
+    return;
+  }
+  recordingBar.classList.remove("hidden");
+  const count = Number(state.recording.stepCount || state.recording.steps?.length || 1);
+  const max = Number(state.recording.maxActions || 120);
+  recordingStatusText.textContent = `Recording workflow · ${count}/${max}`;
+  const lastStep = Array.isArray(state.recording.steps)
+    ? state.recording.steps[state.recording.steps.length - 1]
+    : null;
+  recordingStepPreview.textContent = lastStep
+    ? `${lastStep.kind}: ${lastStep.label || lastStep.url || ""}`
+    : "Interact with the active tab to capture steps…";
+}
+
+function renderPickerUI(picker = state.picker) {
+  state.picker = picker || { active: false, tabId: null };
+  const isActive = Boolean(state.picker.active);
+  elementPickerBar.classList.toggle("hidden", !isActive);
+  pickElementBtn.classList.toggle("active", isActive);
+}
+
+function renderActivityStreamUI() {
+  const items = Array.isArray(state.activityLog) ? state.activityLog.slice().reverse() : [];
+
+  inlineActivityList.innerHTML = "";
+  for (const act of items.slice(0, 12)) {
+    const row = document.createElement("div");
+    row.className = "activity-item";
+    const tStr = act.ts ? new Date(act.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+    row.innerHTML = `<div class="activity-item-main">${escapeHtml(act.title)}<span>${escapeHtml(act.detail || "")}</span></div><span class="activity-item-time">${escapeHtml(tStr)}</span>`;
+    inlineActivityList.appendChild(row);
+  }
+
+  drawerActivityListEl.innerHTML = "";
+  if (items.length === 0) {
+    drawerActivityListEl.innerHTML = `<p class="sheet-empty">No browser actions recorded in this session yet.</p>`;
+    return;
+  }
+  for (const act of items) {
+    const card = document.createElement("div");
+    card.className = "tonal-list-card";
+    const tStr = act.ts ? new Date(act.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+    card.innerHTML = `
+      <div class="tonal-card-top">
+        <div class="tonal-card-title" style="cursor:default">${escapeHtml(act.title)}</div>
+        <span class="session-title-badge">${escapeHtml(act.source === "sidepanel" ? "Side Panel" : "Desktop MCP")}</span>
+      </div>
+      <div class="tonal-card-meta">
+        <span>${escapeHtml(act.detail || act.kind || "Browser event")}</span>
+        <span>${escapeHtml(tStr)}</span>
+      </div>
+    `;
+    drawerActivityListEl.appendChild(card);
   }
 }
 
 function renderBridgeStatus(status) {
   if (!status) return;
   state.bridgeStatus = status;
-  const online = Boolean(status.nativeConnected);
+  if (status.sitePermissions) state.sitePermissions = status.sitePermissions;
+  if (status.recording) renderRecordingUI(status.recording);
+  if (status.picker) renderPickerUI(status.picker);
 
-  bridgeDotEl.classList.toggle("hidden", online);
+  const online = Boolean(status.nativeConnected);
+  bridgeStatusPill.classList.toggle("offline", !online);
+  bridgePillText.textContent = online ? "Live" : "Offline";
   bridgeReconnectRow.classList.toggle("hidden", online);
   bridgeLabelEl.textContent = online ? "Connected" : "Native bridge offline";
 
-  // Show live browser control pill ONLY when tabs or Tab Groups are actively being controlled
+  updateGreetingByTime();
+
   const attachedCount = Number(status.attachedTabCount || 0);
   const groups = Array.isArray(status.sessionGroups) ? status.sessionGroups : [];
+  const isControlling = attachedCount > 0 || groups.length > 0;
+  appShellEl.classList.toggle("is-controlling", isControlling);
 
-  if (attachedCount > 0 || groups.length > 0) {
+  if (isControlling) {
     desktopActivityBar.classList.remove("hidden");
     const parts = [];
     if (groups.length > 0) {
       parts.push(groups.map((g) => g.title || "Antigravity").join(", "));
     }
     if (attachedCount > 0) {
-      parts.push(`${attachedCount} tab${attachedCount > 1 ? "s" : ""} active`);
+      parts.push(`${attachedCount} tab${attachedCount > 1 ? "s" : ""} controlled`);
     }
     desktopActivityText.textContent = parts.join(" · ");
   } else {
     desktopActivityBar.classList.add("hidden");
+    inlineActivityDrawer.classList.add("hidden");
   }
 
   if (!online && status.lastNativeError) {
@@ -415,6 +741,8 @@ function renderBridgeStatus(status) {
   } else {
     setupBanner.classList.add("hidden");
   }
+
+  syncSharedPageChipUI();
 }
 
 function populateAgentCatalog(agentStatus) {
@@ -433,22 +761,55 @@ function populateAgentCatalog(agentStatus) {
   renderBridgeStatus(state.bridgeStatus);
 }
 
+function syncSelectionChipUI() {
+  const sel = String(state.liveSelection || "").trim();
+  if (!sel || sel === state.dismissedSelectionText) {
+    selectionChipEl.classList.add("hidden");
+    return;
+  }
+  selectionChipEl.classList.remove("hidden");
+  selectionChipTextEl.textContent = sel.replace(/\s+/g, " ").slice(0, 56);
+  selectionChipEl.title = sel.slice(0, 320);
+}
+
 function syncSharedPageChipUI() {
   const active = state.activeTab;
   if (!active) {
     activeTabChipEl.classList.add("hidden");
     reshareActiveTabBtn.classList.add("hidden");
+    welcomePageCard.classList.add("hidden");
     return;
   }
 
-  if (state.includeActiveTab) {
+  const host = parseHost(active.url || "");
+  const policy = getPolicyForHost(host);
+
+  // Welcome bounded page context card
+  if (host) {
+    welcomePageCard.classList.remove("hidden");
+    welcomePageTitle.textContent = active.title || host || "Current page";
+    welcomePageHost.textContent = host;
+    welcomeSitePolicy.textContent =
+      policy === "block" ? "Blocked" : policy === "ask" ? "Ask every time" : "Allowed";
+    welcomeSitePolicy.className = `site-policy-tag${
+      policy === "block" ? " policy-block" : policy === "ask" ? " policy-ask" : ""
+    }`;
+    if (active.favIconUrl && /^https?:|^data:/i.test(active.favIconUrl)) {
+      welcomePageFavicon.src = active.favIconUrl;
+      welcomePageFavicon.classList.remove("hidden");
+      welcomePageGlobe.classList.add("hidden");
+    } else {
+      welcomePageFavicon.classList.add("hidden");
+      welcomePageGlobe.classList.remove("hidden");
+    }
+  } else {
+    welcomePageCard.classList.add("hidden");
+  }
+
+  // Composer active tab chip
+  if (state.includeActiveTab && policy !== "block") {
     activeTabChipEl.classList.remove("hidden");
     reshareActiveTabBtn.classList.add("hidden");
-
-    let host = "";
-    try {
-      host = new URL(active.url).hostname.replace(/^www\./, "");
-    } catch {}
     activeTabTitleEl.textContent = active.title || host || "Current page";
 
     if (active.favIconUrl && /^https?:|^data:/i.test(active.favIconUrl)) {
@@ -461,8 +822,90 @@ function syncSharedPageChipUI() {
     }
   } else {
     activeTabChipEl.classList.add("hidden");
-    reshareActiveTabBtn.classList.remove("hidden");
+    reshareActiveTabBtn.classList.toggle("hidden", policy === "block");
   }
+}
+
+async function refreshLiveSelectionFromActiveTab() {
+  if (!state.activeTab?.tabId || !state.includeActiveTab) {
+    state.liveSelection = "";
+    syncSelectionChipUI();
+    return;
+  }
+  const host = parseHost(state.activeTab.url || "");
+  if (!host || getPolicyForHost(host) === "block") {
+    state.liveSelection = "";
+    syncSelectionChipUI();
+    return;
+  }
+  try {
+    const res = await sendRuntimeMessage({
+      type: "sidepanel:previewPageContext",
+      tabId: state.activeTab.tabId,
+      maxChars: 1200,
+    });
+    if (res?.ok && res.context) {
+      const nextSel = String(res.context.selection || "").trim();
+      if (nextSel !== state.liveSelection) {
+        if (!nextSel) state.dismissedSelectionText = "";
+        state.liveSelection = nextSel;
+        syncSelectionChipUI();
+      }
+    }
+  } catch {}
+}
+
+async function openBoundedPagePreview() {
+  closeAllPopovers();
+  pagePreviewPopover.classList.remove("hidden");
+  previewPageTitle.textContent = state.activeTab?.title || "Inspecting page…";
+  previewPageUrl.textContent = state.activeTab?.url || "";
+  previewStatsRow.innerHTML = "";
+  previewSelectionBox.classList.add("hidden");
+  previewExcerptText.textContent = "Reading visible page context…";
+
+  const host = parseHost(state.activeTab?.url || "");
+  const policy = getPolicyForHost(host);
+  for (const btn of previewSitePolicyGroup.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.sitePolicy === policy);
+    btn.disabled = !host;
+  }
+
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:previewPageContext",
+    tabId: state.activeTab?.tabId || null,
+    maxChars: 4500,
+  });
+
+  if (!res?.ok || !res.context) {
+    previewExcerptText.textContent = res?.error || "Page preview unavailable on internal browser pages.";
+    return;
+  }
+  const ctx = res.context;
+  previewPageTitle.textContent = ctx.title || state.activeTab?.title || "(Untitled)";
+  previewPageUrl.textContent = ctx.url || "";
+  previewStatsRow.innerHTML = `
+    <span>${Number(ctx.linksCount || 0)} links</span>
+    <span>·</span>
+    <span>${Number(ctx.buttonsCount || 0)} buttons</span>
+    <span>·</span>
+    <span>${Number(ctx.inputsCount || 0)} inputs</span>
+  `;
+
+  if (ctx.blockedBySitePolicy) {
+    previewExcerptText.textContent = `Site access is blocked for ${ctx.host}. Switch to Allow or Ask above to share page context.`;
+    return;
+  }
+
+  if (ctx.selection) {
+    previewSelectionBox.classList.remove("hidden");
+    previewSelectionText.textContent = ctx.selection;
+  } else {
+    previewSelectionBox.classList.add("hidden");
+  }
+
+  previewExcerptText.textContent =
+    ctx.text || "(No readable body text extracted — restricted or empty page)";
 }
 
 function updateActiveTabBar(tabs) {
@@ -471,6 +914,7 @@ function updateActiveTabBar(tabs) {
     state.allTabs.find((t) => t.active && !/^(chrome-extension):\/\//i.test(t.url || "")) ||
     state.allTabs.find((t) => t.active) ||
     null;
+  const changedTab = active?.tabId !== state.activeTab?.tabId || active?.url !== state.activeTab?.url;
   state.activeTab = active;
   syncSharedPageChipUI();
 
@@ -479,10 +923,40 @@ function updateActiveTabBar(tabs) {
     if (!validIds.has(id)) state.mentionedTabIds.delete(id);
   }
   renderAttachmentChips();
+  if (changedTab) {
+    state.dismissedSelectionText = "";
+    refreshLiveSelectionFromActiveTab();
+  }
 }
 
 function renderAttachmentChips() {
   attachmentChipsEl.innerHTML = "";
+
+  for (const elItem of state.pickedElements) {
+    const chip = document.createElement("div");
+    chip.className = "removable-chip picked-element-chip";
+    chip.title = elItem.label ? `${elItem.selector} — ${elItem.label}` : elItem.selector;
+
+    const ic = document.createElement("span");
+    ic.innerHTML = SVG.targetXs;
+    if (ic.firstElementChild) chip.appendChild(ic.firstElementChild);
+
+    const lbl = document.createElement("span");
+    lbl.textContent = (elItem.selector || elItem.tagName || "element").slice(0, 30);
+    chip.appendChild(lbl);
+
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "chip-dismiss-btn";
+    rm.innerHTML = SVG.closeXs;
+    rm.addEventListener("click", () => {
+      state.pickedElements = state.pickedElements.filter((x) => x.id !== elItem.id);
+      renderAttachmentChips();
+      syncSendButtonState();
+    });
+    chip.appendChild(rm);
+    attachmentChipsEl.appendChild(chip);
+  }
 
   for (const tid of state.mentionedTabIds) {
     const tab = state.allTabs.find((t) => t.tabId === tid);
@@ -500,7 +974,7 @@ function renderAttachmentChips() {
     }
 
     const lbl = document.createElement("span");
-    lbl.textContent = tab.title || tab.url || `Tab ${tid}`;
+    lbl.textContent = `@${(tab.title || tab.url || `Tab ${tid}`).slice(0, 26)}`;
     chip.appendChild(lbl);
 
     const rm = document.createElement("button");
@@ -526,7 +1000,7 @@ function renderAttachmentChips() {
       chip.appendChild(thumb);
     }
     const lbl = document.createElement("span");
-    lbl.textContent = "Page view";
+    lbl.textContent = "Tab screenshot";
     chip.appendChild(lbl);
 
     const rm = document.createElement("button");
@@ -536,10 +1010,84 @@ function renderAttachmentChips() {
     rm.addEventListener("click", () => {
       state.screenshot = null;
       renderAttachmentChips();
+      syncSendButtonState();
     });
     chip.appendChild(rm);
     attachmentChipsEl.appendChild(chip);
   }
+
+  for (const fileItem of state.attachedFiles) {
+    const chip = document.createElement("div");
+    chip.className = "removable-chip";
+    if (fileItem.kind === "image" && fileItem.dataUrl) {
+      const thumb = document.createElement("img");
+      thumb.className = "shot-thumb";
+      thumb.src = fileItem.dataUrl;
+      thumb.alt = "";
+      chip.appendChild(thumb);
+    } else {
+      const ic = document.createElement("span");
+      ic.innerHTML = SVG.fileXs;
+      chip.appendChild(ic.firstElementChild);
+    }
+    const lbl = document.createElement("span");
+    lbl.textContent = fileItem.name;
+    chip.appendChild(lbl);
+
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "chip-dismiss-btn";
+    rm.innerHTML = SVG.closeXs;
+    rm.addEventListener("click", () => {
+      state.attachedFiles = state.attachedFiles.filter((f) => f.id !== fileItem.id);
+      renderAttachmentChips();
+      syncSendButtonState();
+    });
+    chip.appendChild(rm);
+    attachmentChipsEl.appendChild(chip);
+  }
+}
+
+async function handleFilesAdded(fileList) {
+  const incoming = Array.from(fileList || []);
+  for (const file of incoming) {
+    if (state.attachedFiles.length >= 8) break;
+    const id = `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    if (file.type.startsWith("image/")) {
+      const dataUrl = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => resolve("");
+        reader.readAsDataURL(file);
+      });
+      const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : "";
+      if (base64) {
+        state.attachedFiles.push({
+          id,
+          name: file.name || "pasted-image.png",
+          mimeType: file.type || "image/png",
+          kind: "image",
+          dataUrl,
+          base64,
+          size: file.size,
+        });
+      }
+    } else if (file.size <= 2 * 1024 * 1024) {
+      try {
+        const textContent = await file.text();
+        state.attachedFiles.push({
+          id,
+          name: file.name || "attachment.txt",
+          mimeType: file.type || "text/plain",
+          kind: "file",
+          textContent: textContent.slice(0, 32_000),
+          size: file.size,
+        });
+      } catch {}
+    }
+  }
+  renderAttachmentChips();
+  syncSendButtonState();
 }
 
 function appendUserMessageDOM(text, attachments = []) {
@@ -552,9 +1100,15 @@ function appendUserMessageDOM(text, attachments = []) {
     attRow.className = "msg-attachments";
     for (const att of attachments) {
       const b = document.createElement("span");
-      b.className = "att-badge";
-      if (att.kind === "screenshot") {
-        b.innerHTML = `${SVG.imageXs}<span>Page view</span>`;
+      b.className = att.kind === "element" ? "att-badge att-element" : "att-badge";
+      if (att.kind === "screenshot" || att.kind === "image") {
+        b.innerHTML = `${SVG.imageXs}<span>${escapeHtml(att.label || "Image")}</span>`;
+      } else if (att.kind === "file") {
+        b.innerHTML = `${SVG.fileXs}<span>${escapeHtml(att.label || "File")}</span>`;
+      } else if (att.kind === "selection") {
+        b.innerHTML = `${SVG.quoteXs}<span>${escapeHtml(att.preview || "Selection")}</span>`;
+      } else if (att.kind === "element") {
+        b.innerHTML = `${SVG.targetXs}<span>${escapeHtml(att.selector || att.label || "Element")}</span>`;
       } else {
         b.innerHTML = `${SVG.globeXs}<span>${escapeHtml(att.title || "Shared page")}</span>`;
       }
@@ -575,7 +1129,13 @@ function appendUserMessageDOM(text, attachments = []) {
   scrollToBottom(true);
 }
 
-function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", streaming = false } = {}) {
+function createAssistantTurnDOM({
+  thoughts = "",
+  toolCalls = [],
+  text = "",
+  userPromptForShortcut = "",
+  streaming = false,
+} = {}) {
   welcomeStateEl.classList.add("hidden");
   const container = document.createElement("div");
   container.className = "msg-assistant";
@@ -594,7 +1154,7 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
   thoughtToggleBtn.setAttribute("aria-expanded", startOpen ? "true" : "false");
 
   const thoughtLabel = document.createElement("span");
-  thoughtLabel.textContent = streaming && !text ? "Thinking" : "Show thinking";
+  thoughtLabel.textContent = streaming && !text ? "Thinking…" : "Show thinking";
   thoughtToggleBtn.innerHTML = "";
   thoughtToggleBtn.append(thoughtLabel);
   thoughtToggleBtn.insertAdjacentHTML("beforeend", SVG.chevronDown);
@@ -655,7 +1215,7 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
     mdBody.innerHTML = renderMarkdownSafe(text);
   } else if (streaming) {
     container.dataset.streaming = "1";
-    mdBody.innerHTML = `<span class="streaming-placeholder">Just a moment…</span>`;
+    mdBody.innerHTML = `<span class="streaming-placeholder">Thinking…</span>`;
   }
 
   const footer = document.createElement("div");
@@ -666,13 +1226,35 @@ function createAssistantTurnDOM({ thoughts = "", toolCalls = [], text = "", stre
   copyTurnBtn.className = "turn-action-btn";
   copyTurnBtn.innerHTML = `${SVG.copySm}<span>Copy</span>`;
 
+  const retryTurnBtn = document.createElement("button");
+  retryTurnBtn.type = "button";
+  retryTurnBtn.className = "turn-action-btn";
+  retryTurnBtn.innerHTML = `${SVG.retrySm}<span>Retry</span>`;
+  retryTurnBtn.addEventListener("click", () => {
+    if (!state.running && userPromptForShortcut) {
+      sendPromptNow(userPromptForShortcut);
+    }
+  });
+
+  const saveSkillBtn = document.createElement("button");
+  saveSkillBtn.type = "button";
+  saveSkillBtn.className = "turn-action-btn";
+  saveSkillBtn.innerHTML = `${SVG.slashSm}<span>Save /skill</span>`;
+  saveSkillBtn.addEventListener("click", () => {
+    openDrawerTab("skills");
+    if (userPromptForShortcut) {
+      drawerScPromptInput.value = userPromptForShortcut;
+      drawerScTitleInput.value = userPromptForShortcut.slice(0, 36);
+    }
+  });
+
   const openAppBtn = document.createElement("button");
   openAppBtn.type = "button";
   openAppBtn.className = "turn-action-btn";
-  openAppBtn.innerHTML = `${SVG.openExtSm}<span>Continue in app</span>`;
+  openAppBtn.innerHTML = `${SVG.openExtSm}<span>Open in app</span>`;
   openAppBtn.addEventListener("click", () => openInDesktopApp());
 
-  footer.append(copyTurnBtn, openAppBtn);
+  footer.append(copyTurnBtn, retryTurnBtn, saveSkillBtn, openAppBtn);
   container.append(metaRow, thoughtBody, toolsStack, permissionsStack, mdBody, footer);
   messagesListEl.appendChild(container);
   scrollToBottom(true);
@@ -732,7 +1314,7 @@ function renderPermissionRequestCard(refs, payload) {
     toolTitle;
 
   card.innerHTML = `
-    <div class="perm-header">Allow ${escapeHtml(toolCall?.name || "action")}?</div>
+    <div class="perm-header">Approve ${escapeHtml(toolCall?.name || "action")}?</div>
     <div class="perm-detail">${escapeHtml(detailText)}</div>
     <div class="perm-actions"></div>
   `;
@@ -749,12 +1331,11 @@ function renderPermissionRequestCard(refs, payload) {
     const btn = document.createElement("button");
     btn.type = "button";
     const isAllow = /allow/i.test(opt.kind || opt.optionId || "");
-    btn.className = isAllow ? "filled-pill-btn" : "tonal-pill-btn";
-    if (isAllow) btn.style.marginLeft = "0";
+    btn.className = isAllow ? "primary-pill-btn compact" : "tonal-btn compact";
     btn.textContent = opt.name || opt.optionId;
     btn.addEventListener("click", async () => {
       card.remove();
-      await chrome.runtime.sendMessage({
+      await sendRuntimeMessage({
         type: "sidepanel:respondPermission",
         permRequestId,
         optionId: opt.optionId,
@@ -762,6 +1343,57 @@ function renderPermissionRequestCard(refs, payload) {
     });
     actionsRow.appendChild(btn);
   }
+
+  refs.permissionsStack.appendChild(card);
+  scrollToBottom(true);
+}
+
+function renderSiteAccessConfirmationCard(refs, gateInfo, retryCallback) {
+  const host = gateInfo.host || "this site";
+  refs.sparkleEl.classList.remove("streaming");
+  refs.mdBody.innerHTML = "";
+
+  const card = document.createElement("div");
+  card.className = "permission-card";
+  card.innerHTML = `
+    <div class="perm-header">Allow Antigravity to access ${escapeHtml(host)}?</div>
+    <div class="perm-detail">${escapeHtml(gateInfo.url || host)}</div>
+    <div class="perm-actions">
+      <button type="button" class="tonal-btn compact" data-site-act="block">Block site</button>
+      <button type="button" class="tonal-btn compact" data-site-act="once">Allow once</button>
+      <button type="button" class="primary-pill-btn compact" data-site-act="always">Always allow</button>
+    </div>
+  `;
+
+  card.querySelector('[data-site-act="once"]').addEventListener("click", () => {
+    state.confirmedHostsForSession.add(host);
+    refs.container.remove();
+    retryCallback();
+  });
+
+  card.querySelector('[data-site-act="always"]').addEventListener("click", async () => {
+    const res = await sendRuntimeMessage({
+      type: "sidepanel:setSitePermission",
+      host,
+      policy: "allow",
+    });
+    if (res?.permissions) state.sitePermissions = res.permissions;
+    state.confirmedHostsForSession.add(host);
+    syncSharedPageChipUI();
+    refs.container.remove();
+    retryCallback();
+  });
+
+  card.querySelector('[data-site-act="block"]').addEventListener("click", async () => {
+    const res = await sendRuntimeMessage({
+      type: "sidepanel:setSitePermission",
+      host,
+      policy: "block",
+    });
+    if (res?.permissions) state.sitePermissions = res.permissions;
+    syncSharedPageChipUI();
+    card.innerHTML = `<div class="perm-header">Access blocked for ${escapeHtml(host)}</div>`;
+  });
 
   refs.permissionsStack.appendChild(card);
   scrollToBottom(true);
@@ -797,7 +1429,7 @@ function handleIncomingAgentEvent(payload = {}) {
       liveAssistantRefs.rawThoughts += update.content.text;
       liveAssistantRefs.thoughtToggleBtn.classList.remove("hidden");
       if (!liveAssistantRefs.rawText) {
-        liveAssistantRefs.thoughtLabel.textContent = "Thinking";
+        liveAssistantRefs.thoughtLabel.textContent = "Thinking…";
         liveAssistantRefs.thoughtToggleBtn.setAttribute("aria-expanded", "true");
         liveAssistantRefs.thoughtBody.classList.remove("hidden");
       }
@@ -816,21 +1448,33 @@ function handleIncomingAgentEvent(payload = {}) {
   }
 }
 
-async function sendPromptNow(overridePromptText = null) {
+async function stopRunningPrompt() {
+  if (!state.running) return;
+  await sendRuntimeMessage({
+    type: "sidepanel:cancelPrompt",
+    sessionId: state.currentSessionId || null,
+    requestId: state.activeRequestId || null,
+  });
+}
+
+async function sendPromptNow(overridePromptText = null, retryContext = null) {
   if (state.running) {
-    if (state.currentSessionId) {
-      await chrome.runtime.sendMessage({
-        type: "sidepanel:cancelPrompt",
-        sessionId: state.currentSessionId,
-      });
-    }
     return;
   }
 
-  let rawInput = overridePromptText !== null ? String(overridePromptText) : promptInput.value.trim();
+  let rawInput =
+    retryContext?.rawInput ??
+    (overridePromptText !== null ? String(overridePromptText) : promptInput.value.trim());
+
+  if (!rawInput && (state.attachedFiles.length > 0 || state.pickedElements.length > 0 || state.screenshot)) {
+    rawInput =
+      state.pickedElements.length > 0
+        ? "Inspect the selected webpage element(s) and help me with them."
+        : "Analyze the attached context and help me with it.";
+  }
   if (!rawInput) return;
 
-  if (rawInput.startsWith("/")) {
+  if (!retryContext && rawInput.startsWith("/")) {
     const token = rawInput.slice(1).split(/\s+/)[0].toLowerCase();
     const rest = rawInput.slice(1 + token.length).trim();
     const allShortcuts = [...(state.shortcuts.custom || []), ...(state.shortcuts.builtin || [])];
@@ -847,36 +1491,71 @@ async function sendPromptNow(overridePromptText = null) {
   promptInput.value = "";
   promptInput.style.height = "auto";
   closeAllPopovers();
-  syncSendButtonState();
 
-  const attachmentsPreview = [];
-  if (state.includeActiveTab && state.activeTab) {
-    attachmentsPreview.push({
-      kind: "active-tab",
-      tabId: state.activeTab.tabId,
-      title: state.activeTab.title || state.activeTab.url,
-    });
-  }
-  for (const tid of state.mentionedTabIds) {
-    const t = state.allTabs.find((x) => x.tabId === tid);
-    if (t) attachmentsPreview.push({ kind: "mentioned-tab", tabId: tid, title: t.title || t.url });
-  }
-  const screenshotBase64 = state.screenshot?.base64 || null;
-  if (screenshotBase64) {
-    attachmentsPreview.push({ kind: "screenshot" });
-  }
-  state.screenshot = null;
-  renderAttachmentChips();
+  const includeSelection =
+    retryContext?.includeSelection ??
+    Boolean(state.liveSelection && state.liveSelection !== state.dismissedSelectionText);
+  const selectionOverride = retryContext?.selectionOverride ?? (includeSelection ? state.liveSelection : null);
+  const screenshotSnapshot = retryContext ? retryContext.screenshotSnapshot || null : state.screenshot;
+  const screenshotBase64 = retryContext ? retryContext.screenshotBase64 : state.screenshot?.base64 || null;
+  const filesPayload = retryContext ? retryContext.filesPayload : state.attachedFiles.slice();
+  const pickedPayload = retryContext ? retryContext.pickedPayload || [] : state.pickedElements.slice();
 
-  appendUserMessageDOM(rawInput, attachmentsPreview);
-  liveAssistantRefs = createAssistantTurnDOM({ streaming: true });
+  if (!retryContext) {
+    const attachmentsPreview = [];
+    const activeHost = parseHost(state.activeTab?.url || "");
+    if (state.includeActiveTab && state.activeTab && getPolicyForHost(activeHost) !== "block") {
+      attachmentsPreview.push({
+        kind: "active-tab",
+        tabId: state.activeTab.tabId,
+        title: state.activeTab.title || state.activeTab.url,
+      });
+    }
+    if (includeSelection && selectionOverride) {
+      attachmentsPreview.push({
+        kind: "selection",
+        preview: selectionOverride.slice(0, 60),
+      });
+    }
+    for (const tid of state.mentionedTabIds) {
+      const t = state.allTabs.find((x) => x.tabId === tid);
+      if (t) attachmentsPreview.push({ kind: "mentioned-tab", tabId: tid, title: t.title || t.url });
+    }
+    for (const pEl of pickedPayload) {
+      attachmentsPreview.push({
+        kind: "element",
+        selector: pEl.selector || pEl.tagName || "element",
+        label: pEl.label || pEl.selector || "Element",
+      });
+    }
+    if (screenshotBase64) {
+      attachmentsPreview.push({ kind: "screenshot", label: "Tab screenshot" });
+    }
+    for (const f of filesPayload) {
+      attachmentsPreview.push({ kind: f.kind, label: f.name });
+    }
+
+    state.screenshot = null;
+    state.attachedFiles = [];
+    state.pickedElements = [];
+    renderAttachmentChips();
+    syncSendButtonState();
+
+    appendUserMessageDOM(rawInput, attachmentsPreview);
+  }
+
+  const currentTurnRefs = createAssistantTurnDOM({
+    userPromptForShortcut: rawInput,
+    streaming: true,
+  });
+  liveAssistantRefs = currentTurnRefs;
 
   const requestId = `ui-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   state.activeRequestId = requestId;
   updateRunningUI(true);
 
   try {
-    const res = await chrome.runtime.sendMessage({
+    const res = await sendRuntimeMessage({
       type: "sidepanel:sendPrompt",
       payload: {
         requestId,
@@ -884,40 +1563,69 @@ async function sendPromptNow(overridePromptText = null) {
         userText: rawInput,
         interactionMode: state.interactionMode,
         permissionMode: state.permissionMode || "auto",
-        autoApprovePermissions: false,
+        autoApprovePermissions: state.permissionMode === "full",
         modelId: state.modelId || null,
         includeActiveTab: Boolean(state.includeActiveTab),
         activeTabId: state.activeTab?.tabId || null,
+        includeSelection,
+        selectionOverride,
         mentionedTabIds: Array.from(state.mentionedTabIds),
+        pickedElements: pickedPayload,
         screenshotBase64,
+        attachedFiles: filesPayload,
+        cwd: state.settings.cwd || null,
+        customInstructions: state.settings.customInstructions || null,
+        siteAccessConfirmedHosts: Array.from(state.confirmedHostsForSession),
       },
     });
 
+    if (res?.requiresSiteConfirmation) {
+      renderSiteAccessConfirmationCard(currentTurnRefs, res, () => {
+        sendPromptNow(null, {
+          rawInput,
+          includeSelection,
+          selectionOverride,
+          screenshotSnapshot,
+          screenshotBase64,
+          filesPayload,
+          pickedPayload,
+        });
+      });
+      return;
+    }
+
     if (!res?.ok) {
+      if (res?.code === -32021) {
+        // Restore attachments if blocked by site access policy before sending
+        if (screenshotSnapshot && !state.screenshot) state.screenshot = screenshotSnapshot;
+        if (filesPayload.length > 0 && state.attachedFiles.length === 0) state.attachedFiles = filesPayload;
+        if (pickedPayload.length > 0 && state.pickedElements.length === 0) state.pickedElements = pickedPayload;
+        renderAttachmentChips();
+        syncSendButtonState();
+      }
       const errDiv = document.createElement("div");
       errDiv.className = "error-bubble";
       errDiv.textContent = res?.error || "Request failed.";
-      liveAssistantRefs.mdBody.innerHTML = "";
-      liveAssistantRefs.mdBody.appendChild(errDiv);
-      liveAssistantRefs.sparkleEl.classList.remove("streaming");
+      currentTurnRefs.mdBody.innerHTML = "";
+      currentTurnRefs.mdBody.appendChild(errDiv);
+      currentTurnRefs.sparkleEl.classList.remove("streaming");
     } else {
       state.currentSessionId = res.sessionId || state.currentSessionId;
       if (res.title) {
         state.sessionTitle = res.title;
         headerTitleEl.textContent = res.title;
       }
-      if (!liveAssistantRefs.rawText) {
-        liveAssistantRefs.mdBody.innerHTML = `<p><em>Done.</em></p>`;
+      if (!currentTurnRefs.rawText) {
+        currentTurnRefs.mdBody.innerHTML =
+          res.stopReason === "cancelled" ? `<p><em>Stopped.</em></p>` : `<p><em>Completed.</em></p>`;
       }
-      finalizeAssistantTurnDOM(liveAssistantRefs);
+      finalizeAssistantTurnDOM(currentTurnRefs);
     }
   } catch (err) {
-    if (liveAssistantRefs) {
-      liveAssistantRefs.sparkleEl.classList.remove("streaming");
-      liveAssistantRefs.mdBody.innerHTML = `<div class="error-bubble">${escapeHtml(
-        err?.message || String(err),
-      )}</div>`;
-    }
+    currentTurnRefs.sparkleEl.classList.remove("streaming");
+    currentTurnRefs.mdBody.innerHTML = `<div class="error-bubble">${escapeHtml(
+      err?.message || String(err),
+    )}</div>`;
   } finally {
     updateRunningUI(false);
     state.activeRequestId = null;
@@ -929,8 +1637,8 @@ async function sendPromptNow(overridePromptText = null) {
 function startNewChat() {
   if (state.running) return;
   state.currentSessionId = null;
-  state.sessionTitle = "Antigravity";
-  headerTitleEl.textContent = "Antigravity";
+  state.sessionTitle = "New thread";
+  headerTitleEl.textContent = "New thread";
   messagesListEl.innerHTML = "";
   updateGreetingByTime();
   welcomeStateEl.classList.remove("hidden");
@@ -943,13 +1651,13 @@ async function loadChromeSessionIntoView(sessionId) {
   historyDrawer.classList.add("hidden");
   closeAllPopovers();
 
-  const res = await chrome.runtime.sendMessage({
+  const res = await sendRuntimeMessage({
     type: "sidepanel:loadSession",
     sessionId,
   });
   if (!res?.ok || !res.session) {
     messagesListEl.innerHTML = `<div class="error-bubble">${escapeHtml(
-      res?.error || "Unable to load chat.",
+      res?.error || "Unable to load thread.",
     )}</div>`;
     welcomeStateEl.classList.add("hidden");
     return;
@@ -957,7 +1665,7 @@ async function loadChromeSessionIntoView(sessionId) {
 
   const sess = res.session;
   state.currentSessionId = sess.sessionId;
-  state.sessionTitle = sess.title || "Chat";
+  state.sessionTitle = sess.title || "Thread";
   headerTitleEl.textContent = state.sessionTitle;
   if (sess.interactionMode) {
     state.interactionMode = sess.interactionMode;
@@ -971,14 +1679,17 @@ async function loadChromeSessionIntoView(sessionId) {
     return;
   }
   welcomeStateEl.classList.add("hidden");
+  let prevUserText = "";
   for (const m of msgs) {
     if (m.role === "user") {
-      appendUserMessageDOM(m.text || "", m.attachments || []);
+      prevUserText = m.text || "";
+      appendUserMessageDOM(prevUserText, m.attachments || []);
     } else {
       createAssistantTurnDOM({
         thoughts: m.thoughts || "",
         toolCalls: m.toolCalls || [],
         text: m.text || "",
+        userPromptForShortcut: prevUserText,
         streaming: false,
       });
     }
@@ -988,12 +1699,23 @@ async function loadChromeSessionIntoView(sessionId) {
 
 function renderHistoryDrawer() {
   historyListEl.innerHTML = "";
-  if (!Array.isArray(state.sessions) || state.sessions.length === 0) {
-    historyListEl.innerHTML = `<p class="sheet-empty">No recent chats in Chrome yet.</p>`;
+  const needle = String(state.historyFilter || "").trim().toLowerCase();
+  const filtered = (state.sessions || []).filter(
+    (s) =>
+      !needle ||
+      (s.title || "").toLowerCase().includes(needle) ||
+      (s.originTitle || "").toLowerCase().includes(needle) ||
+      (s.originUrl || "").toLowerCase().includes(needle),
+  );
+
+  if (filtered.length === 0) {
+    historyListEl.innerHTML = `<p class="sheet-empty">${
+      needle ? "No matching threads found." : "No Chrome threads yet. Start chatting to sync with Antigravity.app."
+    }</p>`;
     return;
   }
 
-  for (const s of state.sessions) {
+  for (const s of filtered) {
     const card = document.createElement("div");
     card.className = "tonal-list-card";
     const when = s.updatedAt
@@ -1001,14 +1723,14 @@ function renderHistoryDrawer() {
       : "";
     card.innerHTML = `
       <div class="tonal-card-top">
-        <div class="tonal-card-title">${escapeHtml(s.title || "Chat")}</div>
+        <div class="tonal-card-title">${escapeHtml(s.title || "Thread")}</div>
         <div class="tonal-card-actions">
-          <button type="button" class="text-pill-btn open-app-btn" title="Open in Antigravity app">Open in app</button>
-          <button type="button" class="mini-icon-btn del-sess-btn" title="Remove" aria-label="Remove">${SVG.closeXs}</button>
+          <button type="button" class="text-link-btn open-app-btn" title="Open in Antigravity.app">Open ↗</button>
+          <button type="button" class="chip-dismiss-btn del-sess-btn" title="Delete thread" aria-label="Delete">${SVG.closeXs}</button>
         </div>
       </div>
       <div class="tonal-card-meta">
-        <span>${escapeHtml(s.interactionMode === "agent" ? "Agent" : "Chat")} · ${s.messageCount || 0} messages</span>
+        <span>${escapeHtml(s.interactionMode === "agent" ? "Agent" : "Chat")} · ${s.messageCount || 0} msgs</span>
         <span>${escapeHtml(when)}</span>
       </div>
     `;
@@ -1021,7 +1743,7 @@ function renderHistoryDrawer() {
     });
     card.querySelector(".del-sess-btn").addEventListener("click", async (e) => {
       e.stopPropagation();
-      const resp = await chrome.runtime.sendMessage({
+      const resp = await sendRuntimeMessage({
         type: "sidepanel:deleteSession",
         sessionId: s.sessionId,
       });
@@ -1032,6 +1754,57 @@ function renderHistoryDrawer() {
       }
     });
     historyListEl.appendChild(card);
+  }
+}
+
+function renderSkillsDrawer() {
+  drawerSkillsListEl.innerHTML = "";
+  const items = [
+    ...(state.shortcuts.custom || []).map((s) => ({ ...s, badge: "Saved" })),
+    ...(state.shortcuts.builtin || []).map((s) => ({
+      ...s,
+      badge: s.interactionMode === "agent" ? "Agent" : "Built-in",
+    })),
+  ];
+
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "tonal-list-card";
+    card.innerHTML = `
+      <div class="tonal-card-top">
+        <div class="tonal-card-title">/${escapeHtml(item.command)} · ${escapeHtml(item.title || "")}</div>
+        <div class="tonal-card-actions">
+          <button type="button" class="tonal-btn compact run-sc-btn">Run</button>
+          ${!item.builtin ? `<button type="button" class="chip-dismiss-btn del-sc-btn" title="Delete">${SVG.closeXs}</button>` : ""}
+        </div>
+      </div>
+      <div class="tonal-card-meta">
+        <span>${escapeHtml(item.description || "")}</span>
+        <span>${escapeHtml(item.badge)}</span>
+      </div>
+    `;
+    card.querySelector(".run-sc-btn").addEventListener("click", () => {
+      historyDrawer.classList.add("hidden");
+      if (item.interactionMode) {
+        state.interactionMode = item.interactionMode;
+        updateModeUI();
+      }
+      sendPromptNow(item.prompt);
+    });
+    const delBtn = card.querySelector(".del-sc-btn");
+    if (delBtn) {
+      delBtn.addEventListener("click", async () => {
+        const res = await sendRuntimeMessage({
+          type: "sidepanel:deleteShortcut",
+          payload: { id: item.id },
+        });
+        if (res?.custom) {
+          state.shortcuts.custom = res.custom;
+          renderSkillsDrawer();
+        }
+      });
+    }
+    drawerSkillsListEl.appendChild(card);
   }
 }
 
@@ -1046,19 +1819,19 @@ function renderSchedulesDrawer() {
     const card = document.createElement("div");
     card.className = "tonal-list-card";
     const lastInfo = task.lastRunAt
-      ? `Last run ${new Date(task.lastRunAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-      : "Waiting for next run";
+      ? `Last ${new Date(task.lastRunAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : "Pending";
     card.innerHTML = `
       <div class="tonal-card-top">
         <div class="tonal-card-title">${escapeHtml(task.name)}</div>
         <div class="tonal-card-actions">
-          <button type="button" class="tonal-pill-btn run-now-btn">Run now</button>
-          ${task.lastSessionId ? '<button type="button" class="text-pill-btn view-run-btn">View</button>' : ""}
-          <button type="button" class="mini-icon-btn del-sched-btn" aria-label="Delete">${SVG.closeXs}</button>
+          <button type="button" class="tonal-btn compact run-now-btn">Run now</button>
+          ${task.lastSessionId ? '<button type="button" class="text-link-btn view-run-btn">View</button>' : ""}
+          <button type="button" class="chip-dismiss-btn del-sched-btn" aria-label="Delete">${SVG.closeXs}</button>
         </div>
       </div>
       <div class="tonal-card-meta">
-        <span>Every ${task.intervalMinutes}m · ${task.interactionMode === "agent" ? "Agent" : "Read"}</span>
+        <span>Every ${task.intervalMinutes}m · ${task.interactionMode === "agent" ? "Agent" : "Chat"}</span>
         <span>${escapeHtml(lastInfo)}</span>
       </div>
     `;
@@ -1067,7 +1840,7 @@ function renderSchedulesDrawer() {
       btn.disabled = true;
       btn.textContent = "Running…";
       try {
-        const res = await chrome.runtime.sendMessage({ type: "sidepanel:runScheduleNow", id: task.id });
+        const res = await sendRuntimeMessage({ type: "sidepanel:runScheduleNow", id: task.id });
         if (res?.sessionId) {
           await loadChromeSessionIntoView(res.sessionId);
         }
@@ -1081,7 +1854,7 @@ function renderSchedulesDrawer() {
       viewBtn.addEventListener("click", () => loadChromeSessionIntoView(task.lastSessionId));
     }
     card.querySelector(".del-sched-btn").addEventListener("click", async () => {
-      const res = await chrome.runtime.sendMessage({
+      const res = await sendRuntimeMessage({
         type: "sidepanel:deleteSchedule",
         payload: { id: task.id },
       });
@@ -1094,13 +1867,31 @@ function renderSchedulesDrawer() {
   }
 }
 
+function syncPopoverKeyboardHighlight(listContainer) {
+  if (!listContainer) return;
+  const rows = Array.from(listContainer.querySelectorAll(".popover-item"));
+  if (rows.length === 0) return;
+  const clamped = ((state.kbActiveIndex % rows.length) + rows.length) % rows.length;
+  state.kbActiveIndex = clamped;
+  rows.forEach((r, idx) => {
+    r.classList.toggle("kb-active", idx === clamped);
+    if (idx === clamped) {
+      r.scrollIntoView?.({ block: "nearest" });
+    }
+  });
+}
+
 function renderSlashPopover(filterText = "") {
   const needle = filterText.replace(/^\/+/, "").trim().toLowerCase();
   slashListEl.innerHTML = "";
+  state.kbActiveIndex = 0;
 
   const combined = [
     ...(state.shortcuts.custom || []).map((s) => ({ ...s, kindLabel: "Saved" })),
-    ...(state.shortcuts.builtin || []).map((s) => ({ ...s, kindLabel: s.interactionMode === "agent" ? "Agent" : "Page" })),
+    ...(state.shortcuts.builtin || []).map((s) => ({
+      ...s,
+      kindLabel: s.interactionMode === "agent" ? "Agent" : "Page",
+    })),
     ...(state.agySkills || []).slice(0, 25).map((sk) => ({
       command: sk.name,
       title: sk.name,
@@ -1117,7 +1908,7 @@ function renderSlashPopover(filterText = "") {
   );
 
   if (combined.length === 0) {
-    slashListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 12px;">No matching shortcuts.</div>`;
+    slashListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 10px;">No matching shortcuts.</div>`;
     return;
   }
 
@@ -1127,12 +1918,12 @@ function renderSlashPopover(filterText = "") {
     row.innerHTML = `
       <span class="popover-item-icon">${SVG.slashSm}</span>
       <div class="popover-item-main">
-        <div class="popover-item-title">${escapeHtml(item.command)} <span style="font-weight:400;color:var(--gem-text-muted)">· ${escapeHtml(
+        <div class="popover-item-title">/${escapeHtml(item.command)} <span style="font-weight:400;color:var(--text-muted)">· ${escapeHtml(
       item.kindLabel,
     )}</span></div>
         <div class="popover-item-sub">${escapeHtml(item.description || item.title || "")}</div>
       </div>
-      ${!item.builtin && !item.isSkill ? `<button type="button" class="mini-icon-btn del-sc-btn" title="Delete">${SVG.closeXs}</button>` : ""}
+      ${!item.builtin && !item.isSkill ? `<button type="button" class="chip-dismiss-btn del-sc-btn" title="Delete">${SVG.closeXs}</button>` : ""}
     `;
     row.addEventListener("click", (e) => {
       if (e.target.closest(".del-sc-btn")) return;
@@ -1153,7 +1944,7 @@ function renderSlashPopover(filterText = "") {
     if (delBtn) {
       delBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        const res = await chrome.runtime.sendMessage({
+        const res = await sendRuntimeMessage({
           type: "sidepanel:deleteShortcut",
           payload: { id: item.id },
         });
@@ -1165,11 +1956,13 @@ function renderSlashPopover(filterText = "") {
     }
     slashListEl.appendChild(row);
   }
+  syncPopoverKeyboardHighlight(slashListEl);
 }
 
 function renderTabsPicker(filterText = "") {
   const needle = filterText.trim().toLowerCase();
   tabsPickerListEl.innerHTML = "";
+  state.kbActiveIndex = 0;
   const candidates = state.allTabs.filter(
     (t) =>
       !/^chrome-extension:\/\//i.test(t.url || "") &&
@@ -1177,7 +1970,7 @@ function renderTabsPicker(filterText = "") {
   );
 
   if (candidates.length === 0) {
-    tabsPickerListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 12px;">No open tabs found.</div>`;
+    tabsPickerListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 10px;">No open tabs found.</div>`;
     return;
   }
 
@@ -1207,7 +2000,7 @@ function renderTabsPicker(filterText = "") {
     const mainDiv = document.createElement("div");
     mainDiv.className = "popover-item-main";
     mainDiv.innerHTML = `
-      <div class="popover-item-title">${escapeHtml(t.title || t.url || `Tab ${t.tabId}`)}${isActive ? " · Current" : ""}</div>
+      <div class="popover-item-title">${escapeHtml(t.title || t.url || `Tab ${t.tabId}`)}${isActive ? " · Active" : ""}</div>
       <div class="popover-item-sub">${escapeHtml(t.url || "")}</div>
     `;
 
@@ -1225,38 +2018,103 @@ function renderTabsPicker(filterText = "") {
     });
     tabsPickerListEl.appendChild(row);
   }
+  syncPopoverKeyboardHighlight(tabsPickerListEl);
+}
+
+async function toggleElementPickerFromUI() {
+  closeAllPopovers();
+  historyDrawer.classList.add("hidden");
+  if (state.picker.active) {
+    const res = await sendRuntimeMessage({ type: "sidepanel:cancelElementPicker" });
+    renderPickerUI(res?.picker || { active: false, tabId: null });
+    return;
+  }
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:startElementPicker",
+    payload: { tabId: state.activeTab?.tabId || null },
+  });
+  if (res?.ok && res.picker) {
+    renderPickerUI(res.picker);
+  } else if (res?.error) {
+    welcomeStateEl.classList.add("hidden");
+    const errDiv = document.createElement("div");
+    errDiv.className = "error-bubble";
+    errDiv.textContent = res.error;
+    messagesListEl.appendChild(errDiv);
+    scrollToBottom(true);
+  }
+}
+
+async function startWorkflowRecordingFromUI() {
+  closeAllPopovers();
+  historyDrawer.classList.add("hidden");
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:startRecording",
+    payload: { tabId: state.activeTab?.tabId || null },
+  });
+  if (res?.ok && res.recording) {
+    renderRecordingUI(res.recording);
+  } else if (res?.error) {
+    welcomeStateEl.classList.add("hidden");
+    const errDiv = document.createElement("div");
+    errDiv.className = "error-bubble";
+    errDiv.textContent = res.error;
+    messagesListEl.appendChild(errDiv);
+  }
 }
 
 async function openInDesktopApp(sessionId = state.currentSessionId) {
-  await chrome.runtime.sendMessage({
+  await sendRuntimeMessage({
     type: "sidepanel:openInDesktopApp",
     sessionId,
   });
 }
 
 async function refreshTabsList() {
-  const res = await chrome.runtime.sendMessage({ type: "sidepanel:listTabs" });
+  const res = await sendRuntimeMessage({ type: "sidepanel:listTabs" });
   if (res?.ok && Array.isArray(res.tabs)) {
     updateActiveTabBar(res.tabs);
   }
 }
 
 async function reconnectNativeBridge() {
-  const status = await chrome.runtime.sendMessage({ type: "sidepanel:reconnect" });
+  const status = await sendRuntimeMessage({ type: "sidepanel:reconnect" });
   renderBridgeStatus(status);
 }
 
-// Event Listeners
+function openDrawerTab(tabName = "chats") {
+  closeAllPopovers();
+  historyDrawer.classList.remove("hidden");
+  drawerPanelChats.classList.toggle("hidden", tabName !== "chats");
+  drawerPanelSkills.classList.toggle("hidden", tabName !== "skills");
+  drawerPanelSchedules.classList.toggle("hidden", tabName !== "schedules");
+  drawerPanelActivity.classList.toggle("hidden", tabName !== "activity");
+
+  for (const btn of drawerTabsGroup.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.drawerTab === tabName);
+  }
+
+  if (tabName === "chats") renderHistoryDrawer();
+  else if (tabName === "skills") renderSkillsDrawer();
+  else if (tabName === "schedules") renderSchedulesDrawer();
+  else if (tabName === "activity") renderActivityStreamUI();
+}
+
+// Global & Popover Dismiss Listeners
 document.addEventListener("click", (e) => {
   if (
-    !e.target.closest(".floating-menu") &&
+    !e.target.closest(".glass-popover") &&
     !e.target.closest("#model-menu-btn") &&
-    !e.target.closest("#add-menu-btn")
+    !e.target.closest("#settings-btn") &&
+    !e.target.closest("#add-menu-btn") &&
+    !e.target.closest("#inspect-active-tab-btn") &&
+    !e.target.closest("#welcome-preview-btn")
   ) {
     closeAllPopovers();
   }
 });
 
+// Top Header Events
 modelMenuBtn.addEventListener("click", (e) => {
   e.stopPropagation();
   const willOpen = modelPopover.classList.contains("hidden");
@@ -1268,46 +2126,165 @@ modelMenuBtn.addEventListener("click", (e) => {
   }
 });
 
+settingsBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const willOpen = settingsPopover.classList.contains("hidden");
+  closeAllPopovers();
+  if (willOpen) {
+    renderSettingsPopover();
+    settingsPopover.classList.remove("hidden");
+  }
+});
+
+sitePolicySegmentedEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn || !btn.dataset.sitePolicy) return;
+  const host = parseHost(state.activeTab?.url || "");
+  if (!host) return;
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host,
+    policy: btn.dataset.sitePolicy,
+  });
+  if (res?.permissions) {
+    state.sitePermissions = res.permissions;
+    renderSettingsPopover();
+    syncSharedPageChipUI();
+  }
+});
+
+previewSitePolicyGroup.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn || !btn.dataset.sitePolicy) return;
+  const host = parseHost(state.activeTab?.url || "");
+  if (!host) return;
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host,
+    policy: btn.dataset.sitePolicy,
+  });
+  if (res?.permissions) {
+    state.sitePermissions = res.permissions;
+    syncSharedPageChipUI();
+    openBoundedPagePreview();
+  }
+});
+
+themeSegmentedEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn || !btn.dataset.themeChoice) return;
+  state.settings.theme = btn.dataset.themeChoice;
+  applyTheme(state.settings.theme);
+  sendRuntimeMessage({
+    type: "sidepanel:saveSettings",
+    settings: { theme: state.settings.theme },
+  });
+});
+
+saveSettingsBtn.addEventListener("click", async () => {
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:saveSettings",
+    settings: {
+      cwd: settingsCwdInput.value.trim(),
+      customInstructions: settingsInstructionsInput.value,
+      theme: state.settings.theme,
+    },
+  });
+  if (res?.settings) {
+    state.settings = res.settings;
+    updateWorkspaceBadgeUI();
+  }
+  closeAllPopovers();
+});
+
 permissionSegmentedEl.addEventListener("click", (e) => {
-  const btn = e.target.closest(".tonal-seg-btn");
+  const btn = e.target.closest(".seg-btn");
   if (!btn || !btn.dataset.perm) return;
   state.permissionMode = btn.dataset.perm;
-  renderModelMenu();
-  if (state.currentSessionId) {
-    chrome.runtime.sendMessage({
-      type: "sidepanel:setConfig",
-      payload: { sessionId: state.currentSessionId, modeId: state.permissionMode },
-    });
+  updateApprovalUI();
+  sendRuntimeMessage({
+    type: "sidepanel:saveSettings",
+    settings: { defaultApprovalMode: state.permissionMode },
+  });
+});
+
+approvalCycleBtn.addEventListener("click", () => {
+  const order = ["auto", "ask", "full"];
+  const idx = order.indexOf(state.permissionMode);
+  state.permissionMode = order[(idx + 1) % order.length];
+  updateApprovalUI();
+  sendRuntimeMessage({
+    type: "sidepanel:saveSettings",
+    settings: { defaultApprovalMode: state.permissionMode },
+  });
+});
+
+bridgeStatusPill.addEventListener("click", () => {
+  if (!state.bridgeStatus?.nativeConnected) {
+    reconnectNativeBridge();
+  } else {
+    openDrawerTab("activity");
   }
 });
 
 bridgeStatusBtn.addEventListener("click", reconnectNativeBridge);
 bannerReconnectBtn.addEventListener("click", reconnectNativeBridge);
 
-newChatBtn.addEventListener("click", startNewChat);
+headerOpenAppBtn.addEventListener("click", () => openInDesktopApp());
 openDesktopBtn.addEventListener("click", () => openInDesktopApp());
+newChatBtn.addEventListener("click", startNewChat);
+
+// Browser Activity & Recording Controls
+toggleActivityStreamBtn.addEventListener("click", () => {
+  inlineActivityDrawer.classList.toggle("hidden");
+  renderActivityStreamUI();
+});
+
+const clearActivityHandler = async () => {
+  await sendRuntimeMessage({ type: "sidepanel:clearActivity" });
+  state.activityLog = [];
+  renderActivityStreamUI();
+};
+clearInlineActivityBtn.addEventListener("click", clearActivityHandler);
+drawerClearActivityBtn.addEventListener("click", clearActivityHandler);
 
 detachAllBtn.addEventListener("click", async () => {
-  const status = await chrome.runtime.sendMessage({ type: "sidepanel:finishAll" });
+  const status = await sendRuntimeMessage({ type: "sidepanel:finishAll" });
   renderBridgeStatus(status);
 });
 
-function openDrawerTab(tabName = "chats") {
-  closeAllPopovers();
-  historyDrawer.classList.remove("hidden");
-  const isSchedules = tabName === "schedules";
-  drawerPanelChats.classList.toggle("hidden", isSchedules);
-  drawerPanelSchedules.classList.toggle("hidden", !isSchedules);
-  for (const btn of drawerTabsGroup.querySelectorAll(".tonal-seg-btn")) {
-    btn.classList.toggle("active", btn.dataset.drawerTab === tabName);
+stopRecordingBtn.addEventListener("click", async () => {
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:stopRecording",
+    payload: { cancel: false },
+  });
+  renderRecordingUI(res?.recording);
+  if (res?.shortcutDraft) {
+    openDrawerTab("skills");
+    drawerScCmdInput.value = res.shortcutDraft.command || "recorded-flow";
+    drawerScTitleInput.value = res.shortcutDraft.title || "Recorded workflow";
+    drawerScPromptInput.value = res.shortcutDraft.prompt || "";
+    state.drawerScMode = "agent";
+    for (const b of drawerScModeGroup.querySelectorAll(".seg-btn")) {
+      b.classList.toggle("active", b.dataset.scMode === "agent");
+    }
   }
-  if (isSchedules) {
-    renderSchedulesDrawer();
-  } else {
-    renderHistoryDrawer();
-  }
-}
+});
 
+cancelRecordingBtn.addEventListener("click", async () => {
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:stopRecording",
+    payload: { cancel: true },
+  });
+  renderRecordingUI(res?.recording);
+});
+
+cancelElementPickerBtn.addEventListener("click", async () => {
+  const res = await sendRuntimeMessage({ type: "sidepanel:cancelElementPicker" });
+  renderPickerUI(res?.picker || { active: false, tabId: null });
+});
+
+// Drawer Events
 historyBtn.addEventListener("click", () => {
   if (!historyDrawer.classList.contains("hidden")) {
     historyDrawer.classList.add("hidden");
@@ -1319,9 +2296,43 @@ historyBtn.addEventListener("click", () => {
 closeHistoryBtn.addEventListener("click", () => historyDrawer.classList.add("hidden"));
 
 drawerTabsGroup.addEventListener("click", (e) => {
-  const btn = e.target.closest(".tonal-seg-btn");
+  const btn = e.target.closest(".seg-btn");
   if (!btn || !btn.dataset.drawerTab) return;
   openDrawerTab(btn.dataset.drawerTab);
+});
+
+historySearchInput.addEventListener("input", () => {
+  state.historyFilter = historySearchInput.value;
+  renderHistoryDrawer();
+});
+
+drawerRecordBtn.addEventListener("click", startWorkflowRecordingFromUI);
+
+drawerScModeGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn) return;
+  state.drawerScMode = btn.dataset.scMode || "agent";
+  for (const el of drawerScModeGroup.querySelectorAll(".seg-btn")) {
+    el.classList.toggle("active", el === btn);
+  }
+});
+
+drawerSaveScBtn.addEventListener("click", async () => {
+  const command = drawerScCmdInput.value.trim();
+  const title = drawerScTitleInput.value.trim();
+  const prompt = drawerScPromptInput.value.trim();
+  if (!command || !prompt) return;
+  const res = await sendRuntimeMessage({
+    type: "sidepanel:saveShortcut",
+    payload: { command, title, prompt, interactionMode: state.drawerScMode },
+  });
+  if (res?.custom) {
+    state.shortcuts.custom = res.custom;
+    drawerScCmdInput.value = "";
+    drawerScTitleInput.value = "";
+    drawerScPromptInput.value = "";
+    renderSkillsDrawer();
+  }
 });
 
 schedulesBtn.addEventListener("click", (e) => {
@@ -1330,19 +2341,19 @@ schedulesBtn.addEventListener("click", (e) => {
 });
 
 schedIntervalGroup.addEventListener("click", (e) => {
-  const btn = e.target.closest(".tonal-seg-btn");
+  const btn = e.target.closest(".seg-btn");
   if (!btn) return;
   state.schedInterval = Number(btn.dataset.interval) || 60;
-  for (const el of schedIntervalGroup.querySelectorAll(".tonal-seg-btn")) {
+  for (const el of schedIntervalGroup.querySelectorAll(".seg-btn")) {
     el.classList.toggle("active", el === btn);
   }
 });
 
 schedModeGroup.addEventListener("click", (e) => {
-  const btn = e.target.closest(".tonal-seg-btn");
+  const btn = e.target.closest(".seg-btn");
   if (!btn) return;
   state.schedMode = btn.dataset.schedMode || "chat";
-  for (const el of schedModeGroup.querySelectorAll(".tonal-seg-btn")) {
+  for (const el of schedModeGroup.querySelectorAll(".seg-btn")) {
     el.classList.toggle("active", el === btn);
   }
 });
@@ -1354,7 +2365,7 @@ scheduleForm.addEventListener("submit", async (e) => {
   const prompt = document.getElementById("sched-prompt").value.trim();
   if (!name || !prompt) return;
 
-  const res = await chrome.runtime.sendMessage({
+  const res = await sendRuntimeMessage({
     type: "sidepanel:saveSchedule",
     payload: {
       name,
@@ -1372,9 +2383,34 @@ scheduleForm.addEventListener("submit", async (e) => {
   }
 });
 
+// Welcome Page & Workflow Chips
+inspectActiveTabBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!pagePreviewPopover.classList.contains("hidden")) {
+    pagePreviewPopover.classList.add("hidden");
+  } else {
+    openBoundedPagePreview();
+  }
+});
+
+welcomePreviewBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  openBoundedPagePreview();
+});
+
+closePagePreviewBtn.addEventListener("click", () => pagePreviewPopover.classList.add("hidden"));
+
 quickGridEl.addEventListener("click", (e) => {
-  const pill = e.target.closest(".suggestion-pill");
+  const pill = e.target.closest(".workflow-chip");
   if (!pill) return;
+  if (pill.dataset.action === "pick-element") {
+    toggleElementPickerFromUI();
+    return;
+  }
+  if (pill.dataset.action === "record") {
+    startWorkflowRecordingFromUI();
+    return;
+  }
   const scName = pill.dataset.shortcut;
   const all = [...(state.shortcuts.custom || []), ...(state.shortcuts.builtin || [])];
   const found = all.find((s) => s.command === scName);
@@ -1399,13 +2435,17 @@ messagesListEl.addEventListener("click", (e) => {
   });
 });
 
-agentModeToggle.addEventListener("click", () => {
-  state.interactionMode = state.interactionMode === "agent" ? "chat" : "agent";
+// Composer Mode, Attachments, Drag & Drop, Paste, & Voice
+modeSwitchGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".mode-pill-opt");
+  if (!btn || !btn.dataset.mode) return;
+  state.interactionMode = btn.dataset.mode === "agent" ? "agent" : "chat";
   updateModeUI();
   promptInput.focus();
 });
 
-unshareActiveTabBtn.addEventListener("click", () => {
+unshareActiveTabBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
   state.includeActiveTab = false;
   syncSharedPageChipUI();
 });
@@ -1413,6 +2453,12 @@ unshareActiveTabBtn.addEventListener("click", () => {
 reshareActiveTabBtn.addEventListener("click", () => {
   state.includeActiveTab = true;
   syncSharedPageChipUI();
+  refreshLiveSelectionFromActiveTab();
+});
+
+dismissSelectionBtn.addEventListener("click", () => {
+  state.dismissedSelectionText = state.liveSelection;
+  syncSelectionChipUI();
 });
 
 addMenuBtn.addEventListener("click", (e) => {
@@ -1425,6 +2471,59 @@ addMenuBtn.addEventListener("click", (e) => {
   }
 });
 
+menuAttachFileBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  closeAllPopovers();
+  fileInput.click();
+});
+
+fileInput.addEventListener("change", async () => {
+  if (fileInput.files?.length) {
+    await handleFilesAdded(fileInput.files);
+    fileInput.value = "";
+  }
+});
+
+appShellEl.addEventListener("dragenter", (e) => {
+  if (!e.dataTransfer?.types?.includes("Files")) return;
+  e.preventDefault();
+  dragDepth += 1;
+  dropzoneOverlay.classList.remove("hidden");
+});
+
+appShellEl.addEventListener("dragover", (e) => {
+  if (!e.dataTransfer?.types?.includes("Files")) return;
+  e.preventDefault();
+});
+
+appShellEl.addEventListener("dragleave", () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) {
+    dropzoneOverlay.classList.add("hidden");
+  }
+});
+
+appShellEl.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropzoneOverlay.classList.add("hidden");
+  if (e.dataTransfer?.files?.length) {
+    await handleFilesAdded(e.dataTransfer.files);
+  }
+});
+
+promptInput.addEventListener("paste", async (e) => {
+  const items = Array.from(e.clipboardData?.items || []);
+  const imageFiles = items
+    .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+    .map((it) => it.getAsFile())
+    .filter(Boolean);
+  if (imageFiles.length > 0) {
+    e.preventDefault();
+    await handleFilesAdded(imageFiles);
+  }
+});
+
 menuShareTabsBtn.addEventListener("click", async (e) => {
   e.stopPropagation();
   closeAllPopovers();
@@ -1433,22 +2532,38 @@ menuShareTabsBtn.addEventListener("click", async (e) => {
   tabsPopover.classList.remove("hidden");
 });
 
+pickElementBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleElementPickerFromUI();
+});
+
+menuPickElementBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleElementPickerFromUI();
+});
+
 screenshotBtn.addEventListener("click", async (e) => {
   e.stopPropagation();
   closeAllPopovers();
   screenshotBtn.disabled = true;
   try {
-    const res = await chrome.runtime.sendMessage({
+    const res = await sendRuntimeMessage({
       type: "sidepanel:captureScreenshot",
       windowId: state.activeTab?.windowId ?? null,
     });
     if (res?.ok && res.base64) {
       state.screenshot = { dataUrl: res.dataUrl, base64: res.base64 };
       renderAttachmentChips();
+      syncSendButtonState();
     }
   } finally {
     screenshotBtn.disabled = false;
   }
+});
+
+menuRecordBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  startWorkflowRecordingFromUI();
 });
 
 menuShortcutsBtn.addEventListener("click", (e) => {
@@ -1464,11 +2579,11 @@ groupMentionedBtn.addEventListener("click", async () => {
     ids.unshift(state.activeTab.tabId);
   }
   if (ids.length === 0) return;
-  await chrome.runtime.sendMessage({
+  await sendRuntimeMessage({
     type: "sidepanel:groupTabsNow",
     payload: {
       tabIds: ids,
-      title: state.sessionTitle === "Antigravity" ? "Antigravity" : state.sessionTitle.slice(0, 22),
+      title: state.sessionTitle === "New thread" ? "Antigravity" : state.sessionTitle.slice(0, 22),
       color: "blue",
     },
   });
@@ -1484,10 +2599,10 @@ openSaveShortcutBtn.addEventListener("click", () => {
 });
 
 customScModeGroup.addEventListener("click", (e) => {
-  const btn = e.target.closest(".tonal-seg-btn");
+  const btn = e.target.closest(".seg-btn");
   if (!btn) return;
   state.customScMode = btn.dataset.scMode || "chat";
-  for (const el of customScModeGroup.querySelectorAll(".tonal-seg-btn")) {
+  for (const el of customScModeGroup.querySelectorAll(".seg-btn")) {
     el.classList.toggle("active", el === btn);
   }
 });
@@ -1497,7 +2612,7 @@ saveCustomScBtn.addEventListener("click", async () => {
   const title = document.getElementById("custom-sc-title").value.trim();
   const prompt = document.getElementById("custom-sc-prompt").value.trim();
   if (!command || !prompt) return;
-  const res = await chrome.runtime.sendMessage({
+  const res = await sendRuntimeMessage({
     type: "sidepanel:saveShortcut",
     payload: { command, title, prompt, interactionMode: state.customScMode },
   });
@@ -1509,6 +2624,49 @@ saveCustomScBtn.addEventListener("click", async () => {
     document.getElementById("custom-sc-prompt").value = "";
     renderSlashPopover("");
   }
+});
+
+// Voice Dictation (Web Speech API)
+const SpeechRecCtor = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
+if (!SpeechRecCtor) {
+  voiceBtn.classList.add("hidden");
+} else {
+  voiceBtn.addEventListener("click", () => {
+    if (isListeningVoice && speechRecognition) {
+      speechRecognition.stop();
+      return;
+    }
+    try {
+      speechRecognition = new SpeechRecCtor();
+      speechRecognition.continuous = false;
+      speechRecognition.interimResults = false;
+      speechRecognition.onstart = () => {
+        isListeningVoice = true;
+        voiceBtn.classList.add("listening");
+      };
+      speechRecognition.onresult = (ev) => {
+        const transcript = ev.results?.[0]?.[0]?.transcript || "";
+        if (transcript) {
+          promptInput.value = `${promptInput.value}${promptInput.value ? " " : ""}${transcript.trim()}`;
+          promptInput.dispatchEvent(new Event("input"));
+          promptInput.focus();
+        }
+      };
+      speechRecognition.onend = () => {
+        isListeningVoice = false;
+        voiceBtn.classList.remove("listening");
+      };
+      speechRecognition.onerror = () => {
+        isListeningVoice = false;
+        voiceBtn.classList.remove("listening");
+      };
+      speechRecognition.start();
+    } catch {}
+  });
+}
+
+promptInput.addEventListener("focus", () => {
+  refreshLiveSelectionFromActiveTab();
 });
 
 promptInput.addEventListener("input", () => {
@@ -1537,50 +2695,142 @@ promptInput.addEventListener("input", () => {
 });
 
 promptInput.addEventListener("keydown", (e) => {
+  const slashOpen = !slashPopover.classList.contains("hidden");
+  const tabsOpen = !tabsPopover.classList.contains("hidden");
+  if ((slashOpen || tabsOpen) && !e.isComposing) {
+    const activeList = slashOpen ? slashListEl : tabsPickerListEl;
+    const rows = activeList.querySelectorAll(".popover-item");
+    if (rows.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        state.kbActiveIndex += 1;
+        syncPopoverKeyboardHighlight(activeList);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        state.kbActiveIndex -= 1;
+        syncPopoverKeyboardHighlight(activeList);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        const targetRow = rows[state.kbActiveIndex];
+        if (targetRow) {
+          e.preventDefault();
+          targetRow.click();
+          return;
+        }
+      }
+    }
+  }
+
   if (e.key === "Escape") {
+    if (state.picker.active) {
+      sendRuntimeMessage({ type: "sidepanel:cancelElementPicker" }).then((res) => {
+        renderPickerUI(res?.picker || { active: false, tabId: null });
+      });
+    }
     closeAllPopovers();
     return;
   }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
-    sendPromptNow();
-  }
-});
-
-sendBtn.addEventListener("click", () => sendPromptNow());
-
-// Live Runtime Port & Initial Bootstrap
-const livePort = chrome.runtime.connect({ name: "ag-sidepanel" });
-livePort.onMessage.addListener((msg) => {
-  if (!msg || typeof msg !== "object") return;
-  if (msg.type === "sidepanel:bridgeStatus") {
-    renderBridgeStatus(msg.status);
-  } else if (msg.type === "sidepanel:tabsChanged") {
-    refreshTabsList();
-  } else if (msg.type === "sidepanel:agentEvent") {
-    handleIncomingAgentEvent(msg.payload);
-  } else if (msg.type === "sidepanel:sessionsUpdated") {
-    state.sessions = msg.sessions || [];
-    if (!historyDrawer.classList.contains("hidden")) renderHistoryDrawer();
-  } else if (msg.type === "sidepanel:schedulesUpdated") {
-    state.schedules = msg.tasks || [];
-    if (!historyDrawer.classList.contains("hidden") && !drawerPanelSchedules.classList.contains("hidden")) {
-      renderSchedulesDrawer();
+    if (!state.running) {
+      sendPromptNow();
     }
   }
 });
 
+sendBtn.addEventListener("click", () => {
+  if (state.running) {
+    stopRunningPrompt();
+  } else {
+    sendPromptNow();
+  }
+});
+
+// Live Runtime Port & Initial Bootstrap
+if (hasExtensionRuntime && chrome.runtime?.connect) {
+  const livePort = chrome.runtime.connect({ name: "ag-sidepanel" });
+  livePort.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "sidepanel:bridgeStatus") {
+      renderBridgeStatus(msg.status);
+    } else if (msg.type === "sidepanel:tabsChanged") {
+      refreshTabsList();
+    } else if (msg.type === "sidepanel:agentEvent") {
+      handleIncomingAgentEvent(msg.payload);
+    } else if (msg.type === "sidepanel:sessionsUpdated") {
+      state.sessions = msg.sessions || [];
+      if (!historyDrawer.classList.contains("hidden")) renderHistoryDrawer();
+    } else if (msg.type === "sidepanel:schedulesUpdated") {
+      state.schedules = msg.tasks || [];
+      if (!historyDrawer.classList.contains("hidden") && !drawerPanelSchedules.classList.contains("hidden")) {
+        renderSchedulesDrawer();
+      }
+    } else if (msg.type === "sidepanel:sitePermissionsUpdated") {
+      state.sitePermissions = msg.permissions || {};
+      syncSharedPageChipUI();
+    } else if (msg.type === "sidepanel:settingsUpdated") {
+      state.settings = { ...state.settings, ...(msg.settings || {}) };
+      applyTheme(state.settings.theme);
+      updateWorkspaceBadgeUI();
+    } else if (msg.type === "sidepanel:browserActivity") {
+      state.activityLog = msg.activityLog || [];
+      renderActivityStreamUI();
+    } else if (msg.type === "sidepanel:browserActivityCleared") {
+      state.activityLog = [];
+      renderActivityStreamUI();
+    } else if (msg.type === "sidepanel:recordingUpdated") {
+      renderRecordingUI(msg.recording);
+    } else if (msg.type === "sidepanel:pickerState") {
+      renderPickerUI(msg.picker);
+    } else if (msg.type === "sidepanel:elementPicked") {
+      renderPickerUI(msg.picker || { active: false, tabId: null });
+      if (msg.element && state.pickedElements.length < 8) {
+        state.pickedElements.push({
+          id: `pick-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          ...msg.element,
+        });
+        renderAttachmentChips();
+        syncSendButtonState();
+        promptInput.focus();
+      }
+    } else if (msg.type === "sidepanel:quoteSelection" && msg.selectionText) {
+      state.dismissedSelectionText = "";
+      state.liveSelection = String(msg.selectionText).trim();
+      syncSelectionChipUI();
+      promptInput.focus();
+    }
+  });
+}
+
 (async function bootstrap() {
+  applyTheme("system");
   updateGreetingByTime();
   updateModeUI();
+  updateApprovalUI();
   renderModelMenu();
   syncSendButtonState();
+  if (!hasExtensionRuntime) return;
   try {
-    const init = await chrome.runtime.sendMessage({ type: "sidepanel:init" });
+    const init = await sendRuntimeMessage({ type: "sidepanel:init" });
     if (init?.ok) {
       state.sessions = init.sessions || [];
       state.shortcuts = init.shortcuts || { builtin: [], custom: [] };
       state.schedules = init.schedules || [];
+      state.sitePermissions = init.sitePermissions || {};
+      if (init.settings) {
+        state.settings = { ...state.settings, ...init.settings };
+        state.permissionMode = state.settings.defaultApprovalMode || "auto";
+      }
+      state.activityLog = init.activityLog || [];
+      applyTheme(state.settings.theme);
+      updateWorkspaceBadgeUI();
+      updateApprovalUI();
+      renderActivityStreamUI();
+      renderRecordingUI(init.recording);
+      renderPickerUI(init.picker);
       updateActiveTabBar(init.tabs || []);
       populateAgentCatalog(init.agentStatus);
       renderBridgeStatus(init.bridgeStatus);

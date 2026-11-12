@@ -285,6 +285,7 @@ class AcpSidePanelBridge {
     this.pendingRpc = new Map(); // id -> { resolve, reject, timer }
     this.loadedSessions = new Set();
     this.sessionPromptContext = new Map(); // sessionId -> { requestId, autoApprovePermissions, title, replayCollector }
+    this.canceledRequests = new Set(); // requestIds canceled while cold-starting
     this.pendingPermissions = new Map(); // permRequestId -> { acpId, sessionId }
     this.nextPermId = 1;
     this.chromeSessionIds = loadChromeSessionRegistry();
@@ -619,9 +620,34 @@ class AcpSidePanelBridge {
     };
   }
 
+  resolveTargetCwd(rawCwd) {
+    const isDir = (dirPath) => {
+      try {
+        return Boolean(dirPath) && fs.statSync(dirPath).isDirectory();
+      } catch {
+        return false;
+      }
+    };
+    if (rawCwd && typeof rawCwd === "string") {
+      let candidate = rawCwd.trim();
+      if (candidate === "~") {
+        candidate = HOME_DIR;
+      } else if (candidate.startsWith("~/")) {
+        candidate = path.join(HOME_DIR, candidate.slice(2));
+      }
+      if (candidate) {
+        const resolved = path.resolve(candidate);
+        if (isDir(resolved)) {
+          return resolved;
+        }
+      }
+    }
+    return isDir(DEFAULT_ACP_CWD) ? DEFAULT_ACP_CWD : HOME_DIR;
+  }
+
   async createSession({ cwd, systemPromptAppend, modeId, modelId } = {}) {
     await this.ensureInitialized();
-    const targetCwd = cwd && fs.existsSync(cwd) ? cwd : fs.existsSync(DEFAULT_ACP_CWD) ? DEFAULT_ACP_CWD : HOME_DIR;
+    const targetCwd = this.resolveTargetCwd(cwd);
     const appendText = [DEFAULT_CHROME_SYSTEM_PROMPT, systemPromptAppend].filter(Boolean).join("\n\n");
     const res = await this.sendAcpRpc(
       "session/new",
@@ -668,7 +694,7 @@ class AcpSidePanelBridge {
   async loadSession({ sessionId, cwd } = {}) {
     const sid = this.assertChromeSessionAllowed(sessionId);
     await this.ensureInitialized();
-    const targetCwd = cwd && fs.existsSync(cwd) ? cwd : fs.existsSync(DEFAULT_ACP_CWD) ? DEFAULT_ACP_CWD : HOME_DIR;
+    const targetCwd = this.resolveTargetCwd(cwd);
 
     // Close first if already active in memory so `session/load` cleanly replays latest transcript
     if (this.loadedSessions.has(sid)) {
@@ -772,7 +798,7 @@ class AcpSidePanelBridge {
     const sid = this.assertChromeSessionAllowed(sessionId);
     await this.ensureInitialized();
     if (this.loadedSessions.has(sid)) return sid;
-    const targetCwd = cwd && fs.existsSync(cwd) ? cwd : fs.existsSync(DEFAULT_ACP_CWD) ? DEFAULT_ACP_CWD : HOME_DIR;
+    const targetCwd = this.resolveTargetCwd(cwd);
     const res = await this.sendAcpRpc(
       "session/resume",
       {
@@ -797,6 +823,18 @@ class AcpSidePanelBridge {
     systemPromptAppend = "",
     cwd = null,
   } = {}) {
+    const reqKey = requestId ? String(requestId) : "";
+    if (reqKey && this.canceledRequests.has(reqKey)) {
+      this.canceledRequests.delete(reqKey);
+      return {
+        ok: true,
+        sessionId: sessionId ? String(sessionId).trim() : null,
+        title: null,
+        stopReason: "cancelled",
+        usage: null,
+      };
+    }
+
     let sid = sessionId ? String(sessionId).trim() : "";
     if (!sid) {
       const created = await this.createSession({ cwd, systemPromptAppend, modeId, modelId });
@@ -818,6 +856,17 @@ class AcpSidePanelBridge {
       if (modelId) {
         await this.sendAcpRpc("session/set_model", { sessionId: sid, modelId }, 10_000).catch(() => {});
       }
+    }
+
+    if (reqKey && this.canceledRequests.has(reqKey)) {
+      this.canceledRequests.delete(reqKey);
+      return {
+        ok: true,
+        sessionId: sid,
+        title: null,
+        stopReason: "cancelled",
+        usage: null,
+      };
     }
 
     const blocks =
@@ -850,6 +899,9 @@ class AcpSidePanelBridge {
         usage: promptRes?.usage || null,
       };
     } finally {
+      if (reqKey) {
+        this.canceledRequests.delete(reqKey);
+      }
       this.sessionPromptContext.delete(sid);
       for (const [permId, permInfo] of Array.from(this.pendingPermissions.entries())) {
         if (permInfo.sessionId === sid) {
@@ -859,8 +911,34 @@ class AcpSidePanelBridge {
     }
   }
 
-  async cancel({ sessionId } = {}) {
-    const sid = this.assertChromeSessionAllowed(sessionId);
+  async cancel({ sessionId, requestId } = {}) {
+    const reqKey = requestId ? String(requestId).trim() : "";
+    if (reqKey) {
+      if (this.canceledRequests.size >= 200) {
+        const oldest = this.canceledRequests.values().next().value;
+        if (oldest) this.canceledRequests.delete(oldest);
+      }
+      this.canceledRequests.add(reqKey);
+    }
+
+    let rawSid = sessionId ? String(sessionId).trim() : "";
+    if (!rawSid && reqKey) {
+      for (const [activeSid, ctx] of this.sessionPromptContext.entries()) {
+        if (ctx && String(ctx.requestId || "") === reqKey) {
+          rawSid = activeSid;
+          break;
+        }
+      }
+    }
+
+    if (!rawSid) {
+      if (reqKey) {
+        return { ok: true, sessionId: null, deferredCancel: true, requestId: reqKey };
+      }
+      throw Object.assign(new Error("Missing sessionId"), { code: -32602 });
+    }
+
+    const sid = this.assertChromeSessionAllowed(rawSid);
     for (const [permId, permInfo] of Array.from(this.pendingPermissions.entries())) {
       if (permInfo.sessionId === sid) {
         this.pendingPermissions.delete(permId);
@@ -957,6 +1035,7 @@ class AcpSidePanelBridge {
     } catch {}
     this.proc = null;
     this.initPromise = null;
+    this.canceledRequests.clear();
   }
 }
 

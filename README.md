@@ -62,11 +62,12 @@ No `--remote-debugging-port` flags or browser restarts required! To enable the d
 
 ### How the Two-Way Bridge Works (Claude in Chrome & Codex Parity)
 
-- **Docked Webpage Chat Bar (`sidepanel.html`)**:
-  - **Chat Mode (Reader — Zero Debugger Banner)**: Automatically reads the active tab's content, headings, and highlighted selection (plus multi-tab `@` mentions and `📷` screenshots) without attaching `chrome.debugger`.
-  - **Agent Mode (Browser Control)**: Lets Antigravity click, type, fill forms, upload/download files, and organize color-coded Tab Groups right inside your logged-in browser.
-  - **Slash Shortcuts (`/`) & Scheduled Tasks (`⏰`)**: Run built-in or custom saved `/shortcuts` (`/summarize`, `/extract-table`, `/audit-page`, `/organize-tabs`) and schedule recurring browser workflows via `chrome.alarms`.
-  - **Permission Modes (`Auto` / `Ask` / `Plan`) & Live Model Picker**: Choose your model and approve sensitive actions inline.
+- **Docked Webpage Chat Bar (`sidepanel.html` — Authentic New Google Gemini Look + Codex in Chrome Parity)**:
+  - **Chat Mode (Reader — Zero Debugger Banner)**: Automatically shares bounded active-page context, headings, and live highlighted selection (with 1-click context preview and per-site `Allow` / `Ask every time` / `Block` governance), plus multi-tab `@` mentions, local file/image drag-and-drop & clipboard paste, and 1-click screenshots without attaching `chrome.debugger`.
+  - **Interactive Webpage Element Picker (`Pick element`)**: Hover and click any element on the live webpage (Trusted-Types-safe, zero debugger banner) to attach its CSS selector, ARIA role/label, bounding box, computed styles, and sanitized HTML snippet directly into your prompt.
+  - **Agent Mode (Browser Control) & Live Activity Stream**: Lets Antigravity click, type, fill forms, upload/download files, and organize color-coded Tab Groups inside your logged-in browser with an expandable chronological Activity Stream.
+  - **Workflow Demonstration Recorder, Slash Shortcuts (`/`) & Scheduled Tasks (`⏰`)**: Record up to 120 webpage actions (with automatic password redaction) into reusable `/shortcuts`, run built-in or `agy` skills, and schedule recurring browser workflows via `chrome.alarms`.
+  - **Permission Modes (`Auto` / `Ask` / `Full`), Workspace `cwd` & Live Model Picker**: Choose your model from the top-left Gemini selector, configure workspace directory & custom instructions, and approve sensitive actions inline.
 - **Exact One-Way Session Sync + Two-Way Browser Control**:
   - **Start in Chrome → View in Desktop App**: Conversations started inside the **Antigravity in Chrome Side Panel** run via `agy acp --app-data-dir antigravity`, so they **automatically appear inside your Antigravity Desktop App** where you can view or continue them anytime (click **`↗`** in the Side Panel header to jump straight to `Antigravity.app`).
   - **Start in Desktop App → Control Browser Tabs**: Conversations started inside the **Antigravity Desktop App** control your live Brave/Chrome tabs seamlessly via the Native Messaging Unix socket bridge, and are intentionally **not** opened inside the Chrome Side Panel's chat list.
