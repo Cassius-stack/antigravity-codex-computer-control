@@ -249,9 +249,9 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 4px;
+  gap: 2px;
   height: 46px;
-  padding: 0 8px;
+  padding: 0 6px;
   flex-shrink: 0;
 }
 
@@ -271,6 +271,7 @@ textarea:focus-visible {
 }
 
 .icon-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -284,6 +285,22 @@ textarea:focus-visible {
   cursor: pointer;
   flex-shrink: 0;
   transition: background 140ms var(--ease-standard), color 140ms var(--ease-standard);
+}
+
+.topbar .icon-btn {
+  width: 28px;
+  height: 28px;
+}
+
+.settings-active-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-blue);
+  pointer-events: none;
 }
 
 .icon-btn.xs {
@@ -304,16 +321,16 @@ textarea:focus-visible {
 .top-model-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   height: 32px;
-  padding: 0 6px 0 5px;
+  padding: 0 5px 0 4px;
   border: 1px solid transparent;
   border-radius: 999px;
   background: transparent;
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 500;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.012em;
   cursor: pointer;
   min-width: 0;
   max-width: 100%;
@@ -339,30 +356,59 @@ textarea:focus-visible {
 .model-effort-tag {
   display: inline-flex;
   align-items: center;
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--text-muted);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 500;
-  line-height: 1.4;
+  line-height: 1.35;
   flex-shrink: 0;
 }
 
 .workspace-mini-tag {
   display: inline-flex;
   align-items: center;
-  max-width: 68px;
+  max-width: 140px;
   padding: 1px 6px;
   border-radius: 6px;
-  background: var(--surface-2);
-  color: var(--text-muted);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.popover-workspace-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 9px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.popover-workspace-row:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.popover-workspace-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .chevron-xs {
@@ -375,15 +421,16 @@ textarea:focus-visible {
   transform: rotate(180deg);
 }
 
-/* Bridge Status Indicator: Minimal Dot When Live, Pill Label When Offline */
+/* Bridge Status Indicator: Compact Status Dot in Side Panel Header */
 .companion-pill {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 5px;
+  width: 24px;
+  min-width: 24px;
   height: 28px;
-  min-width: 28px;
-  padding: 0 7px;
+  padding: 0;
   border-radius: 999px;
   border: 1px solid transparent;
   background: transparent;
@@ -407,19 +454,11 @@ textarea:focus-visible {
   flex-shrink: 0;
 }
 
-/* Hide "Live" text when connected so narrow Side Panels remain clean & uncrowded */
-.companion-pill:not(.offline) {
-  min-width: 22px;
-  width: 22px;
-  padding: 0;
-}
-
-.companion-pill:not(.offline) #bridge-pill-text {
+.companion-pill #bridge-pill-text {
   display: none;
 }
 
 .companion-pill.offline {
-  padding: 0 9px;
   background: var(--tonal-amber-bg);
   border-color: rgba(253, 214, 99, 0.25);
   color: var(--accent-amber);
@@ -427,6 +466,17 @@ textarea:focus-visible {
 
 .companion-pill.offline .companion-dot {
   background: var(--accent-amber);
+}
+
+@media (min-width: 430px) {
+  .companion-pill.offline {
+    width: auto;
+    padding: 0 9px;
+  }
+
+  .companion-pill.offline #bridge-pill-text {
+    display: inline;
+  }
 }
 
 /* ============================================================================
@@ -1221,70 +1271,6 @@ html[data-theme="light"] .glass-textarea {
   line-height: 1.22;
   letter-spacing: -0.025em;
   color: var(--text-strong);
-}
-
-/* Codex in Chrome Bounded Active Page Context Card */
-.active-page-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 11px;
-  border-radius: 16px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-}
-
-.active-page-card-main {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
-}
-
-.page-card-favicon,
-.page-card-globe {
-  width: 16px;
-  height: 16px;
-  border-radius: 4px;
-  flex-shrink: 0;
-  color: var(--text-muted);
-}
-
-.active-page-card-copy {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.active-page-card-title {
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.active-page-card-meta {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.site-policy-tag {
-  color: var(--accent-green);
-  font-weight: 500;
-}
-
-.site-policy-tag.policy-ask {
-  color: var(--accent-amber);
-}
-
-.site-policy-tag.policy-block {
-  color: var(--accent-coral);
 }
 
 /* New Gemini Tonal Suggestion Chips */
@@ -2092,6 +2078,57 @@ html[data-theme="light"] .glass-textarea {
   max-width: 196px;
 }
 
+.shared-page-chip {
+  max-width: min(268px, 100%);
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.shared-page-chip:hover {
+  border-color: var(--border-strong);
+}
+
+.shared-page-chip.is-ask {
+  border-color: rgba(253, 214, 99, 0.34);
+}
+
+.shared-page-chip.is-blocked {
+  padding-right: 8px;
+  border-color: rgba(242, 139, 130, 0.34);
+  background: rgba(242, 139, 130, 0.08);
+  color: var(--text-muted);
+}
+
+.shared-page-policy-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+.shared-page-policy-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  flex-shrink: 0;
+}
+
+.shared-page-policy-tag.policy-ask {
+  background: var(--tonal-amber-bg);
+  color: var(--accent-amber);
+}
+
+.shared-page-policy-tag.policy-block {
+  background: rgba(242, 139, 130, 0.16);
+  color: var(--accent-coral);
+}
+
 html[data-theme="light"] .shared-page-chip,
 html[data-theme="light"] .selection-quote-chip,
 html[data-theme="light"] .removable-chip,
@@ -2407,20 +2444,10 @@ html[data-theme="light"] .mode-pill-opt.active {
     padding: 0 5px;
   }
 
-  .topbar .icon-btn {
-    width: 28px;
-    height: 28px;
-  }
-
   .top-model-pill {
     font-size: 12.5px;
-    gap: 4px;
-    padding: 0 5px;
-  }
-
-  .workspace-mini-tag,
-  .model-effort-tag {
-    display: none !important;
+    gap: 3.5px;
+    padding: 0 4px;
   }
 
   .composer-dock {
@@ -2450,6 +2477,12 @@ html[data-theme="light"] .mode-pill-opt.active {
   .approval-inline-pill {
     padding: 0 5px;
     gap: 4px;
+  }
+}
+
+@media (max-width: 334px) {
+  .model-effort-tag {
+    display: none !important;
   }
 }
 

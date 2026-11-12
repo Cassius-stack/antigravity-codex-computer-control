@@ -162,24 +162,92 @@ let pickerState = {
   startedAt: 0,
 };
 
+function normalizeSiteHost(rawHostOrUrl) {
+  const raw = String(rawHostOrUrl || "").trim();
+  if (!raw) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+      return parsed.hostname.toLowerCase().replace(/^www\./, "").replace(/\.+$/, "");
+    } catch {
+      return "";
+    }
+  }
+  const stripped = raw
+    .toLowerCase()
+    .replace(/\/.*$/, "")
+    .replace(/\.+$/, "");
+  if (!stripped) return "";
+  if (stripped.startsWith("[")) {
+    const endBracket = stripped.indexOf("]");
+    return endBracket > 0 ? stripped.slice(0, endBracket + 1) : stripped;
+  }
+  const hostOnly = stripped.includes(":") && stripped.indexOf(":") === stripped.lastIndexOf(":")
+    ? stripped.replace(/:\d+$/, "")
+    : stripped;
+  return hostOnly.replace(/^www\./, "").replace(/\.+$/, "");
+}
+
+function getHostCandidateChain(rawHost) {
+  const host = normalizeSiteHost(rawHost);
+  if (!host) return [];
+  if (host.startsWith("[") || host.includes(":") || /^\d+(?:\.\d+){3}$/.test(host)) {
+    return [host];
+  }
+  const parts = host.split(".").filter(Boolean);
+  if (parts.length <= 1) return parts;
+  const chain = [];
+  for (let i = 0; i <= parts.length - 2; i += 1) {
+    chain.push(parts.slice(i).join("."));
+  }
+  return chain;
+}
+
 function normalizeHostFromUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== "string") return "";
   try {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
-    return parsed.hostname.toLowerCase().replace(/^www\./, "");
+    return normalizeSiteHost(parsed.hostname);
   } catch {
     return "";
   }
 }
 
 function getSitePolicyForHost(rawHost) {
-  const host = String(rawHost || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^www\./, "");
-  if (!host) return "allow";
-  return sitePermissions.get(host) || "allow";
+  const candidates = getHostCandidateChain(rawHost);
+  for (const candidate of candidates) {
+    const rule = sitePermissions.get(candidate);
+    if (rule === "allow" || rule === "ask" || rule === "block") {
+      return rule;
+    }
+  }
+  return "allow";
+}
+
+function getInheritedParentPolicyForHost(rawHost) {
+  const candidates = getHostCandidateChain(rawHost).slice(1);
+  for (const ancestor of candidates) {
+    const rule = sitePermissions.get(ancestor);
+    if (rule === "allow" || rule === "ask" || rule === "block") {
+      return rule;
+    }
+  }
+  return "allow";
+}
+
+function isHostConfirmedForSession(rawHost, confirmedHostsSet) {
+  if (!confirmedHostsSet || confirmedHostsSet.size === 0) return false;
+  const candidates = getHostCandidateChain(rawHost);
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    if (confirmedHostsSet.has(candidate)) return true;
+    if (i < candidates.length - 1 && sitePermissions.get(candidate) === "ask") {
+      return false;
+    }
+  }
+  return false;
 }
 
 function getSitePolicyForUrl(rawUrl) {
@@ -196,20 +264,21 @@ function getSitePermissionsSnapshot() {
 
 async function setSitePermissionForHost(rawHost, rawPolicy) {
   await ensureLocalStateLoaded();
-  const host = String(rawHost || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/^www\./, "");
+  const host = normalizeSiteHost(rawHost);
   if (!host) throw new Error("Valid hostname is required for site access permission.");
-  const policy = ["allow", "ask", "block"].includes(String(rawPolicy || "").toLowerCase())
-    ? String(rawPolicy).toLowerCase()
-    : "allow";
-  if (policy === "allow") {
-    sitePermissions.set(host, "allow");
+  const requested = String(rawPolicy || "").trim().toLowerCase();
+  let effectivePolicy = "allow";
+  if (requested === "reset") {
+    sitePermissions.delete(host);
+    effectivePolicy = getSitePolicyForHost(host);
   } else {
-    sitePermissions.set(host, policy);
+    const policy = ["allow", "ask", "block"].includes(requested) ? requested : "allow";
+    if (policy === "allow" && getInheritedParentPolicyForHost(host) === "allow") {
+      sitePermissions.delete(host);
+    } else {
+      sitePermissions.set(host, policy);
+    }
+    effectivePolicy = getSitePolicyForHost(host);
   }
   const snapshot = getSitePermissionsSnapshot();
   try {
@@ -221,7 +290,7 @@ async function setSitePermissionForHost(rawHost, rawPolicy) {
     type: "sidepanel:sitePermissionsUpdated",
     permissions: snapshot,
   });
-  return { ok: true, host, policy, permissions: snapshot };
+  return { ok: true, host, policy: effectivePolicy, permissions: snapshot };
 }
 
 async function saveExtensionSettings(patch = {}) {
@@ -387,9 +456,10 @@ async function ensureLocalStateLoaded() {
       }
     }
     if (data?.agSitePermissions && typeof data.agSitePermissions === "object") {
-      for (const [host, policy] of Object.entries(data.agSitePermissions)) {
-        if (host && ["allow", "ask", "block"].includes(policy)) {
-          sitePermissions.set(host, policy);
+      for (const [rawHost, policy] of Object.entries(data.agSitePermissions)) {
+        const normalizedHost = normalizeSiteHost(rawHost);
+        if (normalizedHost && ["allow", "ask", "block"].includes(policy)) {
+          sitePermissions.set(normalizedHost, policy);
         }
       }
     }
@@ -1198,7 +1268,7 @@ async function checkTabSiteAccessOrPrompt(tabId, confirmedHostsSet) {
     err.code = -32021;
     throw err;
   }
-  if (policy === "ask" && !confirmedHostsSet.has(host)) {
+  if (policy === "ask" && !isHostConfirmedForSession(host, confirmedHostsSet)) {
     return {
       ok: false,
       code: -32020,
@@ -1249,7 +1319,7 @@ async function runSidePanelPrompt({
 
   const confirmedHostsSet = new Set(
     (Array.isArray(siteAccessConfirmedHosts) ? siteAccessConfirmedHosts : [])
-      .map((h) => String(h || "").trim().toLowerCase().replace(/^www\./, ""))
+      .map((h) => normalizeSiteHost(h))
       .filter(Boolean),
   );
 

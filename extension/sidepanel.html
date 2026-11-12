@@ -83,19 +83,18 @@
             id="model-menu-btn"
             aria-haspopup="true"
             aria-expanded="false"
-            title="Switch Gemini / Antigravity model &amp; workspace"
+            title="Switch Gemini / Antigravity model &amp; reasoning effort"
           >
-            <svg class="top-model-spark" viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">
+            <svg class="top-model-spark" viewBox="0 0 32 32" width="14" height="14" aria-hidden="true">
               <use href="#gemini-spark-4c" />
             </svg>
             <span class="top-model-label" id="model-current-label">Gemini 4 Carbon</span>
             <span class="model-effort-tag" id="model-effort-tag">Med</span>
-            <span class="workspace-mini-tag hidden" id="workspace-mini-tag"></span>
             <svg
               class="chevron-xs"
               viewBox="0 0 20 20"
-              width="13"
-              height="13"
+              width="12"
+              height="12"
               fill="none"
               stroke="currentColor"
               stroke-width="1.9"
@@ -142,6 +141,7 @@
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.85">
               <path d="M4 7h9M17 7h3M13 4.8v4.4M4 17h4M12 17h8M8 14.8v4.4" stroke-linecap="round" />
             </svg>
+            <span class="settings-active-dot hidden" id="settings-workspace-dot" aria-hidden="true"></span>
           </button>
 
           <button
@@ -195,6 +195,16 @@
           <button type="button" class="seg-btn" data-perm="ask">Ask</button>
           <button type="button" class="seg-btn" data-perm="full">Full access</button>
         </div>
+
+        <button
+          type="button"
+          class="popover-workspace-row hidden"
+          id="popover-workspace-row"
+          title="Edit workspace directory"
+        >
+          <span class="popover-workspace-label">Workspace</span>
+          <span class="workspace-mini-tag hidden" id="workspace-mini-tag"></span>
+        </button>
 
         <div class="bridge-Popover-row hidden" id="bridge-reconnect-row">
           <span class="bridge-status-caption" id="bridge-label">Offline</span>
@@ -413,7 +423,7 @@
 
       <!-- Main Conversation Viewport -->
       <main class="chat-viewport" id="chat-viewport">
-        <!-- 2026 New Gemini Greeting + Bounded Codex Active Page Card -->
+        <!-- 2026 New Gemini Greeting + Workflow Suggestion Chips -->
         <div class="welcome-state" id="welcome-state">
           <div class="hero-greeting">
             <div class="hero-eyebrow-row">
@@ -423,35 +433,6 @@
               <div class="hero-eyebrow" id="greeting-headline">Hi there</div>
             </div>
             <h1 class="hero-question">Where should we start?</h1>
-          </div>
-
-          <!-- Bounded Active Page Context Card (Codex in Chrome parity) -->
-          <div class="active-page-card hidden" id="welcome-page-card">
-            <div class="active-page-card-main">
-              <img class="page-card-favicon hidden" id="welcome-page-favicon" alt="" width="16" height="16" />
-              <svg
-                class="page-card-globe"
-                id="welcome-page-globe"
-                viewBox="0 0 24 24"
-                width="16"
-                height="16"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-              >
-                <circle cx="12" cy="12" r="8.5" />
-                <path d="M3.8 12h16.4M12 3.5c2.4 2.4 3.7 5.4 3.7 8.5s-1.3 6.1-3.7 8.5c-2.4-2.4-3.7-5.4-3.7-8.5s1.3-6.1 3.7-8.5Z" />
-              </svg>
-              <div class="active-page-card-copy">
-                <div class="active-page-card-title" id="welcome-page-title">Current page</div>
-                <div class="active-page-card-meta">
-                  <span id="welcome-page-host">browser tab</span>
-                  <span>·</span>
-                  <span class="site-policy-tag" id="welcome-site-policy">Allowed</span>
-                </div>
-              </div>
-            </div>
-            <button type="button" class="tonal-btn compact" id="welcome-preview-btn">Preview</button>
           </div>
 
           <!-- 2026 Gemini Colored-Icon Workflow Chips -->
@@ -684,7 +665,7 @@
 
           <!-- Context & Attachment Tray -->
           <div class="context-shelf" id="context-shelf">
-            <div class="shared-page-chip" id="active-tab-chip" title="Click to preview bounded page context">
+            <div class="shared-page-chip" id="active-tab-chip" title="Click to preview bounded page context &amp; site access">
               <button type="button" class="shared-page-inspect-btn" id="inspect-active-tab-btn">
                 <img class="tab-favicon hidden" id="active-tab-favicon" alt="" width="13" height="13" />
                 <svg
@@ -703,6 +684,8 @@
                   />
                 </svg>
                 <span class="shared-page-title" id="active-tab-title">Current page</span>
+                <span class="shared-page-policy-dot hidden" id="active-tab-policy-dot" aria-hidden="true"></span>
+                <span class="shared-page-policy-tag hidden" id="active-tab-policy-tag"></span>
               </button>
               <button
                 type="button"

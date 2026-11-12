@@ -16,6 +16,7 @@ const state = {
   permissionMode: "auto", // "auto" | "ask" | "full"
   modelId: "gemini-4-carbon-medium",
   thoughtLevel: "medium", // "low" | "medium" | "high"
+  userSelectedModel: false,
   models: [
     { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
     { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
@@ -103,12 +104,14 @@ const bridgeStatusPill = document.getElementById("bridge-status-pill");
 const bridgePillText = document.getElementById("bridge-pill-text");
 const headerOpenAppBtn = document.getElementById("header-open-app-btn");
 const settingsBtn = document.getElementById("settings-btn");
+const settingsWorkspaceDotEl = document.getElementById("settings-workspace-dot");
 const newChatBtn = document.getElementById("new-chat-btn");
 
 const modelPopover = document.getElementById("model-popover");
 const modelOptionsListEl = document.getElementById("model-options-list");
 const thoughtLevelSegmentedEl = document.getElementById("thought-level-segmented");
 const permissionSegmentedEl = document.getElementById("permission-segmented");
+const popoverWorkspaceRowEl = document.getElementById("popover-workspace-row");
 const bridgeReconnectRow = document.getElementById("bridge-reconnect-row");
 const bridgeLabelEl = document.getElementById("bridge-label");
 const bridgeStatusBtn = document.getElementById("bridge-status-btn");
@@ -175,13 +178,6 @@ const drawerActivityListEl = document.getElementById("drawer-activity-list");
 const chatViewport = document.getElementById("chat-viewport");
 const welcomeStateEl = document.getElementById("welcome-state");
 const greetingHeadlineEl = document.getElementById("greeting-headline");
-const welcomePageCard = document.getElementById("welcome-page-card");
-const welcomePageFavicon = document.getElementById("welcome-page-favicon");
-const welcomePageGlobe = document.getElementById("welcome-page-globe");
-const welcomePageTitle = document.getElementById("welcome-page-title");
-const welcomePageHost = document.getElementById("welcome-page-host");
-const welcomeSitePolicy = document.getElementById("welcome-site-policy");
-const welcomePreviewBtn = document.getElementById("welcome-preview-btn");
 const quickGridEl = document.getElementById("quick-grid");
 const messagesListEl = document.getElementById("messages-list");
 
@@ -226,6 +222,8 @@ const inspectActiveTabBtn = document.getElementById("inspect-active-tab-btn");
 const activeTabFaviconEl = document.getElementById("active-tab-favicon");
 const activeTabGlobeEl = document.getElementById("active-tab-globe");
 const activeTabTitleEl = document.getElementById("active-tab-title");
+const activeTabPolicyDotEl = document.getElementById("active-tab-policy-dot");
+const activeTabPolicyTagEl = document.getElementById("active-tab-policy-tag");
 const unshareActiveTabBtn = document.getElementById("unshare-active-tab-btn");
 const reshareActiveTabBtn = document.getElementById("reshare-active-tab-btn");
 
@@ -255,25 +253,79 @@ activeTabFaviconEl.addEventListener("error", () => {
   activeTabGlobeEl.classList.remove("hidden");
 });
 
-welcomePageFavicon.addEventListener("error", () => {
-  welcomePageFavicon.classList.add("hidden");
-  welcomePageGlobe.classList.remove("hidden");
-});
+function normalizeSiteHost(rawHostOrUrl) {
+  const raw = String(rawHostOrUrl || "").trim();
+  if (!raw) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+      return parsed.hostname.toLowerCase().replace(/^www\./, "").replace(/\.+$/, "");
+    } catch {
+      return "";
+    }
+  }
+  const stripped = raw
+    .toLowerCase()
+    .replace(/\/.*$/, "")
+    .replace(/\.+$/, "");
+  if (!stripped) return "";
+  if (stripped.startsWith("[")) {
+    const endBracket = stripped.indexOf("]");
+    return endBracket > 0 ? stripped.slice(0, endBracket + 1) : stripped;
+  }
+  const hostOnly = stripped.includes(":") && stripped.indexOf(":") === stripped.lastIndexOf(":")
+    ? stripped.replace(/:\d+$/, "")
+    : stripped;
+  return hostOnly.replace(/^www\./, "").replace(/\.+$/, "");
+}
+
+function getHostCandidateChain(rawHost) {
+  const host = normalizeSiteHost(rawHost);
+  if (!host) return [];
+  if (host.startsWith("[") || host.includes(":") || /^\d+(?:\.\d+){3}$/.test(host)) {
+    return [host];
+  }
+  const parts = host.split(".").filter(Boolean);
+  if (parts.length <= 1) return parts;
+  const chain = [];
+  for (let i = 0; i <= parts.length - 2; i += 1) {
+    chain.push(parts.slice(i).join("."));
+  }
+  return chain;
+}
 
 function parseHost(url) {
   if (!url) return "";
   try {
     const u = new URL(url);
     if (u.protocol !== "http:" && u.protocol !== "https:") return "";
-    return u.hostname.toLowerCase().replace(/^www\./, "");
+    return normalizeSiteHost(u.hostname);
   } catch {
     return "";
   }
 }
 
 function getPolicyForHost(host) {
-  if (!host) return "allow";
-  return state.sitePermissions[host] || "allow";
+  const perms = state.sitePermissions || {};
+  for (const candidate of getHostCandidateChain(host)) {
+    const rule = perms[candidate];
+    if (rule === "allow" || rule === "ask" || rule === "block") {
+      return rule;
+    }
+  }
+  return "allow";
+}
+
+function getInheritedParentPolicy(host) {
+  const perms = state.sitePermissions || {};
+  for (const ancestor of getHostCandidateChain(host).slice(1)) {
+    const rule = perms[ancestor];
+    if (rule === "allow" || rule === "ask" || rule === "block") {
+      return rule;
+    }
+  }
+  return "allow";
 }
 
 function applyTheme(themeChoice = state.settings.theme) {
@@ -555,8 +607,15 @@ function updateWorkspaceBadgeUI() {
     workspaceMiniTagEl.textContent = base;
     workspaceMiniTagEl.title = `Workspace: ${cwd}`;
     workspaceMiniTagEl.classList.remove("hidden");
+    popoverWorkspaceRowEl?.classList.remove("hidden");
+    if (popoverWorkspaceRowEl) popoverWorkspaceRowEl.title = `Workspace: ${cwd} (click to edit)`;
+    settingsWorkspaceDotEl?.classList.remove("hidden");
+    settingsBtn.title = `Site access, workspace (${base}) & custom instructions`;
   } else {
     workspaceMiniTagEl.classList.add("hidden");
+    popoverWorkspaceRowEl?.classList.add("hidden");
+    settingsWorkspaceDotEl?.classList.add("hidden");
+    settingsBtn.title = "Site access, workspace & custom instructions";
   }
 }
 
@@ -686,6 +745,7 @@ function renderModelMenu() {
       ${SVG.check}
     `;
     btn.addEventListener("click", () => {
+      state.userSelectedModel = true;
       state.modelId = resolveFamilyModelIdForEffort(fam, state.thoughtLevel);
       renderModelMenu();
       closeAllPopovers();
@@ -719,7 +779,9 @@ function renderSettingsPopover() {
     btn.disabled = !host;
   }
 
-  const customRules = Object.entries(state.sitePermissions || {}).filter(([, p]) => p && p !== "allow");
+  const customRules = Object.entries(state.sitePermissions || {}).filter(
+    ([ruleHost, p]) => p && (p !== "allow" || getInheritedParentPolicy(ruleHost) !== "allow"),
+  );
   if (customRules.length === 0) {
     configuredSitesListEl.classList.add("hidden");
     configuredSitesListEl.innerHTML = "";
@@ -729,12 +791,12 @@ function renderSettingsPopover() {
     for (const [ruleHost, rulePolicy] of customRules) {
       const chip = document.createElement("span");
       chip.className = "site-rule-chip";
-      chip.innerHTML = `<strong>${escapeHtml(ruleHost)}</strong><span>${escapeHtml(rulePolicy)}</span><button type="button" class="chip-dismiss-btn" title="Reset to Allow">${SVG.closeXs}</button>`;
+      chip.innerHTML = `<strong>${escapeHtml(ruleHost)}</strong><span>${escapeHtml(rulePolicy)}</span><button type="button" class="chip-dismiss-btn" title="Remove site rule">${SVG.closeXs}</button>`;
       chip.querySelector("button").addEventListener("click", async () => {
         const res = await sendRuntimeMessage({
           type: "sidepanel:setSitePermission",
           host: ruleHost,
-          policy: "allow",
+          policy: "reset",
         });
         if (res?.permissions) {
           state.sitePermissions = res.permissions;
@@ -872,12 +934,23 @@ function populateAgentCatalog(agentStatus) {
   }
   if (Array.isArray(agentStatus.models) && agentStatus.models.length > 0) {
     state.models = agentStatus.models;
-    if (!state.models.some((m) => m.modelId === state.modelId)) {
+    if (!state.userSelectedModel && agentStatus.currentModelId && state.models.some((m) => m.modelId === agentStatus.currentModelId)) {
+      state.modelId = agentStatus.currentModelId;
+    } else if (!state.models.some((m) => m.modelId === state.modelId)) {
       state.modelId = agentStatus.currentModelId || state.models[0].modelId;
     }
   }
-  if (agentStatus.currentThoughtLevel && ["low", "medium", "high"].includes(agentStatus.currentThoughtLevel)) {
+  if (
+    !state.userSelectedModel &&
+    agentStatus.currentThoughtLevel &&
+    ["low", "medium", "high"].includes(agentStatus.currentThoughtLevel)
+  ) {
     state.thoughtLevel = agentStatus.currentThoughtLevel;
+    const families = buildGroupedModelFamilies(state.models);
+    const activeFamily = families.find((f) => f.modelIds.has(state.modelId)) || families[0];
+    if (activeFamily) {
+      state.modelId = resolveFamilyModelIdForEffort(activeFamily, state.thoughtLevel);
+    }
   }
   renderModelMenu();
   renderBridgeStatus(state.bridgeStatus);
@@ -899,41 +972,13 @@ function syncSharedPageChipUI() {
   if (!active) {
     activeTabChipEl.classList.add("hidden");
     reshareActiveTabBtn.classList.add("hidden");
-    welcomePageCard.classList.add("hidden");
     return;
   }
 
   const host = parseHost(active.url || "");
   const policy = getPolicyForHost(host);
 
-  // Welcome bounded page context card
-  if (host) {
-    welcomePageCard.classList.remove("hidden");
-    welcomePageTitle.textContent = active.title || host || "Current page";
-    welcomePageHost.textContent = host;
-    welcomeSitePolicy.textContent =
-      policy === "block" ? "Blocked" : policy === "ask" ? "Ask every time" : "Allowed";
-    welcomeSitePolicy.className = `site-policy-tag${
-      policy === "block" ? " policy-block" : policy === "ask" ? " policy-ask" : ""
-    }`;
-    if (active.favIconUrl && /^https?:|^data:/i.test(active.favIconUrl)) {
-      welcomePageFavicon.src = active.favIconUrl;
-      welcomePageFavicon.classList.remove("hidden");
-      welcomePageGlobe.classList.add("hidden");
-    } else {
-      welcomePageFavicon.classList.add("hidden");
-      welcomePageGlobe.classList.remove("hidden");
-    }
-  } else {
-    welcomePageCard.classList.add("hidden");
-  }
-
-  // Composer active tab chip
-  if (state.includeActiveTab && policy !== "block") {
-    activeTabChipEl.classList.remove("hidden");
-    reshareActiveTabBtn.classList.add("hidden");
-    activeTabTitleEl.textContent = active.title || host || "Current page";
-
+  const syncFavicon = () => {
     if (active.favIconUrl && /^https?:|^data:/i.test(active.favIconUrl)) {
       activeTabFaviconEl.src = active.favIconUrl;
       activeTabFaviconEl.classList.remove("hidden");
@@ -942,8 +987,50 @@ function syncSharedPageChipUI() {
       activeTabFaviconEl.classList.add("hidden");
       activeTabGlobeEl.classList.remove("hidden");
     }
+  };
+
+  if (policy === "block" && host) {
+    activeTabChipEl.classList.remove("hidden", "is-ask");
+    activeTabChipEl.classList.add("is-blocked");
+    activeTabChipEl.title = `Site access blocked for ${host} — click to inspect or change access`;
+    reshareActiveTabBtn.classList.add("hidden");
+    unshareActiveTabBtn.classList.add("hidden");
+    activeTabTitleEl.textContent = active.title || host;
+    activeTabPolicyDotEl?.classList.add("hidden");
+    if (activeTabPolicyTagEl) {
+      activeTabPolicyTagEl.textContent = "Blocked";
+      activeTabPolicyTagEl.className = "shared-page-policy-tag policy-block";
+    }
+    syncFavicon();
+    return;
+  }
+
+  activeTabChipEl.classList.remove("is-blocked");
+  unshareActiveTabBtn.classList.remove("hidden");
+
+  if (state.includeActiveTab && policy !== "block") {
+    activeTabChipEl.classList.remove("hidden");
+    activeTabChipEl.classList.toggle("is-ask", Boolean(host && policy === "ask"));
+    activeTabChipEl.title = host
+      ? `Sharing ${host} (${policy === "ask" ? "Ask every time" : "Allowed"}) — click to preview bounded context & site access`
+      : "Click to preview bounded page context";
+    reshareActiveTabBtn.classList.add("hidden");
+    activeTabTitleEl.textContent = active.title || host || "Current page";
+
+    if (host && policy === "ask") {
+      activeTabPolicyDotEl?.classList.add("hidden");
+      if (activeTabPolicyTagEl) {
+        activeTabPolicyTagEl.textContent = "Ask";
+        activeTabPolicyTagEl.className = "shared-page-policy-tag policy-ask";
+      }
+    } else {
+      activeTabPolicyTagEl?.classList.add("hidden");
+      activeTabPolicyDotEl?.classList.toggle("hidden", !host);
+    }
+    syncFavicon();
   } else {
     activeTabChipEl.classList.add("hidden");
+    activeTabChipEl.classList.remove("is-ask");
     reshareActiveTabBtn.classList.toggle("hidden", policy === "block");
   }
 }
@@ -2415,6 +2502,7 @@ if (thoughtLevelSegmentedEl) {
     const btn = e.target.closest(".seg-btn");
     if (!btn || !btn.dataset.thought) return;
     const nextThought = btn.dataset.thought;
+    state.userSelectedModel = true;
     state.thoughtLevel = nextThought;
     const families = buildGroupedModelFamilies(state.models);
     const activeFamily = families.find((f) => f.modelIds.has(state.modelId)) || families[0];
@@ -2619,7 +2707,7 @@ scheduleForm.addEventListener("submit", async (e) => {
   }
 });
 
-// Welcome Page & Workflow Chips
+// Active Page Preview & Workflow Chips
 inspectActiveTabBtn.addEventListener("click", (e) => {
   e.stopPropagation();
   if (!pagePreviewPopover.classList.contains("hidden")) {
@@ -2629,9 +2717,12 @@ inspectActiveTabBtn.addEventListener("click", (e) => {
   }
 });
 
-welcomePreviewBtn.addEventListener("click", (e) => {
+popoverWorkspaceRowEl?.addEventListener("click", (e) => {
   e.stopPropagation();
-  openBoundedPagePreview();
+  closeAllPopovers();
+  renderSettingsPopover();
+  settingsPopover.classList.remove("hidden");
+  settingsCwdInput.focus();
 });
 
 closePagePreviewBtn.addEventListener("click", () => pagePreviewPopover.classList.add("hidden"));

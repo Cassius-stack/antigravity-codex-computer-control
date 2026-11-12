@@ -42,6 +42,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
+        let rawPrefix = ProcessInfo.processInfo.environment["AG_WINDOW_PREFIX"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let windowPrefix = rawPrefix.isEmpty ? "AGTestWindow" : rawPrefix
 
         winAlpha = NSWindow(
             contentRect: NSRect(x: 80, y: 120, width: 380, height: 240),
@@ -49,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        winAlpha.title = "AGTestWindow Alpha"
+        winAlpha.title = "\(windowPrefix) Alpha"
         winAlpha.isReleasedWhenClosed = false
         winAlpha.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
@@ -81,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        winBeta.title = "AGTestWindow Beta"
+        winBeta.title = "\(windowPrefix) Beta"
         winBeta.isReleasedWhenClosed = false
         winBeta.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 

@@ -3169,3 +3169,351 @@ rl.on("line", (line) => {
     "Navigating active Element Picker tab to non-injectable URL must auto-clear pickerState",
   );
 });
+
+test("Hierarchical Subdomain Site Governance, Standalone-Safe Popup Runtime, and Consolidated Welcome/Header Layout Contract", async (t) => {
+  // 1. Verify consolidated New Gemini welcome screen + uncrowded 360px header DOM/CSS contract
+  const spHtml = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "sidepanel.html"), "utf8");
+  const spCss = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "sidepanel.css"), "utf8");
+  assert.doesNotMatch(
+    spHtml,
+    /id="welcome-page-card"/,
+    "Welcome screen must not duplicate composer active-page context with a second #welcome-page-card",
+  );
+  assert.match(
+    spHtml,
+    /id="active-tab-chip"[\s\S]*?id="active-tab-policy-dot"[\s\S]*?id="active-tab-policy-tag"/,
+    "Composer #active-tab-chip must consolidate active-page context, site-policy indicators, and preview trigger",
+  );
+  const topbarSlice = spHtml.slice(spHtml.indexOf('<header class="topbar">'), spHtml.indexOf("</header>"));
+  assert.doesNotMatch(
+    topbarSlice,
+    /id="workspace-mini-tag"/,
+    "Topbar #model-menu-btn must not embed #workspace-mini-tag inline where it truncates model names at 360px",
+  );
+  const modelPopoverSlice = spHtml.slice(
+    spHtml.indexOf('id="model-popover"'),
+    spHtml.indexOf('id="settings-popover"'),
+  );
+  assert.match(
+    modelPopoverSlice,
+    /id="popover-workspace-row"[\s\S]*?id="workspace-mini-tag"/,
+    "Active workspace badge must live cleanly inside #model-popover",
+  );
+  assert.match(
+    spCss,
+    /\.companion-pill #bridge-pill-text\s*\{\s*display:\s*none;/,
+    "Narrow Side Panel header must keep #bridge-status-pill compact even when offline so model label never truncates",
+  );
+
+  // 2. Verify popup.js standalone safety (zero raw TypeError strings) & subdomain policy inheritance
+  const popupCode = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "popup.js"), "utf8");
+  function runPopupVm({ chromeMock } = {}) {
+    const makeEl = (id, opts = {}) => {
+      const classes = new Set(opts.initialClasses || []);
+      return {
+        id,
+        textContent: "",
+        disabled: false,
+        dataset: opts.dataset || {},
+        listeners: {},
+        classList: {
+          add: (...cs) => cs.forEach((c) => classes.add(c)),
+          remove: (...cs) => cs.forEach((c) => classes.delete(c)),
+          toggle: (c, force) => {
+            const on = force === undefined ? !classes.has(c) : Boolean(force);
+            if (on) classes.add(c);
+            else classes.delete(c);
+            return on;
+          },
+          contains: (c) => classes.has(c),
+        },
+        addEventListener(ev, fn) {
+          this.listeners[ev] = fn;
+        },
+        querySelectorAll() {
+          return opts.children || [];
+        },
+      };
+    };
+    const segBtns = ["allow", "ask", "block"].map((p) =>
+      makeEl(`seg-${p}`, { initialClasses: p === "allow" ? ["seg-opt", "active"] : ["seg-opt"], dataset: { policy: p } }),
+    );
+    const elements = {
+      "bridge-pill": makeEl("bridge-pill"),
+      "bridge-status-text": makeEl("bridge-status-text"),
+      "browser-label": makeEl("browser-label"),
+      "group-count": makeEl("group-count"),
+      "attached-count": makeEl("attached-count"),
+      "group-summary": makeEl("group-summary"),
+      "reconnect-btn": makeEl("reconnect-btn"),
+      "finish-btn": makeEl("finish-btn"),
+      "open-sidepanel-btn": makeEl("open-sidepanel-btn"),
+      "popup-host-label": makeEl("popup-host-label"),
+      "popup-site-policy": makeEl("popup-site-policy", { children: segBtns }),
+    };
+    const ctx = vm.createContext({
+      document: {
+        documentElement: { dataset: {} },
+        getElementById: (id) => elements[id],
+      },
+      window: { close() {} },
+      URL,
+      Promise,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    });
+    if (chromeMock !== undefined) {
+      ctx.chrome = chromeMock;
+    }
+    vm.runInContext(popupCode, ctx, { filename: "extension/popup.js" });
+    return { elements, segBtns, ctx };
+  }
+
+  // 2a. Standalone `chrome === {}` (like opening file:///.../popup.html in Chromium) and `chrome === undefined`
+  for (const standaloneChrome of [undefined, {}]) {
+    const { elements } = runPopupVm({ chromeMock: standaloneChrome });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.doesNotMatch(
+      elements["group-summary"].textContent,
+      /Cannot read propert|TypeError|undefined/i,
+      `popup.js must never render raw JS TypeError strings (got: ${elements["group-summary"].textContent})`,
+    );
+    assert.match(elements["group-summary"].textContent, /browser toolbar/i);
+  }
+
+  // 2b. Runtime `sendMessage` rejection with raw TypeError or invalidated extension context
+  const { elements: errElements } = runPopupVm({
+    chromeMock: {
+      runtime: {
+        async sendMessage() {
+          throw new TypeError("Cannot read properties of undefined (reading 'sendMessage')");
+        },
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.doesNotMatch(errElements["group-summary"].textContent, /Cannot read propert|TypeError/i);
+  assert.match(errElements["group-summary"].textContent, /waking up|Reconnect/i);
+
+  // 2c. Subdomain inheritance + subdomain override inside popup.js
+  let mockPerms = { "example.com": "block" };
+  let mockTabUrl = "https://sub.example.com/dashboard";
+  const { elements: subElements, segBtns, ctx: subCtx } = runPopupVm({
+    chromeMock: {
+      tabs: {
+        async query() {
+          return [{ id: 7, windowId: 1, url: mockTabUrl }];
+        },
+      },
+      runtime: {
+        async sendMessage(msg) {
+          if (msg.type === "popup:getStatus") {
+            return {
+              nativeConnected: true,
+              browserName: "Brave",
+              sessionGroups: [],
+              attachedTabCount: 0,
+              sitePermissions: mockPerms,
+            };
+          }
+          return { settings: { theme: "dark" } };
+        },
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(subElements["popup-host-label"].textContent, "sub.example.com");
+  assert.equal(segBtns.find((b) => b.dataset.policy === "block").classList.contains("active"), true);
+  assert.equal(segBtns.find((b) => b.dataset.policy === "allow").classList.contains("active"), false);
+
+  mockPerms = { "example.com": "block", "docs.example.com": "allow" };
+  mockTabUrl = "https://api.docs.example.com/v1";
+  await vm.runInContext("refresh()", subCtx);
+  assert.equal(segBtns.find((b) => b.dataset.policy === "allow").classList.contains("active"), true);
+  assert.equal(segBtns.find((b) => b.dataset.policy === "block").classList.contains("active"), false);
+
+  // 3. End-to-End Subdomain Site Access Governance in background.js + Native Host + MCP Socket
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-subdomain-gov-"));
+  const mockAgyPath = path.join(tmpDir, "mock-agy");
+  fs.writeFileSync(
+    mockAgyPath,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+if (process.argv[2] === "models") {
+  process.stdout.write("gemini-4-carbon-medium    Gemini 4 Carbon (Medium)\\n");
+  process.exit(0);
+}
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const { id, method, params } = JSON.parse(line);
+  if (method === "initialize") return send({ jsonrpc: "2.0", id, result: { protocolVersion: 1, agentCapabilities: {} } });
+  if (method === "session/new") return send({ jsonrpc: "2.0", id, result: { sessionId: "sess-sub-1" } });
+  if (method === "session/prompt") {
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } } } });
+    return send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+  }
+  send({ jsonrpc: "2.0", id, result: {} });
+});
+`,
+    { mode: 0o755 },
+  );
+  fs.chmodSync(mockAgyPath, 0o755);
+
+  const env = launchNativeHostWithRealExtension({
+    sockDir: path.join(tmpDir, "socks"),
+    brand: "brave",
+    extraHostEnv: {
+      AGY_BIN: mockAgyPath,
+      AG_ACP_APP_DATA_DIR: "antigravity",
+      AG_ACP_DEFAULT_CWD: tmpDir,
+      AG_CHROME_SESSIONS_FILE: path.join(tmpDir, "sessions.json"),
+    },
+    initialTabs: [
+      { id: 41, windowId: 1, active: true, title: "Sub App", url: "https://sub.example.com/vault" },
+      { id: 42, windowId: 1, active: false, title: "Deep Sub", url: "https://a.b.example.com/secret" },
+      { id: 43, windowId: 1, active: false, title: "Docs Sub", url: "https://docs.example.com/guide" },
+      { id: 44, windowId: 1, active: false, title: "API Docs Sub", url: "https://api.docs.example.com/ref" },
+      { id: 45, windowId: 1, active: false, title: "Portal Ask", url: "https://portal.corp.test/home" },
+      { id: 46, windowId: 1, active: false, title: "Sibling Ask", url: "https://hr.corp.test/payroll" },
+      { id: 47, windowId: 1, active: false, title: "Local IP", url: "http://192.168.1.10/status" },
+    ],
+  });
+  t.after(async () => {
+    await env.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+  const sockPath = await env.waitForSocket();
+  const mcpSock = new ExtensionSocketClient(sockPath);
+  await mcpSock.connect();
+  t.after(() => mcpSock.close());
+
+  // 3a. Setting `block` on `example.com` blocks `sub.example.com` and `a.b.example.com` across all surfaces
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "example.com",
+    policy: "block",
+  });
+
+  const subPreview = await env.sendRuntimeMessage({ type: "sidepanel:previewPageContext", tabId: 41 });
+  assert.equal(subPreview.context.blockedBySitePolicy, true);
+  assert.equal(subPreview.context.sitePolicy, "block");
+
+  const deepSubPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Read deep subdomain", includeActiveTab: true, activeTabId: 42 },
+  });
+  assert.equal(deepSubPrompt.ok, false);
+  assert.equal(deepSubPrompt.code, -32021);
+
+  const subPicker = await env.sendRuntimeMessage({
+    type: "sidepanel:startElementPicker",
+    payload: { tabId: 41 },
+  });
+  assert.equal(subPicker.ok, false);
+  assert.equal(subPicker.code, -32021);
+
+  await assert.rejects(
+    () => mcpSock.request("claimTab", { tabId: 41 }),
+    (err) => err.code === -32021,
+  );
+  await assert.rejects(
+    () => mcpSock.request("createTab", { url: "https://nested.sub.example.com/admin" }),
+    (err) => err.code === -32021,
+  );
+
+  // 3b. Setting `allow` on `docs.example.com` overrides parent `example.com: block` for `docs.example.com` and `api.docs.example.com`, while keeping `sub.example.com` blocked!
+  const allowDocsRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "docs.example.com",
+    policy: "allow",
+  });
+  assert.equal(allowDocsRes.ok, true);
+  assert.equal(allowDocsRes.policy, "allow");
+  assert.equal(allowDocsRes.permissions["example.com"], "block");
+  assert.equal(allowDocsRes.permissions["docs.example.com"], "allow");
+
+  const docsPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Summarize docs", includeActiveTab: true, activeTabId: 43 },
+  });
+  assert.equal(docsPrompt.ok, true, "Explicit subdomain allow must override parent domain block");
+
+  const apiDocsPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Summarize API docs", includeActiveTab: true, activeTabId: 44 },
+  });
+  assert.equal(apiDocsPrompt.ok, true, "Child of allowed subdomain must inherit subdomain allow override");
+
+  const stillBlockedSub = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Try sibling blocked subdomain", includeActiveTab: true, activeTabId: 41 },
+  });
+  assert.equal(stillBlockedSub.ok, false);
+  assert.equal(stillBlockedSub.code, -32021);
+
+  // 3c. Resetting `docs.example.com` via `policy: "reset"` removes override and restores `example.com: block` inheritance
+  const resetDocsRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "docs.example.com",
+    policy: "reset",
+  });
+  assert.equal(resetDocsRes.policy, "block");
+  assert.equal("docs.example.com" in resetDocsRes.permissions, false);
+
+  // 3d. Setting `ask` on `corp.test` gates `portal.corp.test`, and confirming `portal.corp.test` does NOT silently approve sibling `hr.corp.test`
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "corp.test",
+    policy: "ask",
+  });
+  const askGate = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Check portal", includeActiveTab: true, activeTabId: 45 },
+  });
+  assert.equal(askGate.ok, false);
+  assert.equal(askGate.code, -32020);
+  assert.equal(askGate.requiresSiteConfirmation, true);
+  assert.equal(askGate.host, "portal.corp.test");
+
+  const confirmedPortal = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      userText: "Check portal after confirm",
+      includeActiveTab: true,
+      activeTabId: 45,
+      siteAccessConfirmedHosts: ["portal.corp.test"],
+    },
+  });
+  assert.equal(confirmedPortal.ok, true);
+
+  const siblingStillAsks = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      userText: "Try HR sibling",
+      includeActiveTab: true,
+      activeTabId: 46,
+      siteAccessConfirmedHosts: ["portal.corp.test"],
+    },
+  });
+  assert.equal(siblingStillAsks.ok, false);
+  assert.equal(siblingStillAsks.code, -32020);
+
+  // 3e. Numeric IPv4 suffix (`168.1.10`) and bare TLD (`com`) must never cross-match unrelated hosts
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "168.1.10",
+    policy: "block",
+  });
+  await env.sendRuntimeMessage({
+    type: "sidepanel:setSitePermission",
+    host: "com",
+    policy: "block",
+  });
+  const ipPrompt = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: { userText: "Check router status", includeActiveTab: true, activeTabId: 47 },
+  });
+  assert.equal(ipPrompt.ok, true, "IPv4 addresses must only match exact IPv4 host, never suffix octets");
+});

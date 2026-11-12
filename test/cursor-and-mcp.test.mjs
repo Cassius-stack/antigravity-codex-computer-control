@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { AXDiffTracker } from "../src/diff.mjs";
 import { MacBridge } from "../src/mac-bridge.mjs";
@@ -84,20 +85,63 @@ function findFirstIndexedElementWithBounds(treeText) {
   return null;
 }
 
+const __testDirname = path.dirname(fileURLToPath(import.meta.url));
+const CURSOR_FIXTURE_SRC_BIN = path.join(
+  __testDirname,
+  "fixtures",
+  "TestCocoaApp.app",
+  "Contents",
+  "MacOS",
+  "TestCocoaApp",
+);
+
 test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-order isolation, unconstrained y=10 menu-bar cursor, 1:1 JPEG dimensions, includeCursor screenshots, diff isolation, and error paths", async (t) => {
   const diffTracker = new AXDiffTracker();
   const bridge = new MacBridge({ diffTracker });
+  let fixtureTmpDir = null;
+  let fixtureProc = null;
 
   t.after(async () => {
     try {
       await bridge.cursorControl({ action: "configure", enabled: true, idleTimeoutMs: 2600, glideEnabled: true });
       await bridge.cursorControl({ action: "clear_all" });
     } catch {}
+    if (fixtureProc && !fixtureProc.killed) {
+      try {
+        fixtureProc.kill("SIGTERM");
+      } catch {}
+    }
+    if (fixtureTmpDir) {
+      try {
+        fs.rmSync(fixtureTmpDir, { recursive: true, force: true });
+      } catch {}
+    }
     bridge.close();
   });
 
   const perms = await bridge.checkPermissions();
   assert.equal(perms.axTrusted, true, "Accessibility permission must be granted");
+
+  // Spawn an isolated static 2-window Cocoa fixture (non-activating, distinct binary & window prefix)
+  // so neither active user apps nor concurrent native-mac.test.mjs mutate winA during AX diff checks.
+  const cursorPrefix = `AGCursorFixture_${process.pid}`;
+  if (fs.existsSync(CURSOR_FIXTURE_SRC_BIN)) {
+    fixtureTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-cursor-fix-"));
+    const isolatedBin = path.join(fixtureTmpDir, "AGCursorFixture");
+    fs.copyFileSync(CURSOR_FIXTURE_SRC_BIN, isolatedBin);
+    fs.chmodSync(isolatedBin, 0o755);
+    fixtureProc = spawn(isolatedBin, [], {
+      env: { ...process.env, AG_WINDOW_PREFIX: cursorPrefix },
+      stdio: "ignore",
+    });
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await new Promise((r) => setTimeout(r, 125));
+      const probeWins = await bridge.listWindows({ includeMinimized: false });
+      const readyAlpha = probeWins.find((w) => w.title === `${cursorPrefix} Alpha`);
+      const readyBeta = probeWins.find((w) => w.title === `${cursorPrefix} Beta`);
+      if (readyAlpha && readyBeta && readyAlpha.axBacked !== false) break;
+    }
+  }
 
   const openWins = (await bridge.listWindows({ includeMinimized: false })).filter(
     (w) => w.bounds && w.bounds.width >= 160 && w.bounds.height >= 120,
@@ -106,8 +150,10 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
 
   const onScreenWins = openWins.filter((w) => w.onScreen !== false);
   const offSpaceWin = openWins.find((w) => w.onScreen === false) ?? null;
-  const winA = onScreenWins[0] ?? openWins[0];
-  const winB = openWins.find((w) => w.id !== winA.id) ?? null;
+  const fixtureAlpha = onScreenWins.find((w) => w.title === `${cursorPrefix} Alpha`);
+  const fixtureBeta = onScreenWins.find((w) => w.title === `${cursorPrefix} Beta`);
+  const winA = fixtureAlpha ?? onScreenWins[0] ?? openWins[0];
+  const winB = fixtureBeta ?? openWins.find((w) => w.id !== winA.id) ?? null;
 
   // 1. Verify unified 1:1 window-relative AX header & element coordinate space
   const stA = await bridge.getWindowState({ windowId: winA.id, disableDiff: true });
@@ -166,6 +212,19 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
         x: 95,
         y: 75,
         badge: "Target B",
+        ripple: true,
+      }),
+    );
+  }
+
+  if (offSpaceWin && offSpaceWin.id !== winA.id && offSpaceWin.id !== winB?.id) {
+    cursorCalls.push(
+      bridge.cursorControl({
+        action: "move",
+        windowId: offSpaceWin.id,
+        x: 80,
+        y: 65,
+        badge: "OffSpace",
         ripple: true,
       }),
     );
@@ -303,12 +362,22 @@ test("Native macOS VirtualCursorManager: real WindowServer overlays, Space/z-ord
   // 5. AXDiffTracker isolation: hiding cursor must NOT pollute AX tree diffing
   const baselineState = await bridge.getWindowState({ windowId: winA.id, disableDiff: true });
   assert.equal(baselineState.isDiff, false);
+  assert.doesNotMatch(
+    baselineState.fullTree,
+    /Computer Use (Cursor|Highlight)/i,
+    "Virtual cursor overlays must never pollute target window AX tree",
+  );
   await bridge.cursorControl({ action: "hide", windowId: winA.id });
   const postHideCursor = await bridge.cursorControl({ action: "get_state", windowId: winA.id });
   assert.equal(postHideCursor.cursors.length, 0, "Cursor for winA must be hidden immediately");
 
   const diffAfterHide = await bridge.getWindowState({ windowId: winA.id });
   assert.equal(diffAfterHide.isDiff, true);
+  assert.doesNotMatch(
+    diffAfterHide.fullTree,
+    /Computer Use (Cursor|Highlight)/i,
+    "Post-hide AX diff must contain zero virtual cursor elements",
+  );
   assert.equal(diffAfterHide.unchanged, true, "Hiding virtual cursor must not pollute AX diff state");
 
   // 6. Global configure (disable -> clear, re-enable) & clear_all
