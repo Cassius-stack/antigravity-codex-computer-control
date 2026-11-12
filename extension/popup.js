@@ -11,6 +11,7 @@ const popupHostLabel = document.getElementById("popup-host-label");
 const popupSitePolicy = document.getElementById("popup-site-policy");
 
 let currentActiveTab = null;
+let currentWindowId = null;
 let currentHost = "";
 
 function extractHost(url) {
@@ -64,7 +65,12 @@ async function refresh() {
     if (chrome.tabs?.query) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       currentActiveTab = tab || null;
+      if (tab?.windowId) currentWindowId = tab.windowId;
       currentHost = extractHost(tab?.url || "");
+    }
+    if (!currentWindowId && chrome.windows?.getCurrent) {
+      const win = await chrome.windows.getCurrent().catch(() => null);
+      if (win?.id) currentWindowId = win.id;
     }
     const [resp, settingsRes] = await Promise.all([
       chrome.runtime.sendMessage({ type: "popup:getStatus" }),
@@ -118,9 +124,18 @@ finishBtn.addEventListener("click", async () => {
 });
 
 openSidepanelBtn.addEventListener("click", async () => {
+  if (!chrome.sidePanel?.open) return;
+  const winId = currentActiveTab?.windowId || currentWindowId;
   try {
-    if (currentActiveTab?.id && chrome.sidePanel?.open) {
+    if (currentActiveTab?.id) {
       await chrome.sidePanel.open({ tabId: currentActiveTab.id });
+      window.close();
+      return;
+    }
+  } catch {}
+  try {
+    if (winId) {
+      await chrome.sidePanel.open({ windowId: winId });
       window.close();
     }
   } catch {}

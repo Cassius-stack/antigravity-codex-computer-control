@@ -1057,14 +1057,21 @@ function formatTabContextSection(label, ctx, browserFamily) {
 function formatPickedElementSection(el, idx = 1) {
   if (!el || typeof el !== "object") return "";
   const selector = sanitizeForContextEnvelope(el.selector || el.tagName || "element");
+  const pageUrl = el.url || el.pageUrl || "";
+  const pageTitle = el.title || el.pageTitle || "";
   const lines = [
     `### Picked Webpage Element #${idx}: \`${selector}\``,
     `- Tag: \`<${sanitizeForContextEnvelope(el.tagName || "div")}>\`` +
       (el.role ? ` · Role: \`${sanitizeForContextEnvelope(el.role)}\`` : "") +
       (el.label ? ` · Label: "${sanitizeForContextEnvelope(el.label)}"` : ""),
   ];
-  if (el.url) {
-    lines.push(`- Page URL: ${sanitizeForContextEnvelope(el.url)}`);
+  if (pageTitle || pageUrl) {
+    lines.push(
+      `- Page: ${pageTitle ? `"${sanitizeForContextEnvelope(pageTitle)}" ` : ""}${pageUrl ? `(${sanitizeForContextEnvelope(pageUrl)})` : ""}`.trim(),
+    );
+  }
+  if (pageUrl) {
+    lines.push(`- Page URL: ${sanitizeForContextEnvelope(pageUrl)}`);
   }
   if (el.rect && typeof el.rect === "object") {
     lines.push(
@@ -1213,6 +1220,7 @@ async function runSidePanelPrompt({
   permissionMode = "auto",
   autoApprovePermissions = false,
   modelId = null,
+  thoughtLevel = null,
   includeActiveTab = true,
   activeTabId = null,
   includeSelection = true,
@@ -1474,6 +1482,7 @@ async function runSidePanelPrompt({
       promptBlocks,
       modeId: effectiveModeId,
       modelId: modelId || null,
+      thoughtLevel: thoughtLevel || null,
       autoApprovePermissions: effectiveAutoApprove,
       cwd: effectiveCwd,
       systemPromptAppend: effectiveInstructions,
@@ -1559,8 +1568,15 @@ async function injectRecorderIntoTab(tabId) {
         badge.appendChild(labelEl);
         document.documentElement.appendChild(badge);
 
+        const resolveEventTarget = (ev) => {
+          const raw = (typeof ev.composedPath === "function" && ev.composedPath()[0]) || ev.target;
+          return raw && raw.nodeType === 1 ? raw : ev.target;
+        };
         const onClick = (ev) => {
-          const target = ev.target?.closest?.("button, a, input, select, textarea, [role='button'], [role='tab'], [role='menuitem'], label") || ev.target;
+          const baseTarget = resolveEventTarget(ev);
+          const target =
+            baseTarget?.closest?.("button, a, input, select, textarea, [role='button'], [role='tab'], [role='menuitem'], label") ||
+            baseTarget;
           const info = describeEl(target);
           try {
             chrome.runtime.sendMessage({
@@ -1576,7 +1592,7 @@ async function injectRecorderIntoTab(tabId) {
           } catch {}
         };
         const onChange = (ev) => {
-          const target = ev.target;
+          const target = resolveEventTarget(ev);
           if (!target || !/^(INPUT|TEXTAREA|SELECT)$/i.test(target.tagName || "")) return;
           const info = describeEl(target);
           const redacted = isSensitiveInput(target);
@@ -1750,7 +1766,8 @@ async function injectElementPickerIntoTab(tabId) {
         let hoveredEl = null;
 
         const onMouseMove = (ev) => {
-          const target = ev.target;
+          const rawTarget = (typeof ev.composedPath === "function" && ev.composedPath()[0]) || ev.target;
+          const target = rawTarget && rawTarget.nodeType === 1 ? rawTarget : ev.target;
           if (!target || target.nodeType !== 1 || root.contains(target)) return;
           hoveredEl = target;
           const r = target.getBoundingClientRect();
@@ -1789,7 +1806,8 @@ async function injectElementPickerIntoTab(tabId) {
           ev.preventDefault();
           ev.stopPropagation();
           ev.stopImmediatePropagation?.();
-          const el = hoveredEl || ev.target;
+          const rawTarget = (typeof ev.composedPath === "function" && ev.composedPath()[0]) || ev.target;
+          const el = hoveredEl || (rawTarget && rawTarget.nodeType === 1 ? rawTarget : ev.target);
           if (!el || el.nodeType !== 1) {
             cleanup();
             return;
@@ -3119,6 +3137,28 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       injectRecorderIntoTab(tabId).catch(() => {});
     }
   }
+  if (pickerState.active && Number(tabId) === Number(pickerState.tabId)) {
+    const nextUrl = changeInfo.url || tab?.url || "";
+    if (nextUrl && (!isSafeInjectableUrl(nextUrl) || getSitePolicyForUrl(nextUrl) === "block")) {
+      pickerState = { active: false, tabId: null, startedAt: 0 };
+      broadcastToSidePanels({
+        type: "sidepanel:pickerState",
+        picker: getPickerSnapshot(),
+      });
+    } else if (changeInfo.status === "complete") {
+      injectElementPickerIntoTab(tabId)
+        .then((ok) => {
+          if (!ok && pickerState.active && Number(pickerState.tabId) === Number(tabId)) {
+            pickerState = { active: false, tabId: null, startedAt: 0 };
+            broadcastToSidePanels({
+              type: "sidepanel:pickerState",
+              picker: getPickerSnapshot(),
+            });
+          }
+        })
+        .catch(() => {});
+    }
+  }
 });
 
 if (chrome.tabs?.onActivated?.addListener) {
@@ -3130,8 +3170,14 @@ if (chrome.tabs?.onActivated?.addListener) {
 if (chrome.contextMenus?.onClicked?.addListener) {
   chrome.contextMenus.onClicked.addListener((info, tab) => {
     try {
-      if (tab?.id && chrome.sidePanel?.open) {
-        chrome.sidePanel.open({ tabId: tab.id }).catch?.(() => {});
+      if (chrome.sidePanel?.open) {
+        if (tab?.id) {
+          chrome.sidePanel.open({ tabId: tab.id }).catch?.(() => {
+            if (tab?.windowId) chrome.sidePanel.open({ windowId: tab.windowId }).catch?.(() => {});
+          });
+        } else if (tab?.windowId) {
+          chrome.sidePanel.open({ windowId: tab.windowId }).catch?.(() => {});
+        }
       }
       if (info?.menuItemId === "ag-ask-selection" && info.selectionText) {
         setTimeout(() => {
@@ -3371,13 +3417,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const targetTabId = senderTabId ?? pickerState.tabId ?? null;
     pickerState = { active: false, tabId: null, startedAt: 0 };
     const picker = getPickerSnapshot();
-    const element = msg.element && typeof msg.element === "object" ? { ...msg.element, tabId: targetTabId } : null;
+    const rawEl = msg.element && typeof msg.element === "object" ? msg.element : null;
+    const normUrl = rawEl ? String(rawEl.url || rawEl.pageUrl || "").trim() : "";
+    const normTitle = rawEl ? String(rawEl.title || rawEl.pageTitle || "").trim() : "";
+    const element = rawEl
+      ? {
+          ...rawEl,
+          tabId: targetTabId,
+          url: normUrl,
+          pageUrl: normUrl,
+          title: normTitle,
+          pageTitle: normTitle,
+        }
+      : null;
     if (element) {
       const selLabel = element.selector || element.tagName || "element";
       recordBrowserActivity({
         kind: "element",
         title: `Picked element ${selLabel}`,
-        detail: element.pageTitle || element.pageUrl || selLabel,
+        detail: element.title || element.url || selLabel,
         tabId: targetTabId,
         source: "sidepanel",
       });

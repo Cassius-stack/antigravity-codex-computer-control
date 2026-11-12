@@ -15,7 +15,16 @@ const state = {
   interactionMode: "chat", // "chat" | "agent"
   permissionMode: "auto", // "auto" | "ask" | "full"
   modelId: "gemini-4-carbon-medium",
-  models: [{ modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon" }],
+  thoughtLevel: "medium", // "low" | "medium" | "high"
+  models: [
+    { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+    { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+    { modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
+    { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
+    { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+    { modelId: "claude-sonnet-4-6-thinking", name: "Claude Sonnet 4.6 (Thinking)" },
+    { modelId: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 (Thinking)" },
+  ],
   running: false,
   activeRequestId: null,
   includeActiveTab: true,
@@ -86,6 +95,7 @@ const dropzoneOverlay = document.getElementById("dropzone-overlay");
 const historyBtn = document.getElementById("history-btn");
 const modelMenuBtn = document.getElementById("model-menu-btn");
 const modelCurrentLabelEl = document.getElementById("model-current-label");
+const modelEffortTagEl = document.getElementById("model-effort-tag");
 const workspaceMiniTagEl = document.getElementById("workspace-mini-tag");
 const headerTitleEl = document.getElementById("header-title");
 
@@ -97,6 +107,7 @@ const newChatBtn = document.getElementById("new-chat-btn");
 
 const modelPopover = document.getElementById("model-popover");
 const modelOptionsListEl = document.getElementById("model-options-list");
+const thoughtLevelSegmentedEl = document.getElementById("thought-level-segmented");
 const permissionSegmentedEl = document.getElementById("permission-segmented");
 const bridgeReconnectRow = document.getElementById("bridge-reconnect-row");
 const bridgeLabelEl = document.getElementById("bridge-label");
@@ -207,6 +218,7 @@ const tabsPopover = document.getElementById("tabs-popover");
 const tabsPickerListEl = document.getElementById("tabs-picker-list");
 const groupMentionedBtn = document.getElementById("group-mentioned-btn");
 
+const composerNoticeEl = document.getElementById("composer-notice");
 const composerCard = document.getElementById("composer-card");
 const thinkingWave = document.getElementById("thinking-wave");
 const activeTabChipEl = document.getElementById("active-tab-chip");
@@ -282,13 +294,12 @@ window.matchMedia?.("(prefers-color-scheme: light)")?.addEventListener?.("change
 
 function updateGreetingByTime() {
   const hr = new Date().getHours();
-  const browserSuffix = state.bridgeStatus?.browserName ? ` · ${state.bridgeStatus.browserName}` : "";
   if (hr >= 5 && hr < 12) {
-    greetingHeadlineEl.textContent = `Good morning${browserSuffix}`;
+    greetingHeadlineEl.textContent = "Good morning";
   } else if (hr >= 12 && hr < 18) {
-    greetingHeadlineEl.textContent = `Good afternoon${browserSuffix}`;
+    greetingHeadlineEl.textContent = "Good afternoon";
   } else {
-    greetingHeadlineEl.textContent = `Good evening${browserSuffix}`;
+    greetingHeadlineEl.textContent = "Good evening";
   }
 }
 
@@ -555,39 +566,147 @@ function updateRunningUI(running) {
   syncSendButtonState();
 }
 
+const MODEL_FAMILY_SUBTITLES = {
+  "gemini-4-carbon": "Pro reasoning & browser control",
+  "gemini-4-argon": "Deep research & complex coding",
+  "gemini-3.8-flash": "Fast multimodal responses",
+  "claude-sonnet-4-6": "Balanced coding & analysis",
+  "claude-opus-4-6": "Frontier deep reasoning",
+  "gpt-oss-120b": "Open-weight reasoning",
+};
+
+function parseModelVariantInfo(modelObj) {
+  const id = String(modelObj?.modelId || "").trim();
+  const rawName = String(modelObj?.name || id).trim();
+  const suffixMatch = /^(.*)-(low|medium|high|thinking)$/i.exec(id);
+  const familyId = suffixMatch ? suffixMatch[1] : id;
+  let variantKey = suffixMatch ? suffixMatch[2].toLowerCase() : "";
+  if (!variantKey) {
+    const parenMatch = /\((low|medium|high|thinking)\)\s*$/i.exec(rawName);
+    if (parenMatch) variantKey = parenMatch[1].toLowerCase();
+  }
+  const familyName = rawName.replace(/\s*\((low|medium|high|thinking)\)\s*$/i, "").trim() || familyId;
+  return { id, rawName, familyId, familyName, variantKey };
+}
+
+function buildGroupedModelFamilies(modelsList) {
+  const map = new Map();
+  for (const m of Array.isArray(modelsList) ? modelsList : []) {
+    if (!m?.modelId) continue;
+    const info = parseModelVariantInfo(m);
+    let fam = map.get(info.familyId);
+    if (!fam) {
+      fam = {
+        familyId: info.familyId,
+        name: info.familyName,
+        subtitle: MODEL_FAMILY_SUBTITLES[info.familyId] || "",
+        defaultModelId: info.id,
+        variants: {},
+        modelIds: new Set(),
+      };
+      map.set(info.familyId, fam);
+    }
+    fam.modelIds.add(info.id);
+    if (info.variantKey) {
+      fam.variants[info.variantKey] = info.id;
+    } else {
+      fam.variants.base = info.id;
+    }
+    if (info.variantKey === "medium") {
+      fam.defaultModelId = info.id;
+    }
+  }
+  return Array.from(map.values());
+}
+
+function resolveFamilyModelIdForEffort(fam, effort) {
+  if (!fam) return state.modelId;
+  const eff = ["low", "medium", "high"].includes(effort) ? effort : "medium";
+  if (fam.variants[eff]) return fam.variants[eff];
+  if (eff === "low" && fam.variants.base) return fam.variants.base;
+  if ((eff === "medium" || eff === "high") && fam.variants.thinking) return fam.variants.thinking;
+  return (
+    fam.variants.medium ||
+    fam.variants.high ||
+    fam.variants.thinking ||
+    fam.variants.base ||
+    fam.variants.low ||
+    fam.defaultModelId
+  );
+}
+
+function inferEffortFromModelId(modelId, fallback = "medium") {
+  const m = /-(low|medium|high|thinking)$/i.exec(String(modelId || ""));
+  if (!m) return fallback;
+  const v = m[1].toLowerCase();
+  if (v === "thinking") return fallback === "low" ? "medium" : fallback;
+  return v;
+}
+
 function formatModelDisplayName(rawName) {
   const cleaned = String(rawName || "Gemini 4 Carbon")
     .replace(/\s*\(.*?\)\s*/g, "")
-    .replace(/^Gemini\s+/i, "")
+    .replace(/^Claude\s+/i, "")
     .trim();
-  return cleaned || "Pro";
+  return cleaned || "Gemini 4 Carbon";
 }
 
 function renderModelMenu() {
-  const activeModel = state.models.find((m) => m.modelId === state.modelId) || state.models[0];
-  modelCurrentLabelEl.textContent = formatModelDisplayName(activeModel?.name || state.modelId);
+  const families = buildGroupedModelFamilies(state.models);
+  const activeFamily =
+    families.find((f) => f.modelIds.has(state.modelId)) ||
+    families[0] || {
+      familyId: "gemini-4-carbon",
+      name: "Gemini 4 Carbon",
+      subtitle: MODEL_FAMILY_SUBTITLES["gemini-4-carbon"],
+      defaultModelId: state.modelId,
+      variants: { medium: state.modelId },
+      modelIds: new Set([state.modelId]),
+    };
+
+  state.thoughtLevel = inferEffortFromModelId(state.modelId, state.thoughtLevel || "medium");
+  modelCurrentLabelEl.textContent = formatModelDisplayName(activeFamily.name);
+  if (modelEffortTagEl) {
+    modelEffortTagEl.textContent =
+      state.thoughtLevel === "high" ? "High" : state.thoughtLevel === "low" ? "Low" : "Med";
+  }
   headerTitleEl.textContent = state.sessionTitle || "New thread";
 
   modelOptionsListEl.innerHTML = "";
-  for (const m of state.models) {
+  for (const fam of families) {
     const btn = document.createElement("button");
     btn.type = "button";
-    const selected = m.modelId === state.modelId;
+    const selected = fam.familyId === activeFamily.familyId;
     btn.className = `model-option-btn${selected ? " selected" : ""}`;
-    btn.innerHTML = `<span>${escapeHtml(m.name || m.modelId)}</span>${SVG.check}`;
+    btn.innerHTML = `
+      <span class="model-opt-copy">
+        <span class="model-opt-name">${escapeHtml(fam.name)}</span>
+        ${fam.subtitle ? `<span class="model-opt-sub">${escapeHtml(fam.subtitle)}</span>` : ""}
+      </span>
+      ${SVG.check}
+    `;
     btn.addEventListener("click", () => {
-      state.modelId = m.modelId;
+      state.modelId = resolveFamilyModelIdForEffort(fam, state.thoughtLevel);
       renderModelMenu();
       closeAllPopovers();
-      if (state.currentSessionId) {
-        sendRuntimeMessage({
-          type: "sidepanel:setConfig",
-          payload: { sessionId: state.currentSessionId, modelId: state.modelId },
-        });
-      }
+      sendRuntimeMessage({
+        type: "sidepanel:setConfig",
+        payload: {
+          sessionId: state.currentSessionId || null,
+          modelId: state.modelId,
+          thoughtLevel: state.thoughtLevel,
+        },
+      });
     });
     modelOptionsListEl.appendChild(btn);
   }
+
+  if (thoughtLevelSegmentedEl) {
+    for (const seg of thoughtLevelSegmentedEl.querySelectorAll(".seg-btn")) {
+      seg.classList.toggle("active", seg.dataset.thought === state.thoughtLevel);
+    }
+  }
+
   updateApprovalUI();
 }
 
@@ -756,6 +875,9 @@ function populateAgentCatalog(agentStatus) {
     if (!state.models.some((m) => m.modelId === state.modelId)) {
       state.modelId = agentStatus.currentModelId || state.models[0].modelId;
     }
+  }
+  if (agentStatus.currentThoughtLevel && ["low", "medium", "high"].includes(agentStatus.currentThoughtLevel)) {
+    state.thoughtLevel = agentStatus.currentThoughtLevel;
   }
   renderModelMenu();
   renderBridgeStatus(state.bridgeStatus);
@@ -1048,10 +1170,48 @@ function renderAttachmentChips() {
   }
 }
 
+let composerNoticeTimer = null;
+
+function showComposerNotice(message) {
+  if (!composerNoticeEl) return;
+  if (composerNoticeTimer) clearTimeout(composerNoticeTimer);
+  composerNoticeEl.textContent = String(message || "");
+  composerNoticeEl.classList.remove("hidden");
+  composerNoticeTimer = setTimeout(() => {
+    composerNoticeEl.classList.add("hidden");
+  }, 4600);
+}
+
+const KNOWN_BINARY_EXT_RE =
+  /\.(pdf|zip|gz|tgz|tar|rar|7z|dmg|pkg|iso|exe|dll|so|dylib|bin|wasm|sqlite|sqlite3|db|doc|docx|xls|xlsx|ppt|pptx|odt|epub|mp3|wav|ogg|flac|m4a|mp4|mov|avi|mkv|webm|woff|woff2|ttf|otf|ico)$/i;
+const KNOWN_BINARY_MIME_RE =
+  /^(application\/(pdf|zip|gzip|x-gzip|x-tar|x-rar|x-7z|wasm|vnd\.openxmlformats|msword|vnd\.ms-)|audio\/|video\/|font\/)/i;
+
+async function isLikelyBinaryFile(file) {
+  const name = String(file?.name || "");
+  const mime = String(file?.type || "").toLowerCase();
+  if (KNOWN_BINARY_EXT_RE.test(name) || KNOWN_BINARY_MIME_RE.test(mime)) {
+    return true;
+  }
+  try {
+    const probeSlice = file.slice(0, 4096);
+    if (typeof probeSlice.arrayBuffer === "function") {
+      const bytes = new Uint8Array(await probeSlice.arrayBuffer());
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 0) return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
 async function handleFilesAdded(fileList) {
   const incoming = Array.from(fileList || []);
   for (const file of incoming) {
-    if (state.attachedFiles.length >= 8) break;
+    if (state.attachedFiles.length >= 8) {
+      showComposerNotice("Maximum of 8 attachments reached.");
+      break;
+    }
     const id = `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     if (file.type.startsWith("image/")) {
       const dataUrl = await new Promise((resolve) => {
@@ -1072,9 +1232,17 @@ async function handleFilesAdded(fileList) {
           size: file.size,
         });
       }
-    } else if (file.size <= 2 * 1024 * 1024) {
+    } else if (file.size > 2 * 1024 * 1024) {
+      showComposerNotice(`"${file.name || "File"}" exceeds the 2 MB text attachment limit.`);
+    } else if (await isLikelyBinaryFile(file)) {
+      showComposerNotice(`"${file.name || "Binary file"}" cannot be read as text. Attach images or code/text files.`);
+    } else {
       try {
         const textContent = await file.text();
+        if (textContent.includes("\u0000")) {
+          showComposerNotice(`"${file.name || "Binary file"}" contains binary data and was skipped.`);
+          continue;
+        }
         state.attachedFiles.push({
           id,
           name: file.name || "attachment.txt",
@@ -1565,6 +1733,7 @@ async function sendPromptNow(overridePromptText = null, retryContext = null) {
         permissionMode: state.permissionMode || "auto",
         autoApprovePermissions: state.permissionMode === "full",
         modelId: state.modelId || null,
+        thoughtLevel: state.thoughtLevel || "medium",
         includeActiveTab: Boolean(state.includeActiveTab),
         activeTabId: state.activeTab?.tabId || null,
         includeSelection,
@@ -1963,15 +2132,59 @@ function renderTabsPicker(filterText = "") {
   const needle = filterText.trim().toLowerCase();
   tabsPickerListEl.innerHTML = "";
   state.kbActiveIndex = 0;
-  const candidates = state.allTabs.filter(
+  const openBrowserTabs = state.allTabs.filter((t) => !/^chrome-extension:\/\//i.test(t.url || ""));
+  const showChromeAllOption =
+    openBrowserTabs.length > 0 &&
+    (!needle ||
+      "chrome".includes(needle) ||
+      "browser".includes(needle) ||
+      "all".includes(needle) ||
+      "tabs".includes(needle));
+  const matchesActiveAlias =
+    Boolean(needle) &&
+    ("page".includes(needle) || "current".includes(needle) || "active".includes(needle) || "tab".includes(needle));
+
+  const candidates = openBrowserTabs.filter(
     (t) =>
-      !/^chrome-extension:\/\//i.test(t.url || "") &&
-      (!needle || (t.title || "").toLowerCase().includes(needle) || (t.url || "").toLowerCase().includes(needle)),
+      !needle ||
+      (t.title || "").toLowerCase().includes(needle) ||
+      (t.url || "").toLowerCase().includes(needle) ||
+      (matchesActiveAlias && (t.tabId === state.activeTab?.tabId || "tab".includes(needle))),
   );
 
-  if (candidates.length === 0) {
+  if (!showChromeAllOption && candidates.length === 0) {
     tabsPickerListEl.innerHTML = `<div class="popover-item-sub" style="padding:8px 10px;">No open tabs found.</div>`;
     return;
+  }
+
+  if (showChromeAllOption) {
+    const targetBatch = openBrowserTabs.slice(0, 6);
+    const allSelected = targetBatch.every((t) => state.mentionedTabIds.has(t.tabId));
+    const chromeRow = document.createElement("div");
+    chromeRow.className = `popover-item${allSelected ? " selected" : ""}`;
+    const bName = state.bridgeStatus?.browserName || "Chrome";
+    chromeRow.innerHTML = `
+      <span class="popover-item-icon">${allSelected ? SVG.checkSmall : SVG.globeXs}</span>
+      <div class="popover-item-main">
+        <div class="popover-item-title">@Chrome · All open tabs</div>
+        <div class="popover-item-sub">Reference ${targetBatch.length} open ${escapeHtml(bName)} tab${
+          targetBatch.length === 1 ? "" : "s"
+        }</div>
+      </div>
+    `;
+    chromeRow.addEventListener("click", () => {
+      if (allSelected) {
+        for (const t of targetBatch) state.mentionedTabIds.delete(t.tabId);
+      } else {
+        for (const t of targetBatch) state.mentionedTabIds.add(t.tabId);
+      }
+      promptInput.value = promptInput.value.replace(/(^|\s)@[^\s]*$/, "$1");
+      syncSendButtonState();
+      renderAttachmentChips();
+      closeAllPopovers();
+      promptInput.focus();
+    });
+    tabsPickerListEl.appendChild(chromeRow);
   }
 
   for (const t of candidates) {
@@ -2196,6 +2409,29 @@ saveSettingsBtn.addEventListener("click", async () => {
   }
   closeAllPopovers();
 });
+
+if (thoughtLevelSegmentedEl) {
+  thoughtLevelSegmentedEl.addEventListener("click", (e) => {
+    const btn = e.target.closest(".seg-btn");
+    if (!btn || !btn.dataset.thought) return;
+    const nextThought = btn.dataset.thought;
+    state.thoughtLevel = nextThought;
+    const families = buildGroupedModelFamilies(state.models);
+    const activeFamily = families.find((f) => f.modelIds.has(state.modelId)) || families[0];
+    if (activeFamily) {
+      state.modelId = resolveFamilyModelIdForEffort(activeFamily, nextThought);
+    }
+    renderModelMenu();
+    sendRuntimeMessage({
+      type: "sidepanel:setConfig",
+      payload: {
+        sessionId: state.currentSessionId || null,
+        modelId: state.modelId,
+        thoughtLevel: state.thoughtLevel,
+      },
+    });
+  });
+}
 
 permissionSegmentedEl.addEventListener("click", (e) => {
   const btn = e.target.closest(".seg-btn");

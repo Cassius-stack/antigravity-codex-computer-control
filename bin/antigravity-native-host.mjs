@@ -28,11 +28,50 @@ const FALLBACK_MODELS = [
   { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
   { modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
   { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
+  { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
+  { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },
   { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+  { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
   { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
-  { modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Thinking)" },
+  { modelId: "claude-sonnet-4-6-thinking", name: "Claude Sonnet 4.6 (Thinking)" },
+  { modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
   { modelId: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 (Thinking)" },
+  { modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
 ];
+
+function parseCliModelsOutput(stdout) {
+  if (!stdout || typeof stdout !== "string") return [];
+  const cleanAnsi = stdout.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  const parsed = [];
+  const seen = new Set();
+  for (const rawLine of cleanAnsi.split(/\n/)) {
+    const segments = rawLine
+      .split(/\r/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (segments.length === 0) continue;
+    const line = segments[segments.length - 1];
+    if (
+      !line ||
+      /^available models/i.test(line) ||
+      /fetching available models/i.test(line) ||
+      line.startsWith("-") ||
+      line.startsWith("=")
+    ) {
+      continue;
+    }
+    const m = /^([a-z0-9][a-z0-9._-]*)(?:\s{2,}(.+?)|\s+\((.+)\)|\s+-\s+(.+))?$/i.exec(line);
+    if (m) {
+      const id = m[1].trim();
+      const label = (m[2] || m[3] || m[4] || id).trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        parsed.push({ modelId: id, name: label });
+      }
+    }
+  }
+  return parsed;
+}
 
 const FALLBACK_MODES = [
   { id: "auto", name: "Auto", description: "Approve safe actions; ask before irreversible actions." },
@@ -294,6 +333,7 @@ class AcpSidePanelBridge {
     this.capabilities = null;
     this.cachedModels = FALLBACK_MODELS;
     this.currentModelId = "gemini-4-carbon-medium";
+    this.currentThoughtLevel = "medium";
     this.cachedModes = FALLBACK_MODES;
     this.currentModeId = "auto";
     this.cachedConfigOptions = [];
@@ -339,6 +379,10 @@ class AcpSidePanelBridge {
     }
     if (Array.isArray(resultObj.configOptions)) {
       this.cachedConfigOptions = resultObj.configOptions;
+      const thoughtOpt = resultObj.configOptions.find((o) => o && o.id === "thought_level");
+      if (thoughtOpt?.currentValue) {
+        this.currentThoughtLevel = String(thoughtOpt.currentValue).toLowerCase();
+      }
     }
     if (resultObj._meta?.antigravity?.tier) {
       this.cachedTier = resultObj._meta.antigravity.tier;
@@ -355,17 +399,7 @@ class AcpSidePanelBridge {
         { env: { ...process.env, PATH: buildEnrichedPath() }, timeout: 4000 },
         (err, stdout) => {
           if (!err && stdout) {
-            const parsed = [];
-            for (const rawLine of stdout.split(/\r?\n/)) {
-              const line = rawLine.trim();
-              if (!line || /^available models/i.test(line) || line.startsWith("-")) continue;
-              const m = /^([a-z0-9._-]+)(?:\s+\((.+)\)|\s+-\s+(.+))?$/i.exec(line);
-              if (m) {
-                const id = m[1];
-                const label = m[2] || m[3] || id;
-                parsed.push({ modelId: id, name: label });
-              }
-            }
+            const parsed = parseCliModelsOutput(stdout);
             if (parsed.length > 0 && this.cachedModels === FALLBACK_MODELS) {
               this.cachedModels = parsed;
             }
@@ -611,6 +645,7 @@ class AcpSidePanelBridge {
       agentInfo: this.agentInfo,
       models: this.cachedModels,
       currentModelId: this.currentModelId,
+      currentThoughtLevel: this.currentThoughtLevel,
       modes: this.cachedModes,
       currentModeId: this.currentModeId,
       configOptions: this.cachedConfigOptions,
@@ -645,7 +680,7 @@ class AcpSidePanelBridge {
     return isDir(DEFAULT_ACP_CWD) ? DEFAULT_ACP_CWD : HOME_DIR;
   }
 
-  async createSession({ cwd, systemPromptAppend, modeId, modelId } = {}) {
+  async createSession({ cwd, systemPromptAppend, modeId, modelId, thoughtLevel } = {}) {
     await this.ensureInitialized();
     const targetCwd = this.resolveTargetCwd(cwd);
     const appendText = [DEFAULT_CHROME_SYSTEM_PROMPT, systemPromptAppend].filter(Boolean).join("\n\n");
@@ -674,9 +709,22 @@ class AcpSidePanelBridge {
 
     if (modeId) {
       await this.sendAcpRpc("session/set_mode", { sessionId, modeId }, 10_000).catch(() => {});
+      this.currentModeId = modeId;
     }
     if (modelId) {
       await this.sendAcpRpc("session/set_model", { sessionId, modelId }, 10_000).catch(() => {});
+      this.currentModelId = modelId;
+    }
+    const normThought = ["low", "medium", "high"].includes(String(thoughtLevel || "").toLowerCase())
+      ? String(thoughtLevel).toLowerCase()
+      : null;
+    if (normThought) {
+      await this.sendAcpRpc(
+        "session/set_config_option",
+        { sessionId, configId: "thought_level", value: normThought },
+        10_000,
+      ).catch(() => {});
+      this.currentThoughtLevel = normThought;
     }
 
     return {
@@ -684,6 +732,7 @@ class AcpSidePanelBridge {
       sessionId,
       models: this.cachedModels,
       currentModelId: modelId || res?.models?.currentModelId || this.currentModelId,
+      currentThoughtLevel: this.currentThoughtLevel,
       modes: this.cachedModes,
       currentModeId: modeId || res?.modes?.currentModeId || this.currentModeId,
       configOptions: this.cachedConfigOptions,
@@ -819,6 +868,7 @@ class AcpSidePanelBridge {
     text = "",
     modeId = null,
     modelId = null,
+    thoughtLevel = null,
     autoApprovePermissions = false,
     systemPromptAppend = "",
     cwd = null,
@@ -837,7 +887,7 @@ class AcpSidePanelBridge {
 
     let sid = sessionId ? String(sessionId).trim() : "";
     if (!sid) {
-      const created = await this.createSession({ cwd, systemPromptAppend, modeId, modelId });
+      const created = await this.createSession({ cwd, systemPromptAppend, modeId, modelId, thoughtLevel });
       sid = created.sessionId;
       emitExtensionNotification("agentEvent", {
         event: "session_created",
@@ -845,6 +895,7 @@ class AcpSidePanelBridge {
         sessionId: sid,
         models: created.models,
         currentModelId: created.currentModelId,
+        currentThoughtLevel: created.currentThoughtLevel,
         modes: created.modes,
         currentModeId: created.currentModeId,
       });
@@ -852,9 +903,22 @@ class AcpSidePanelBridge {
       await this.ensureSessionResumed(sid, cwd);
       if (modeId) {
         await this.sendAcpRpc("session/set_mode", { sessionId: sid, modeId }, 10_000).catch(() => {});
+        this.currentModeId = modeId;
       }
       if (modelId) {
         await this.sendAcpRpc("session/set_model", { sessionId: sid, modelId }, 10_000).catch(() => {});
+        this.currentModelId = modelId;
+      }
+      const normThought = ["low", "medium", "high"].includes(String(thoughtLevel || "").toLowerCase())
+        ? String(thoughtLevel).toLowerCase()
+        : null;
+      if (normThought) {
+        await this.sendAcpRpc(
+          "session/set_config_option",
+          { sessionId: sid, configId: "thought_level", value: normThought },
+          10_000,
+        ).catch(() => {});
+        this.currentThoughtLevel = normThought;
       }
     }
 
@@ -969,10 +1033,14 @@ class AcpSidePanelBridge {
     return { ok: true, sessionId: pending.sessionId };
   }
 
-  async setConfig({ sessionId, modeId, modelId, configId, value } = {}) {
+  async setConfig({ sessionId, modeId, modelId, thoughtLevel, configId, value } = {}) {
+    const normThought = ["low", "medium", "high"].includes(String(thoughtLevel || "").toLowerCase())
+      ? String(thoughtLevel).toLowerCase()
+      : null;
     if (!sessionId) {
       if (modeId) this.currentModeId = modeId;
       if (modelId) this.currentModelId = modelId;
+      if (normThought) this.currentThoughtLevel = normThought;
       return { ok: true, deferred: true };
     }
     const sid = await this.ensureSessionResumed(sessionId);
@@ -983,6 +1051,14 @@ class AcpSidePanelBridge {
     if (modelId) {
       await this.sendAcpRpc("session/set_model", { sessionId: sid, modelId }, 10_000);
       this.currentModelId = modelId;
+    }
+    if (normThought) {
+      await this.sendAcpRpc(
+        "session/set_config_option",
+        { sessionId: sid, configId: "thought_level", value: normThought },
+        10_000,
+      ).catch(() => {});
+      this.currentThoughtLevel = normThought;
     }
     if (configId && value !== undefined) {
       await this.sendAcpRpc("session/set_config_option", { sessionId: sid, configId, value }, 10_000);

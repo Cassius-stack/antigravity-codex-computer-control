@@ -530,6 +530,7 @@ function launchNativeHostWithRealExtension({
     bookmarks,
     createdAlarms,
     alarmsOnAlarm,
+    tabsOnUpdated,
     getSidePanelBehavior: () => sidePanelBehavior,
     sendRuntimeMessage(msg, sender = {}) {
       return new Promise((resolve) => {
@@ -2893,4 +2894,278 @@ rl.on("line", async (line) => {
   );
 
   spPort.disconnect();
+});
+
+test("Real agy models \\r-Spinner 2-Column Parsing, Grouped Model + Reasoning Effort Selector, Authentic New Gemini Greeting, @Chrome Mention, Binary Drop Guard, and Cross-Navigation Picker Reset", async (t) => {
+  const sidepanelHtml = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "sidepanel.html"), "utf8");
+  const sidepanelCss = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "sidepanel.css"), "utf8");
+  const sidepanelJs = fs.readFileSync(path.join(PROJECT_ROOT, "extension", "sidepanel.js"), "utf8");
+
+  // 1. Authentic 2026 New Gemini Welcome & Model/Effort UI Contracts (Zero 2024 purple-coral --hero-gradient)
+  assert.ok(!sidepanelCss.includes("--hero-gradient"), "2024 old-Gemini purple-coral --hero-gradient must be removed");
+  assert.ok(!/#8e44ad/i.test(sidepanelCss), "Legacy purple greeting gradient color #8e44ad must not exist");
+  assert.ok(sidepanelHtml.includes("Where should we start?"), "Welcome screen must use authentic New Gemini headline");
+  assert.ok(sidepanelHtml.includes('id="thought-level-segmented"'), "Model popover must expose Low/Medium/High Reasoning effort");
+  assert.ok(sidepanelHtml.includes('id="model-effort-tag"'), "Top-left model button must display active effort tag");
+  assert.ok(sidepanelHtml.includes('id="composer-notice"'), "Composer must include inline notice slot for rejected binary/oversized files");
+  assert.ok(sidepanelJs.includes("@Chrome · All open tabs"), "sidepanel.js @ picker must expose Codex in Chrome @Chrome quick target");
+
+  // 2. Verify sidepanel.js Model Family Grouping, Display Formatting (never headless "4 Carbon"), & Binary File Guard
+  {
+    const helpersStart = sidepanelJs.indexOf("const MODEL_FAMILY_SUBTITLES =");
+    const helpersEnd = sidepanelJs.indexOf("function renderModelMenu()");
+    assert.ok(helpersStart > 0 && helpersEnd > helpersStart, "Could not locate model grouping helpers in sidepanel.js");
+
+    const binStart = sidepanelJs.indexOf("const KNOWN_BINARY_EXT_RE =");
+    const binEnd = sidepanelJs.indexOf("async function handleFilesAdded(");
+    assert.ok(binStart > 0 && binEnd > binStart, "Could not locate binary file guard helpers in sidepanel.js");
+
+    const sb = {
+      state: { modelId: "gemini-4-carbon-medium", thoughtLevel: "medium" },
+      Uint8Array,
+    };
+    vm.runInNewContext(
+      `${sidepanelJs.slice(helpersStart, helpersEnd)}\n${sidepanelJs.slice(binStart, binEnd)}\nglobalThis.fns = { buildGroupedModelFamilies, resolveFamilyModelIdForEffort, formatModelDisplayName, isLikelyBinaryFile };`,
+      sb,
+    );
+
+    const grouped = sb.fns.buildGroupedModelFamilies([
+      { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+      { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+      { modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
+      { modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      { modelId: "claude-sonnet-4-6-thinking", name: "Claude Sonnet 4.6 (Thinking)" },
+    ]);
+    assert.equal(grouped.length, 2, "Low/Medium/High/Thinking variants must collapse into clean model families");
+    assert.equal(grouped[0].name, "Gemini 4 Carbon");
+    assert.equal(
+      sb.fns.formatModelDisplayName(grouped[0].name),
+      "Gemini 4 Carbon",
+      "Header pill must preserve 'Gemini 4 Carbon' instead of stripping to '4 Carbon'",
+    );
+    assert.equal(sb.fns.resolveFamilyModelIdForEffort(grouped[0], "high"), "gemini-4-carbon-high");
+    assert.equal(sb.fns.resolveFamilyModelIdForEffort(grouped[0], "low"), "gemini-4-carbon-low");
+    assert.equal(sb.fns.resolveFamilyModelIdForEffort(grouped[1], "low"), "claude-sonnet-4-6");
+    assert.equal(sb.fns.resolveFamilyModelIdForEffort(grouped[1], "high"), "claude-sonnet-4-6-thinking");
+
+    const makeMockFile = (name, type, bytes) => ({
+      name,
+      type,
+      size: bytes.length,
+      slice: (s, e) => ({
+        arrayBuffer: async () => bytes.slice(s, e).buffer,
+      }),
+    });
+    assert.equal(
+      await sb.fns.isLikelyBinaryFile(makeMockFile("report.pdf", "application/pdf", new Uint8Array([0x25, 0x50, 0x44, 0x46]))),
+      true,
+      "PDF files must be flagged as binary",
+    );
+    assert.equal(
+      await sb.fns.isLikelyBinaryFile(makeMockFile("unknown.dat", "", new Uint8Array([0x48, 0x69, 0x00, 0xff]))),
+      true,
+      "Files containing NUL bytes must be flagged as binary",
+    );
+    assert.equal(
+      await sb.fns.isLikelyBinaryFile(makeMockFile("component.tsx", "", new TextEncoder().encode("export const App = () => null;"))),
+      false,
+      "Clean TypeScript/code files with empty MIME must be accepted as text",
+    );
+  }
+
+  // 3. End-to-End Real `agy models` \r-Spinner + 2-Column Output Parsing, `thoughtLevel` ACP Config, & Cross-Navigation Picker Reset
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-real-models-review-"));
+  const mockAgyPath = path.join(tmpDir, "mock-agy-real");
+  const acpLogPath = path.join(tmpDir, "acp-thought-log.json");
+
+  const mockAgyScript = `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+
+const args = process.argv.slice(2);
+if (args[0] === "models") {
+  // Exact real 'agy models' stdout with \\r spinner frames and 2+-space aligned columns
+  process.stdout.write(
+    "\\r⠋ Fetching available models...\\rgemini-4-carbon-medium    Gemini 4 Carbon (Medium)\\n" +
+    "gemini-4-carbon-high      Gemini 4 Carbon (High)\\n" +
+    "gemini-4-carbon-low       Gemini 4 Carbon (Low)\\n" +
+    "gemini-3.8-flash-medium   Gemini 3.8 Flash (Medium)\\n" +
+    "claude-sonnet-4-6         Claude Sonnet 4.6\\n" +
+    "claude-sonnet-4-6-thinking  Claude Sonnet 4.6 (Thinking)\\n" +
+    "gpt-oss-120b-medium       GPT-OSS 120B (Medium)\\n"
+  );
+  process.exit(0);
+}
+if (args[0] !== "acp") process.exit(1);
+
+const logPath = ${JSON.stringify(acpLogPath)};
+const log = { setModels: [], setConfigs: [] };
+const flush = () => fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
+flush();
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const { id, method, params } = JSON.parse(line);
+  if (method === "initialize") {
+    send({ jsonrpc: "2.0", id, result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "RealFormatMock" } } });
+    return;
+  }
+  if (method === "session/new") {
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        sessionId: "sess-thought-1",
+        configOptions: [{ id: "thought_level", name: "Thinking Level", currentValue: "medium" }],
+      },
+    });
+    return;
+  }
+  if (method === "session/set_model") {
+    log.setModels.push(params);
+    flush();
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+  if (method === "session/set_config_option") {
+    log.setConfigs.push(params);
+    flush();
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+  if (method === "session/set_mode" || method === "session/resume" || method === "session/close") {
+    send({ jsonrpc: "2.0", id, result: {} });
+    return;
+  }
+  if (method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } } },
+    });
+    send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+  }
+});
+`;
+  fs.writeFileSync(mockAgyPath, mockAgyScript, { mode: 0o755 });
+  fs.chmodSync(mockAgyPath, 0o755);
+
+  const env = launchNativeHostWithRealExtension({
+    sockDir: path.join(tmpDir, "socks"),
+    brand: "brave",
+    extraHostEnv: {
+      AGY_BIN: mockAgyPath,
+      AG_ACP_APP_DATA_DIR: "antigravity",
+      AG_ACP_DEFAULT_CWD: tmpDir,
+      AG_CHROME_SESSIONS_FILE: path.join(tmpDir, "sessions.json"),
+    },
+    initialTabs: [
+      { id: 30, windowId: 1, active: true, title: "PR #412", url: "https://github.com/example/repo/pull/412" },
+    ],
+  });
+  t.after(async () => {
+    await env.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+  await env.waitForSocket();
+
+  const spEvents = [];
+  const spPort = env.connectSidePanelPort();
+  spPort.onMessage((m) => spEvents.push(m));
+  t.after(() => spPort.disconnect());
+
+  // Verify real 2-column + \r-spinner `agy models` output was parsed completely (7 models, not 0!)
+  const initRes = await env.sendRuntimeMessage({ type: "sidepanel:init" });
+  assert.equal(initRes.ok, true);
+  assert.equal(initRes.agentStatus.ok, true);
+  const parsedModelIds = initRes.agentStatus.models.map((m) => m.modelId);
+  assert.deepEqual(
+    parsedModelIds,
+    [
+      "gemini-4-carbon-medium",
+      "gemini-4-carbon-high",
+      "gemini-4-carbon-low",
+      "gemini-3.8-flash-medium",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-6-thinking",
+      "gpt-oss-120b-medium",
+    ],
+    "fetchCliModelsOnce must strip \\r spinner frames and parse 2-column 'agy models' stdout",
+  );
+  assert.equal(
+    initRes.agentStatus.models[0].name,
+    "Gemini 4 Carbon (Medium)",
+    "Parsed display label must match second column of 'agy models'",
+  );
+
+  // Verify Element Picker normalizes content-script `{ url, title }` into both Activity Stream & prompt context
+  await env.sendRuntimeMessage({ type: "sidepanel:startElementPicker", payload: { tabId: 30 } });
+  const pickRes = await env.sendRuntimeMessage(
+    {
+      type: "picker:elementSelected",
+      element: {
+        selector: "button.merge-pr",
+        tagName: "button",
+        label: "Squash and merge",
+        url: "https://github.com/example/repo/pull/412",
+        title: "PR #412 · Merge Check",
+      },
+    },
+    { tab: { id: 30 } },
+  );
+  assert.equal(pickRes.ok, true);
+  const afterPickInit = await env.sendRuntimeMessage({ type: "sidepanel:init" });
+  const elAct = afterPickInit.activityLog.find((a) => a.kind === "element");
+  assert.equal(
+    elAct?.detail,
+    "PR #412 · Merge Check",
+    "Activity log must record content-script `title`/`url` from picked element",
+  );
+
+  // Verify `thoughtLevel: "high"` + `modelId: "gemini-4-carbon-high"` forwards both set_model & set_config_option(thought_level)
+  const turnRes = await env.sendRuntimeMessage({
+    type: "sidepanel:sendPrompt",
+    payload: {
+      userText: "Review this PR with High reasoning effort.",
+      modelId: "gemini-4-carbon-high",
+      thoughtLevel: "high",
+      includeActiveTab: false,
+      pickedElements: [spEvents.find((e) => e.type === "sidepanel:elementPicked").element],
+    },
+  });
+  assert.equal(turnRes.ok, true);
+  const acpLog = JSON.parse(fs.readFileSync(acpLogPath, "utf8"));
+  assert.equal(acpLog.setModels.at(-1)?.modelId, "gemini-4-carbon-high");
+  assert.deepEqual(acpLog.setConfigs.at(-1), {
+    sessionId: "sess-thought-1",
+    configId: "thought_level",
+    value: "high",
+  });
+
+  // Verify live `sidepanel:setConfig` also forwards `thoughtLevel`
+  const cfgRes = await env.sendRuntimeMessage({
+    type: "sidepanel:setConfig",
+    payload: { sessionId: "sess-thought-1", modelId: "gemini-4-carbon-low", thoughtLevel: "low" },
+  });
+  assert.equal(cfgRes.ok, true);
+  const acpLog2 = JSON.parse(fs.readFileSync(acpLogPath, "utf8"));
+  assert.deepEqual(acpLog2.setConfigs.at(-1), {
+    sessionId: "sess-thought-1",
+    configId: "thought_level",
+    value: "low",
+  });
+
+  // Verify navigating an active Element Picker tab to a non-injectable URL (`chrome://settings`) auto-resets pickerState!
+  const startPick2 = await env.sendRuntimeMessage({ type: "sidepanel:startElementPicker", payload: { tabId: 30 } });
+  assert.equal(startPick2.picker.active, true);
+  env.tabs.get(30).url = "chrome://settings";
+  env.tabsOnUpdated.emit(30, { status: "loading", url: "chrome://settings" }, { ...env.tabs.get(30) });
+  const afterNavInit = await env.sendRuntimeMessage({ type: "sidepanel:init" });
+  assert.equal(
+    afterNavInit.picker.active,
+    false,
+    "Navigating active Element Picker tab to non-injectable URL must auto-clear pickerState",
+  );
 });
